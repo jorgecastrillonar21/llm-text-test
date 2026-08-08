@@ -1,0 +1,38 @@
+{
+  "name": "ooc-clone",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first AI-driven interactive anime/RPG engine",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,magenta \"pnpm dev:api\" \"pnpm dev:web\"",
+    "dev:lan": "concurrently -n api,web -c cyan,magenta \"pnpm dev:api:lan\" \"pnpm dev:web:lan\"",
+    "dev:api": "node scripts/uv.mjs run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000",
+    "dev:api:lan": "node scripts/uv.mjs run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000",
+    "dev:web": "pnpm --filter web dev",
+    "dev:web:lan": "pnpm --filter web dev:lan",
+    "build": "pnpm --filter web build",
+    "lint": "pnpm lint:api && pnpm lint:web",
+    "lint:api": "node scripts/uv.mjs run ruff check .",
+    "lint:web": "pnpm --filter web lint",
+    "format": "node scripts/uv.mjs run ruff format . && pnpm --filter web format",
+    "test": "pnpm test:api && pnpm test:web",
+    "test:api": "node scripts/uv.mjs run pytest",
+    "test:web": "pnpm --filter web test",
+    "test:e2e": "pnpm --filter web test:e2e",
+    "typecheck": "pnpm --filter web typecheck",
+    "db:migrate": "node scripts/uv.mjs run alembic upgrade head",
+    "db:revision": "node scripts/uv.mjs run alembic revision --autogenerate -m",
+    "db:seed": "node scripts/uv.mjs run python -m app.scripts.seed_demo",
+    "api:sync": "node scripts/uv.mjs sync",
+    "api:generate": "pnpm --filter web api:generate",
+    "bootstrap": "pnpm install && pnpm api:sync && pnpm db:migrate && pnpm db:seed"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "packageManager": "pnpm@9.15.9"
+}

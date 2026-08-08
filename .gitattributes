@@ -1,0 +1,19 @@
+# Line endings are normalized to LF in the repository. What matters is checkout.
+
+# Shell scripts must keep LF. A CRLF bootstrap.sh fails on macOS/Linux with the
+# unhelpful `bash: $'\r': command not found`, and Git for Windows checks out CRLF
+# by default (core.autocrlf=true).
+*.sh text eol=lf
+
+# PowerShell tolerates LF but is conventionally CRLF on Windows.
+*.ps1 text eol=crlf
+
+# Lockfiles: keep diffs stable across platforms.
+pnpm-lock.yaml text eol=lf
+uv.lock text eol=lf
+
+# Never munge binaries.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary

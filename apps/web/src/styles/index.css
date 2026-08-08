@@ -1,0 +1,45 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-ink-950: #08080e;
+  --color-ink-900: #0b0b12;
+  --color-ink-850: #12121c;
+  --color-ink-800: #181826;
+  --color-ink-700: #232335;
+  --color-ink-600: #33334a;
+  --color-ink-400: #6e6e8f;
+  --color-ink-200: #a9a9c4;
+  --color-ink-50: #ecebf5;
+
+  --color-ember-500: #d97757;
+  --color-ember-400: #e69076;
+  --color-arcane-400: #8b7fd4;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-ink-900);
+    color: var(--color-ink-50);
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    /* Keeps the composer clear of the iOS/Android home indicator. */
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-arcane-400);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  .prose-narration {
+    line-height: 1.7;
+    white-space: pre-wrap;
+  }
+}
