@@ -2,13 +2,21 @@
 
 Transaction strategy: a turn is atomic. Everything -- the player's message, the
 narration, dialogue, memories, relationship updates, events and the turn counter
-increment -- is written inside one transaction that the caller commits only after
-the story provider has returned a valid TurnGeneration.
+increment -- is staged through TurnGatewayPort and made durable by a single
+commit once the story provider has returned a valid TurnGeneration.
 
-If generation fails, the whole transaction rolls back, including the player
-message. The alternative (committing the player message first) leaves a session
-whose transcript ends with an unanswered action and whose turn counter disagrees
-with its messages. A failed turn is therefore a no-op the player can simply retry.
+If generation fails, nothing is committed and the caller's transaction scope
+rolls the staged work back, including the player message. The alternative
+(committing the player message first) leaves a session whose transcript ends with
+an unanswered action and whose turn counter disagrees with its messages. A failed
+turn is therefore a no-op the player can simply retry.
+
+The commit happens here, before the result is returned, rather than in a
+framework teardown hook that would run after the response was already sent. A
+client that re-reads the transcript on success always sees its own write.
+
+This module knows nothing about SQLAlchemy or the database schema: it depends on
+app.application.persistence, which app.infrastructure implements.
 """
 
 from __future__ import annotations
@@ -17,16 +25,20 @@ import logging
 import uuid
 
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.context_builder import build_story_context
 from app.application.contracts import DialogueLine, TurnGeneration
+from app.application.persistence import (
+    NewEvent,
+    NewMemory,
+    NewMessage,
+    SessionSnapshot,
+    TurnGatewayPort,
+)
 from app.application.ports import StoryGeneratorPort
 from app.domain.enums import MessageRole
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector, clamp_delta
-from app.infrastructure.db import models
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +75,7 @@ class TurnResult(BaseModel):
 
 
 async def execute_turn(
-    db: AsyncSession,
+    gateway: TurnGatewayPort,
     *,
     session_id: uuid.UUID,
     action: str,
@@ -75,42 +87,39 @@ async def execute_turn(
     if len(cleaned) > MAX_ACTION_LENGTH:
         raise ValidationError(f"Action must be at most {MAX_ACTION_LENGTH} characters.")
 
-    session = await db.get(models.GameSession, session_id)
+    session = await gateway.get_session(session_id)
     if session is None:
         raise NotFoundError("GameSession", session_id)
 
-    world = await db.get(models.World, session.world_id)
+    world = await gateway.get_world(session.world_id)
     if world is None:  # FK guarantees this, but the type checker does not.
         raise NotFoundError("World", session.world_id)
 
     turn_index = session.turn_index + 1
 
-    player_message = models.Message(
-        session_id=session.id,
-        turn_index=turn_index,
-        role=MessageRole.PLAYER,
-        content=cleaned,
+    # Staged before generation so the action is part of the transcript the
+    # provider reads. Still uncommitted: a failed turn takes it down with it.
+    player_message_id = await gateway.add_message(
+        NewMessage(
+            session_id=session.id,
+            turn_index=turn_index,
+            role=MessageRole.PLAYER,
+            content=cleaned,
+        )
     )
-    db.add(player_message)
-    # Flush so the action is part of the context the provider sees, without committing.
-    await db.flush()
 
-    context = await build_story_context(db, session=session, world=world, player_action=cleaned)
+    context = await build_story_context(
+        gateway, session=session, world=world, player_action=cleaned
+    )
 
     # Raises StoryGenerationError on provider failure -> caller rolls back the turn.
     generation = await generator.generate_turn(context)
 
-    known_character_ids = set(
-        (
-            await db.execute(
-                select(models.Character.id).where(models.Character.world_id == world.id)
-            )
-        ).scalars()
-    )
+    known_character_ids = await gateway.known_character_ids(world.id)
 
     messages = [
         TurnMessage(
-            id=player_message.id,
+            id=player_message_id,
             turn_index=turn_index,
             role=MessageRole.PLAYER,
             speaker=session.player_name,
@@ -119,17 +128,17 @@ async def execute_turn(
         )
     ]
 
-    narrator_message = models.Message(
-        session_id=session.id,
-        turn_index=turn_index,
-        role=MessageRole.NARRATOR,
-        content=generation.narration,
+    narrator_message_id = await gateway.add_message(
+        NewMessage(
+            session_id=session.id,
+            turn_index=turn_index,
+            role=MessageRole.NARRATOR,
+            content=generation.narration,
+        )
     )
-    db.add(narrator_message)
-    await db.flush()
     messages.append(
         TurnMessage(
-            id=narrator_message.id,
+            id=narrator_message_id,
             turn_index=turn_index,
             role=MessageRole.NARRATOR,
             speaker="Narrator",
@@ -156,18 +165,18 @@ async def execute_turn(
                 "Story provider referenced unknown character %s; storing line unattributed.",
                 line.character_id,
             )
-        row = models.Message(
-            session_id=session.id,
-            turn_index=turn_index,
-            role=MessageRole.CHARACTER,
-            speaker_character_id=character_id,
-            content=line.text,
+        message_id = await gateway.add_message(
+            NewMessage(
+                session_id=session.id,
+                turn_index=turn_index,
+                role=MessageRole.CHARACTER,
+                speaker_character_id=character_id,
+                content=line.text,
+            )
         )
-        db.add(row)
-        await db.flush()
         messages.append(
             TurnMessage(
-                id=row.id,
+                id=message_id,
                 turn_index=turn_index,
                 role=MessageRole.CHARACTER,
                 speaker=line.speaker,
@@ -176,16 +185,16 @@ async def execute_turn(
             )
         )
 
-    memories_created = _persist_memories(db, session, generation, known_character_ids)
-    relationships = await _apply_relationships(db, session, generation, known_character_ids)
-    events_created = _persist_events(db, session, generation, turn_index)
+    memories_created = await _persist_memories(gateway, session, generation, known_character_ids)
+    relationships = await _apply_relationships(gateway, session, generation, known_character_ids)
+    events_created = await _persist_events(gateway, session, generation, turn_index)
 
-    session.turn_index = turn_index
+    await gateway.set_turn_index(session.id, turn_index)
 
     # The turn is the transactional boundary. Committing here -- rather than in a
     # dependency teardown that runs after the response is sent -- means a client
     # that refetches the transcript on success always sees this turn.
-    await db.commit()
+    await gateway.commit()
 
     return TurnResult(
         session_id=session.id,
@@ -199,7 +208,7 @@ async def execute_turn(
     )
 
 
-def _is_the_player_speaking(line: DialogueLine, session: models.GameSession) -> bool:
+def _is_the_player_speaking(line: DialogueLine, session: SessionSnapshot) -> bool:
     """True when a dialogue line is attributed to the player rather than an NPC.
 
     Only unattributed lines are candidates: an NPC that genuinely shares the player's
@@ -210,9 +219,9 @@ def _is_the_player_speaking(line: DialogueLine, session: models.GameSession) -> 
     return line.speaker.strip().casefold() == session.player_name.strip().casefold()
 
 
-def _persist_memories(
-    db: AsyncSession,
-    session: models.GameSession,
+async def _persist_memories(
+    gateway: TurnGatewayPort,
+    session: SessionSnapshot,
     generation: TurnGeneration,
     known_character_ids: set[uuid.UUID],
 ) -> int:
@@ -221,8 +230,8 @@ def _persist_memories(
         character_id = (
             candidate.character_id if candidate.character_id in known_character_ids else None
         )
-        db.add(
-            models.Memory(
+        await gateway.add_memory(
+            NewMemory(
                 session_id=session.id,
                 character_id=character_id,
                 kind=candidate.kind,
@@ -235,8 +244,8 @@ def _persist_memories(
 
 
 async def _apply_relationships(
-    db: AsyncSession,
-    session: models.GameSession,
+    gateway: TurnGatewayPort,
+    session: SessionSnapshot,
     generation: TurnGeneration,
     known_character_ids: set[uuid.UUID],
 ) -> list[AppliedRelationship]:
@@ -250,42 +259,26 @@ async def _apply_relationships(
             )
             continue
 
-        row = (
-            await db.execute(
-                select(models.Relationship).where(
-                    models.Relationship.session_id == session.id,
-                    models.Relationship.character_id == change.character_id,
-                )
+        current = await gateway.get_relationship(session.id, change.character_id)
+        existing = (
+            RelationshipVector(
+                trust=current.trust,
+                affection=current.affection,
+                respect=current.respect,
+                fear=current.fear,
             )
-        ).scalar_one_or_none()
+            if current is not None
+            else RelationshipVector()
+        )
 
-        if row is None:
-            # Axes are set explicitly: column defaults are not materialised on the
-            # instance until flush, and they are read below before that happens.
-            row = models.Relationship(
-                session_id=session.id,
-                character_id=change.character_id,
-                trust=0,
-                affection=0,
-                respect=0,
-                fear=0,
-            )
-            db.add(row)
-
-        # Clamping is the application layer's job; the model only proposes.
-        updated = RelationshipVector(
-            trust=row.trust, affection=row.affection, respect=row.respect, fear=row.fear
-        ).apply(
+        # Clamping is the application's job; the model only proposes.
+        updated = existing.apply(
             trust_delta=clamp_delta(change.trust_delta),
             affection_delta=clamp_delta(change.affection_delta),
             respect_delta=clamp_delta(change.respect_delta),
             fear_delta=clamp_delta(change.fear_delta),
         )
-        row.trust = updated.trust
-        row.affection = updated.affection
-        row.respect = updated.respect
-        row.fear = updated.fear
-        await db.flush()
+        await gateway.save_relationship(session.id, change.character_id, updated)
 
         applied.append(
             AppliedRelationship(
@@ -301,15 +294,15 @@ async def _apply_relationships(
     return applied
 
 
-def _persist_events(
-    db: AsyncSession,
-    session: models.GameSession,
+async def _persist_events(
+    gateway: TurnGatewayPort,
+    session: SessionSnapshot,
     generation: TurnGeneration,
     turn_index: int,
 ) -> int:
     for event in generation.world_events:
-        db.add(
-            models.GameEvent(
+        await gateway.add_event(
+            NewEvent(
                 session_id=session.id,
                 turn_index=turn_index,
                 type=event.type,

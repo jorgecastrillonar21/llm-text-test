@@ -127,11 +127,20 @@ pnpm build
 Backend is Ruff (`E,F,I,UP,B,SIM,C4,RUF`, line length 100). Frontend is ESLint with
 `typescript-eslint`; `@typescript-eslint/no-explicit-any` is an **error**.
 
-`mypy` is configured but not wired into `pnpm lint`. Run it directly if useful:
+`pnpm typecheck` runs **both** type checkers: `mypy app` for the backend and `tsc` for
+the frontend. Either half alone:
 
 ```bash
-node scripts/uv.mjs run mypy app
+pnpm typecheck:api
 ```
+
+```bash
+pnpm typecheck:web
+```
+
+`mypy` runs with `disallow_untyped_defs = true` and is a CI gate in the backend job.
+It was configured from the start but never executed, which meant the setting was
+decorative until the boundary refactor wired it up.
 
 TypeScript is pinned to 5.x because `typescript-eslint` does not yet support TS 7
 (`peerDependencies: typescript >=4.8.4 <6.1.0`). Revisit when that lands.

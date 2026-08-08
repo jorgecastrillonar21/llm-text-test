@@ -1,17 +1,25 @@
 """Builds the StoryContext handed to a story provider.
 
-All retrieval policy lives here so it is deterministic and testable in one place.
-Retrieval is currently pure SQL ordering -- no embeddings. Semantic retrieval
-replaces `_load_memories` in Phase 3; see docs/ai-contract.md.
+All retrieval policy lives here so it is deterministic and testable in one place:
+how much history is worth sending, how many characters, and what a stored row
+turns into once the provider sees it. Reads go through StoryContextReaderPort --
+this module does not know what a database is.
+
+Retrieval is currently recency and importance ordering, no embeddings. Semantic
+retrieval replaces the memory read in Phase 3; see docs/ai-contract.md.
 """
 
 from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
+from app.application.persistence import (
+    CharacterRecord,
+    SessionSnapshot,
+    StoryContextReaderPort,
+    TranscriptMessage,
+    WorldSnapshot,
+)
 from app.application.story_context import (
     CharacterContext,
     MemoryContext,
@@ -23,7 +31,6 @@ from app.application.story_context import (
     WorldContext,
 )
 from app.domain.enums import MessageRole
-from app.infrastructure.db import models
 
 RECENT_MESSAGE_LIMIT = 20
 MEMORY_LIMIT = 30
@@ -31,13 +38,19 @@ CHARACTER_LIMIT = 12
 
 
 async def build_story_context(
-    db: AsyncSession,
+    reader: StoryContextReaderPort,
     *,
-    session: models.GameSession,
-    world: models.World,
+    session: SessionSnapshot,
+    world: WorldSnapshot,
     player_action: str,
 ) -> StoryContext:
-    characters = await _load_characters(db, world.id)
+    characters = await reader.load_characters(world.id, limit=CHARACTER_LIMIT)
+    names = {character.id: character.name for character in characters}
+
+    messages = await reader.load_recent_messages(session.id, limit=RECENT_MESSAGE_LIMIT)
+    memories = await reader.load_memories(session.id, limit=MEMORY_LIMIT)
+    relationships = await reader.load_relationships(session.id)
+
     return StoryContext(
         world=WorldContext(
             id=world.id,
@@ -55,116 +68,60 @@ async def build_story_context(
             summary=session.summary,
             turn_index=session.turn_index,
         ),
-        relevant_characters=characters,
-        recent_messages=await _load_recent_messages(db, session.id, characters),
-        relevant_memories=await _load_memories(db, session.id),
-        relationships=await _load_relationships(db, session.id, characters),
+        relevant_characters=[_to_character_context(record) for record in characters],
+        recent_messages=[_to_message_context(message, names) for message in messages],
+        relevant_memories=[
+            MemoryContext(
+                kind=memory.kind,
+                summary=memory.summary,
+                importance=memory.importance,
+                character_id=memory.character_id,
+            )
+            for memory in memories
+        ],
+        relationships=[
+            RelationshipContext(
+                character_id=relationship.character_id,
+                character_name=names.get(relationship.character_id, "Unknown"),
+                trust=relationship.trust,
+                affection=relationship.affection,
+                respect=relationship.respect,
+                fear=relationship.fear,
+            )
+            for relationship in relationships
+        ],
         player_action=player_action,
     )
 
 
-async def _load_characters(db: AsyncSession, world_id: uuid.UUID) -> list[CharacterContext]:
-    rows = (
-        await db.execute(
-            select(models.Character)
-            .where(models.Character.world_id == world_id)
-            .order_by(models.Character.created_at)
-            .limit(CHARACTER_LIMIT)
-        )
-    ).scalars()
-    return [
-        CharacterContext(
-            id=row.id,
-            name=row.name,
-            description=row.description,
-            appearance=row.appearance,
-            personality=row.personality,
-            backstory=row.backstory,
-            speech_style=row.speech_style,
-            goals=list(row.goals or []),
-            secrets=list(row.secrets or []),
-        )
-        for row in rows
-    ]
-
-
-async def _load_recent_messages(
-    db: AsyncSession, session_id: uuid.UUID, characters: list[CharacterContext]
-) -> list[MessageContext]:
-    """Newest N by insertion order, returned oldest-first for natural reading."""
-    rows = (
-        (
-            await db.execute(
-                select(models.Message)
-                .where(models.Message.session_id == session_id)
-                .order_by(models.Message.turn_index.desc(), models.Message.created_at.desc())
-                .limit(RECENT_MESSAGE_LIMIT)
-            )
-        )
-        .scalars()
-        .all()
+def _to_character_context(record: CharacterRecord) -> CharacterContext:
+    return CharacterContext(
+        id=record.id,
+        name=record.name,
+        description=record.description,
+        appearance=record.appearance,
+        personality=record.personality,
+        backstory=record.backstory,
+        speech_style=record.speech_style,
+        goals=list(record.goals),
+        secrets=list(record.secrets),
     )
 
-    names = {character.id: character.name for character in characters}
-    return [
-        MessageContext(
-            turn_index=row.turn_index,
-            role=MessageRole(row.role),
-            speaker=_speaker_label(row, names),
-            content=row.content,
-        )
-        for row in reversed(rows)
-    ]
+
+def _to_message_context(message: TranscriptMessage, names: dict[uuid.UUID, str]) -> MessageContext:
+    return MessageContext(
+        turn_index=message.turn_index,
+        role=message.role,
+        speaker=_speaker_label(message, names),
+        content=message.content,
+    )
 
 
-def _speaker_label(message: models.Message, names: dict[uuid.UUID, str]) -> str:
+def _speaker_label(message: TranscriptMessage, names: dict[uuid.UUID, str]) -> str:
     if message.speaker_character_id is not None:
         return names.get(message.speaker_character_id, "Unknown")
     return {
         MessageRole.PLAYER: "Player",
         MessageRole.NARRATOR: "Narrator",
         MessageRole.SYSTEM: "System",
-    }.get(MessageRole(message.role), "Narrator")
-
-
-async def _load_memories(db: AsyncSession, session_id: uuid.UUID) -> list[MemoryContext]:
-    """Most important first, then most recent. Deterministic; no embeddings yet."""
-    rows = (
-        await db.execute(
-            select(models.Memory)
-            .where(models.Memory.session_id == session_id)
-            .order_by(models.Memory.importance.desc(), models.Memory.created_at.desc())
-            .limit(MEMORY_LIMIT)
-        )
-    ).scalars()
-    return [
-        MemoryContext(
-            kind=row.kind,
-            summary=row.summary,
-            importance=row.importance,
-            character_id=row.character_id,
-        )
-        for row in rows
-    ]
-
-
-async def _load_relationships(
-    db: AsyncSession, session_id: uuid.UUID, characters: list[CharacterContext]
-) -> list[RelationshipContext]:
-    rows = (
-        await db.execute(
-            select(models.Relationship).where(models.Relationship.session_id == session_id)
-        )
-    ).scalars()
-    names = {character.id: character.name for character in characters}
-    return [
-        RelationshipContext(
-            character_id=row.character_id,
-            character_name=names.get(row.character_id, "Unknown"),
-            trust=row.trust,
-            affection=row.affection,
-            respect=row.respect,
-            fear=row.fear,
-        )
-        for row in rows
-    ]
+    }.get(message.role, "Narrator")

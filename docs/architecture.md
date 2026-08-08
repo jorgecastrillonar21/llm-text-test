@@ -12,17 +12,26 @@ apps/api/app/
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
 │   ├── ports.py          StoryGeneratorPort, ImageGeneratorPort (Protocols)
+│   ├── persistence.py    read/write DTOs + the persistence ports
 │   ├── context_builder.py  all retrieval policy, in one place
 │   └── turn_service.py   the turn use case
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
-├── api/              FastAPI routers, DTOs, error mapping, dependencies
+│   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
+├── api/              HTTP adapter and composition: routers, DTOs, errors, DI
 ├── prompts/          version-controlled prompt files
 └── scripts/          seed_demo
 ```
 
 Dependencies point inwards: `api → application → domain`. `infrastructure` implements
-the ports that `application` declares. Nothing in `domain` or `application` imports
-`httpx`, FastAPI, or SQLAlchemy models.
+the ports that `application` declares, and `api` is the HTTP adapter that composes the
+two. Nothing in `domain` or `application` imports SQLAlchemy, FastAPI, `httpx`,
+`app.infrastructure` or `app.api`; `domain` additionally does not import `application`.
+
+That rule is **enforced, not just stated**. `tests/test_architecture.py` walks the AST of
+every module under `app/domain` and `app/application` and fails on a forbidden import.
+It exists because the rule was documented here while the turn service and context
+builder were importing `sqlalchemy` and the ORM models directly — prose cannot fail a
+build.
 
 ```mermaid
 flowchart TD
@@ -30,7 +39,10 @@ flowchart TD
     Router --> TurnSvc[turn_service]
     TurnSvc --> CtxBuilder[context_builder]
     TurnSvc --> Port{{StoryGeneratorPort}}
-    CtxBuilder --> DB[(SQLite)]
+    TurnSvc --> PersPort{{TurnGatewayPort}}
+    CtxBuilder --> PersPort
+    PersPort -.implemented by.-> Gateway[SqlAlchemyTurnGateway]
+    Gateway --> DB[(SQLite)]
     Port -.implemented by.-> Mock[MockStoryGenerator]
     Port -.implemented by.-> Ollama[OllamaStoryGenerator]
     Ollama --> LLM[Ollama /api/chat]
@@ -41,12 +53,19 @@ flowchart TD
 
 ## Request lifecycle
 
-1. FastAPI resolves `DbSession` — a request-scoped `AsyncSession`.
+1. FastAPI resolves `DbSession` — a request-scoped `AsyncSession`. For the turn
+   endpoint it resolves `TurnGateway` instead, which binds `SqlAlchemyTurnGateway` to
+   that same session. This is the only place the turn use case and the ORM meet.
 2. The router validates the request into a DTO.
 3. The router or an application service does the work.
-4. **Write endpoints commit explicitly**, inside the handler.
+4. **Write endpoints commit explicitly**, inside the handler or the use case.
 5. The response is serialised from a DTO. ORM objects never cross the boundary.
 6. Domain errors are mapped to a consistent envelope by `api/errors.py`.
+
+Simple CRUD routers still query SQLAlchemy directly. That is deliberate: inventing a
+repository per table to move `SELECT * FROM worlds` behind an interface would add
+indirection without removing a dependency the API layer is allowed to have. Ports exist
+where there is a use case to protect — currently the turn loop.
 
 ### Why commits are explicit
 
@@ -65,20 +84,23 @@ sequenceDiagram
     participant Turn as turn_service
     participant Ctx as context_builder
     participant Gen as StoryGeneratorPort
+    participant GW as TurnGatewayPort
     participant DB
 
     UI->>API: POST /sessions/{id}/turns {action}
-    API->>Turn: execute_turn
-    Turn->>DB: load session + world
-    Turn->>DB: INSERT player message (flush, not commit)
-    Turn->>Ctx: build_story_context
-    Ctx->>DB: last 20 messages, memories, relationships, characters
+    API->>Turn: execute_turn(gateway, ...)
+    Turn->>GW: get_session + get_world
+    Turn->>GW: add_message(player) — staged, not committed
+    GW->>DB: INSERT + FLUSH
+    Turn->>Ctx: build_story_context(reader)
+    Ctx->>GW: characters, last 20 messages, memories, relationships
     Ctx-->>Turn: StoryContext
     Turn->>Gen: generate_turn(context)
     Gen-->>Turn: TurnGeneration (validated)
-    Turn->>DB: narration, dialogue, memories, relationship deltas, events
-    Turn->>DB: session.turn_index += 1
-    Turn->>DB: COMMIT
+    Turn->>GW: narration, dialogue, memories, relationship vectors, events
+    Turn->>GW: set_turn_index
+    Turn->>GW: commit()
+    GW->>DB: COMMIT
     Turn-->>UI: TurnResult
 ```
 
@@ -92,6 +114,41 @@ player message first) leaves a transcript ending in an unanswered action and a t
 counter that disagrees with the messages. A failed turn is a **no-op the player can
 simply retry**, which is exactly what the UI tells them. Covered by
 `test_failed_generation_rolls_back_the_entire_turn`.
+
+The player's action is *staged* before generation — written and flushed, never
+committed — so it appears in the transcript the provider reads. `TurnPersistencePort`
+documents that requirement; the adapter satisfies it with a flush, and
+`test_a_staged_message_is_readable_before_commit` pins both halves.
+
+## Persistence ports
+
+The turn use case reaches storage through three Protocols in
+`application/persistence.py`:
+
+| Port | Responsibility |
+|---|---|
+| `StoryContextReaderPort` | the reads that feed context assembly |
+| `TurnPersistencePort` | session/world lookups and every turn write |
+| `TurnUnitOfWorkPort` | `commit()` |
+
+`TurnGatewayPort` composes all three. `build_story_context` takes only the reader —
+functions declare the narrowest port they need — while `execute_turn` takes the
+composite, because one transaction genuinely spans all three and splitting it into
+three arguments that must be the same object helps nobody.
+
+Limits (`RECENT_MESSAGE_LIMIT`, `MEMORY_LIMIT`, `CHARACTER_LIMIT`) stay in the
+application: how much history is worth sending is policy, not storage. Ordering is
+policy too, but it has to execute in the query to be worth anything, so each port
+method's contract states the order the adapter must return, and the adapter honours it.
+
+Read DTOs are separate from the `story_context` models on purpose. The adapter maps rows
+into `TranscriptMessage`, `CharacterRecord` and friends; the application then decides
+what becomes `StoryContext`. That is why speaker labels and relationship names are
+resolved in `context_builder` rather than in SQL.
+
+`tests/test_turn_ports.py` runs the whole turn against an in-memory fake gateway — if
+the use case works with a dictionary, it does not depend on SQLAlchemy.
+`tests/test_turn_gateway.py` checks the adapter against a real database.
 
 ## Persistence
 
@@ -134,8 +191,9 @@ pattern. A network database would add operational cost for zero benefit here.
 which is deterministic, debuggable, and adequate for the ~30 memories a young session
 accumulates. Embeddings introduce a model dependency, an index to maintain, and
 non-deterministic tests — before there is evidence that recency+importance is the
-bottleneck. The seam is ready: replace `context_builder._load_memories` and nothing
-else changes. See [ai-contract.md](ai-contract.md#future-semantic-retrieval).
+bottleneck. The seam is ready: `StoryContextReaderPort.load_memories` is one method with
+one implementation, and swapping it changes nothing else. See
+[ai-contract.md](ai-contract.md#future-semantic-retrieval).
 
 **Why no microservices.** There is one user and one process. Splitting this into
 services would add network hops, partial-failure modes, and deployment complexity to a

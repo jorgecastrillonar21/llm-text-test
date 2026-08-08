@@ -169,6 +169,7 @@ directly to the phone — the application backend is the boundary. See
 | `pnpm test` | backend + frontend tests |
 | `pnpm test:e2e` | Playwright smoke flow (needs the API running) |
 | `pnpm lint` | ruff + eslint |
+| `pnpm typecheck` | mypy + tsc (`:api` / `:web` for one half) |
 | `pnpm build` | frontend production build |
 | `pnpm api:generate` | regenerate TS types from OpenAPI (API must be running) |
 
@@ -176,10 +177,13 @@ directly to the phone — the application backend is the boundary. See
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs three jobs on Node 24 and
 Python 3.13: **backend** (`uv sync --locked`, `ruff check`, `ruff format --check`,
-`pytest`), **frontend** (`pnpm install --frozen-lockfile`, lint, typecheck, test,
-build), and **e2e** (Playwright against a real API in mock mode). No job needs Ollama or
-ComfyUI — a missing AI runtime is a hard error by design, so CI would fail rather than
-quietly skip.
+`mypy app`, `pytest`), **frontend** (`pnpm install --frozen-lockfile`, lint, typecheck,
+test, build), and **e2e** (Playwright against a real API in mock mode). No job needs
+Ollama or ComfyUI — a missing AI runtime is a hard error by design, so CI would fail
+rather than quietly skip.
+
+It triggers on pushes to `master` and on pull requests. The push filter previously said
+`main`, a branch this repository does not have, so no push ever ran CI.
 
 ## Documentation
 

@@ -152,8 +152,9 @@ testing, remote config, per-world overrides) is deliberately out of scope.
 
 ## Future semantic retrieval
 
-Today `context_builder._load_memories` orders by `(importance DESC, created_at DESC)`
-with a fixed limit. That is the single function semantic retrieval replaces.
+Today `StoryContextReaderPort.load_memories` orders by `(importance DESC, created_at
+DESC)` with a limit the application supplies. That is the single method semantic
+retrieval replaces, and it has exactly one implementation.
 
 The plan, when recency+importance demonstrably fails:
 

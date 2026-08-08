@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TypedDict
 
 from sqlalchemy import select
 
@@ -22,7 +23,25 @@ logger = logging.getLogger(__name__)
 
 DEMO_WORLD_NAME = "The Fractured Crown"
 
-CHARACTERS = [
+
+class SeedCharacter(TypedDict):
+    """Shape of the literals below.
+
+    Without it the dict values widen to `str | list[str]`, and joining the names
+    stops type-checking -- the one error mypy found when it was first run.
+    """
+
+    name: str
+    description: str
+    appearance: str
+    personality: str
+    backstory: str
+    speech_style: str
+    goals: list[str]
+    secrets: list[str]
+
+
+CHARACTERS: list[SeedCharacter] = [
     {
         "name": "Elena",
         "description": "A court mage who reads people faster than she reads books.",

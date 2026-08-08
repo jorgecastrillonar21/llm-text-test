@@ -12,8 +12,10 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.persistence import TurnGatewayPort
 from app.application.ports import ImageGeneratorPort, StoryGeneratorPort
 from app.config import Settings
+from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
 
 
 async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
@@ -34,6 +36,16 @@ async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
             raise
 
 
+def get_turn_gateway(session: Annotated[AsyncSession, Depends(get_db)]) -> TurnGatewayPort:
+    """Bind the SQLAlchemy adapter to this request's transaction.
+
+    This is the only place the turn use case and the ORM meet. `execute_turn`
+    receives the port; rollback on failure stays with `get_db`, whose teardown
+    owns the session it created.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
 def get_settings_dep(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
@@ -50,6 +62,7 @@ def get_image_generator(request: Request) -> ImageGeneratorPort:
 
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
+TurnGateway = Annotated[TurnGatewayPort, Depends(get_turn_gateway)]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 StoryGen = Annotated[StoryGeneratorPort, Depends(get_story_generator)]
 ImageGen = Annotated[ImageGeneratorPort, Depends(get_image_generator)]

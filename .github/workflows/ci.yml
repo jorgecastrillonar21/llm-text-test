@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `master` is this repository's default and only long-lived branch. The
+    # filter said `main`, so no push ever triggered CI and every green run came
+    # from a pull request that nobody was opening.
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -14,7 +17,7 @@ concurrency:
 
 jobs:
   backend:
-    name: Backend (ruff + pytest)
+    name: Backend (ruff + mypy + pytest)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -45,6 +48,11 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
 
+      - name: Type check
+        # mypy was installed and configured from the start but never executed, so
+        # `disallow_untyped_defs` was decorative. Running it here makes it a gate.
+        run: uv run mypy app
+
       - name: Test
         # No Ollama, no ComfyUI: every test uses the mock provider or an isolated
         # temporary SQLite database.
@@ -73,7 +81,9 @@ jobs:
         run: pnpm lint:web
 
       - name: Typecheck
-        run: pnpm typecheck
+        # `typecheck:web`, not `typecheck`: the root script now also runs mypy,
+        # and this job deliberately has no Python toolchain installed.
+        run: pnpm typecheck:web
 
       - name: Test
         run: pnpm test:web

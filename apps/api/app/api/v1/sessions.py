@@ -5,7 +5,7 @@ import uuid
 from fastapi import APIRouter, Query, status
 from sqlalchemy import select
 
-from app.api.deps import DbSession, StoryGen
+from app.api.deps import DbSession, StoryGen, TurnGateway
 from app.api.schemas import (
     MemoryRead,
     MessageRead,
@@ -97,10 +97,10 @@ async def list_relationships(session_id: uuid.UUID, db: DbSession) -> list[model
 
 @router.post("/sessions/{session_id}/turns", response_model=TurnResponse)
 async def submit_turn(
-    session_id: uuid.UUID, payload: TurnRequest, db: DbSession, generator: StoryGen
+    session_id: uuid.UUID, payload: TurnRequest, gateway: TurnGateway, generator: StoryGen
 ) -> TurnResponse:
     """Run one turn. Atomic: a provider failure rolls the whole turn back."""
     result = await execute_turn(
-        db, session_id=session_id, action=payload.action, generator=generator
+        gateway, session_id=session_id, action=payload.action, generator=generator
     )
     return TurnResponse.model_validate(result.model_dump())
