@@ -28,6 +28,11 @@ from app.infrastructure.story.rendering import render_context
 
 logger = logging.getLogger(__name__)
 
+# Conservative floor for the truncation check. Real text tokenizes at 2.5-4.5
+# characters per token; measured Spanish context sat at 3.0, and a truncated prompt
+# measured 9.6. Six separates the two cases without false positives.
+_MIN_CHARS_PER_TOKEN = 6
+
 
 class OllamaStoryGenerator:
     name = "ollama"
@@ -37,22 +42,27 @@ class OllamaStoryGenerator:
         self._model = settings.ollama_model
         self._timeout = settings.ollama_timeout_seconds
         self._temperature = settings.ollama_temperature
+        self._num_ctx = settings.ollama_num_ctx
         self._client = client
 
     async def generate_turn(self, context: StoryContext) -> TurnGeneration:
         prompt = load_prompt("story_director")
+        rendered = render_context(context)
         payload = {
             "model": self._model,
             "stream": False,
             "format": TurnGeneration.model_json_schema(),
-            "options": {"temperature": self._temperature},
+            # num_ctx is not optional: Ollama's 4096 default truncates the head of the
+            # prompt -- system rules, world, characters -- and says nothing.
+            "options": {"temperature": self._temperature, "num_ctx": self._num_ctx},
             "messages": [
                 {"role": "system", "content": prompt.body},
-                {"role": "user", "content": render_context(context)},
+                {"role": "user", "content": rendered},
             ],
         }
 
         data = await self._post("/api/chat", payload)
+        self._warn_if_prompt_was_truncated(len(prompt.body) + len(rendered), data)
 
         content = data.get("message", {}).get("content")
         if not isinstance(content, str) or not content.strip():
@@ -81,6 +91,33 @@ class OllamaStoryGenerator:
                 provider=self.name,
                 retryable=True,
             ) from exc
+
+    def _warn_if_prompt_was_truncated(self, prompt_chars: int, data: dict[str, Any]) -> None:
+        """Surface the silent context loss that num_ctx exists to prevent.
+
+        Ollama reports how many prompt tokens it evaluated but never reports that it
+        dropped the rest, so compare against a floor: natural language does not reach
+        six characters per token, and a count below that means content was discarded.
+        The check is one-sided on purpose -- it can miss truncation, but it does not
+        cry wolf.
+
+        This warns rather than raises. The heuristic is an estimate, and the turn it
+        would abort still produced a valid, playable result; a log line the developer
+        can act on is proportionate. The real fix is configuration, not a failed turn.
+        """
+        evaluated = data.get("prompt_eval_count")
+        if not isinstance(evaluated, int) or evaluated <= 0:
+            return
+        if evaluated < prompt_chars // _MIN_CHARS_PER_TOKEN:
+            logger.warning(
+                "Ollama evaluated only %d prompt tokens for a %d-character prompt: part "
+                "of it was discarded, starting with the system rules and the world and "
+                "character definitions. OLLAMA_NUM_CTX is %d -- raise it, or lower the "
+                "retrieval limits in context_builder.py.",
+                evaluated,
+                prompt_chars,
+                self._num_ctx,
+            )
 
     async def status(self) -> ProviderStatus:
         if not self._model.strip():

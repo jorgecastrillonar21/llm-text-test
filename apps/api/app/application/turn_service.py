@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.context_builder import build_story_context
-from app.application.contracts import TurnGeneration
+from app.application.contracts import DialogueLine, TurnGeneration
 from app.application.ports import StoryGeneratorPort
 from app.domain.enums import MessageRole
 from app.domain.errors import NotFoundError, ValidationError
@@ -139,6 +139,17 @@ async def execute_turn(
     )
 
     for line in generation.dialogue:
+        if _is_the_player_speaking(line, session):
+            # The player character belongs to the player. A model that puts words in
+            # their mouth is overstepping the one boundary the game has, and the line
+            # is dropped rather than persisted -- an invented quote becomes canon on
+            # the next turn, because the transcript is fed back as established fact.
+            logger.warning(
+                "Story provider wrote dialogue for the player character %r; line dropped.",
+                session.player_name,
+            )
+            continue
+
         character_id = line.character_id if line.character_id in known_character_ids else None
         if line.character_id is not None and character_id is None:
             logger.warning(
@@ -186,6 +197,17 @@ async def execute_turn(
         events_created=events_created,
         visual_cue_generated=generation.visual_cue.generate,
     )
+
+
+def _is_the_player_speaking(line: DialogueLine, session: models.GameSession) -> bool:
+    """True when a dialogue line is attributed to the player rather than an NPC.
+
+    Only unattributed lines are candidates: an NPC that genuinely shares the player's
+    name carries a real character_id and is left alone.
+    """
+    if line.character_id is not None:
+        return False
+    return line.speaker.strip().casefold() == session.player_name.strip().casefold()
 
 
 def _persist_memories(

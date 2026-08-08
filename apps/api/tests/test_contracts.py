@@ -65,3 +65,44 @@ def test_json_schema_is_generatable_for_ollama_structured_output() -> None:
     assert schema["type"] == "object"
     assert "narration" in schema["properties"]
     assert "narration" in schema["required"]
+
+
+def test_the_schema_requires_suggested_actions() -> None:
+    """Regression: an optional field is one a grammar-constrained model may skip.
+
+    mistral:7b omitted the key in every world tested, so the UI silently lost its
+    suggestion chips. `required` is what takes that choice away from the model.
+    """
+    assert "suggested_actions" in TurnGeneration.model_json_schema()["required"]
+
+
+def test_a_response_without_suggestions_is_still_a_playable_turn() -> None:
+    """The schema demands them; validation must not throw away good prose over them."""
+    generation = TurnGeneration.model_validate({"narration": "The door opens."})
+
+    assert generation.suggested_actions == []
+
+
+def test_a_visual_cue_that_asks_for_nothing_is_not_a_request() -> None:
+    cue = TurnGeneration.model_validate(
+        {"narration": "n", "visual_cue": {"generate": True, "scene_prompt": "   "}}
+    ).visual_cue
+
+    assert cue.generate is False
+
+
+def test_an_unrequested_visual_cue_does_not_keep_a_payload() -> None:
+    """Observed with mistral:7b: generate=false alongside a filled-in scene_prompt."""
+    cue = TurnGeneration.model_validate(
+        {
+            "narration": "n",
+            "visual_cue": {
+                "generate": False,
+                "scene_prompt": "A rooftop at sunset",
+                "character_ids": [str(uuid.uuid4())],
+            },
+        }
+    ).visual_cue
+
+    assert cue.scene_prompt is None
+    assert cue.character_ids == []

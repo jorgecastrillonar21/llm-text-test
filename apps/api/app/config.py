@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     ollama_timeout_seconds: float = 120.0
     ollama_temperature: float = 0.7
 
+    # Must be set explicitly. Ollama defaults num_ctx to 4096 regardless of what the
+    # model supports, and llama.cpp truncates from the *start* of the prompt -- the
+    # system prompt and the world/character definitions -- without reporting it.
+    # A full context at the current retrieval caps measures ~6.7k tokens, so 4096
+    # silently discards roughly two thirds of it and every world reads the same.
+    ollama_num_ctx: int = Field(default=8192, ge=512)
+
     image_provider: ImageProvider = ImageProvider.DISABLED
     comfyui_base_url: str = "http://127.0.0.1:8188"
     comfyui_workflow_path: str = ""

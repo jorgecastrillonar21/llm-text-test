@@ -110,7 +110,16 @@ defaulting to your browser's language.
    ```dotenv
    STORY_PROVIDER=ollama
    OLLAMA_MODEL=llama3.1:8b
+   OLLAMA_NUM_CTX=8192
    ```
+
+   `OLLAMA_NUM_CTX` matters more than it looks. Ollama defaults to a 4096-token
+   context regardless of what the model supports, and llama.cpp discards the *head*
+   of an oversized prompt — the story rules, the world, the characters — without
+   raising anything. A full context at the current retrieval limits measures ~6.7k
+   tokens, so at the default roughly two thirds is thrown away and every world starts
+   reading the same. Do not lower this below 8192 without also lowering the limits in
+   [context_builder.py](apps/api/app/application/context_builder.py).
 
 4. Restart the API. Check **Settings → AI status**, or:
 

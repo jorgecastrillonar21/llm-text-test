@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import logging
+
 import httpx
 import pytest
 
@@ -147,4 +150,67 @@ async def test_ollama_valid_response_is_parsed(make_story_context) -> None:
     generation = await generator.generate_turn(make_story_context())
     assert generation.narration == "The door opens."
     assert len(generation.suggested_actions) == 3
+    await client.aclose()
+
+
+_VALID_REPLY = (
+    '{"narration": "The door opens.", "dialogue": [], "suggested_actions": [], '
+    '"memory_candidates": [], "relationship_changes": [], "world_events": [], '
+    '"visual_cue": {"generate": false}}'
+)
+
+
+def _replying(extra: dict[str, object] | None = None) -> tuple[httpx.AsyncClient, list[dict]]:
+    """A client that always answers, recording each request body for inspection."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.read().decode()))
+        return httpx.Response(200, json={"message": {"content": _VALID_REPLY}, **(extra or {})})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), seen
+
+
+async def test_ollama_sends_an_explicit_num_ctx(make_story_context) -> None:
+    """Regression: without num_ctx Ollama defaults to 4096 and truncates the prompt.
+
+    It drops the head -- the system rules and the world and character definitions --
+    and reports nothing, so every world produces interchangeable prose.
+    """
+    client, seen = _replying()
+    generator = OllamaStoryGenerator(
+        Settings(ollama_model="m", ollama_num_ctx=16384), client=client
+    )
+
+    await generator.generate_turn(make_story_context())
+
+    assert seen[0]["options"]["num_ctx"] == 16384
+    await client.aclose()
+
+
+async def test_ollama_warns_when_the_prompt_did_not_fit(
+    make_story_context, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Far fewer tokens than the prompt's characters can possibly encode to.
+    client, _ = _replying({"prompt_eval_count": 3})
+    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
+
+    with caplog.at_level(logging.WARNING):
+        await generator.generate_turn(make_story_context())
+
+    assert "OLLAMA_NUM_CTX" in caplog.text
+    await client.aclose()
+
+
+async def test_ollama_stays_quiet_when_the_whole_prompt_was_evaluated(
+    make_story_context, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The truncation check must not cry wolf on a prompt that fit."""
+    client, _ = _replying({"prompt_eval_count": 100_000})
+    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
+
+    with caplog.at_level(logging.WARNING):
+        await generator.generate_turn(make_story_context())
+
+    assert caplog.text == ""
     await client.aclose()

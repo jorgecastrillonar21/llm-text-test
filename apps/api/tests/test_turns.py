@@ -6,6 +6,7 @@ import uuid
 
 from httpx import ASGITransport, AsyncClient
 
+from app.application.contracts import DialogueLine, TurnGeneration
 from app.domain.errors import StoryGenerationError
 from tests.conftest import FailingStoryGenerator
 
@@ -211,3 +212,90 @@ async def test_session_is_usable_again_after_a_failed_turn(app_client: AsyncClie
     )
     assert retried.status_code == 200
     assert retried.json()["turn_index"] == 1
+
+
+class ScriptedStoryGenerator:
+    """Returns one fixed generation, for exercising what the turn service refuses."""
+
+    name = "scripted"
+
+    def __init__(self, generation: TurnGeneration) -> None:
+        self._generation = generation
+
+    async def generate_turn(self, context: object) -> TurnGeneration:
+        return self._generation
+
+    async def status(self) -> object:  # pragma: no cover - not exercised
+        raise NotImplementedError
+
+
+async def test_dialogue_attributed_to_the_player_is_dropped(app_client: AsyncClient) -> None:
+    """Observed with mistral:7b: it wrote a line of the player's own dialogue.
+
+    The player character belongs to the player. Persisting an invented quote is
+    worse than losing it, because the transcript is replayed to the model next turn
+    as established fact -- so the invention becomes canon.
+    """
+    _, session = await bootstrap(app_client)
+    set_generator(
+        app_client,
+        ScriptedStoryGenerator(
+            TurnGeneration(
+                narration="The alley is quiet.",
+                dialogue=[
+                    DialogueLine(speaker="Rin", text="I never trust coincidences."),
+                    DialogueLine(speaker="Elena", text="Neither do I."),
+                ],
+                suggested_actions=["Leave", "Stay", "Listen"],
+            )
+        ),
+    )
+
+    body = (
+        await app_client.post(
+            f"/api/v1/sessions/{session['id']}/turns", json={"action": "I ask her."}
+        )
+    ).json()
+
+    spoken = [m["content"] for m in body["messages"] if m["role"] == "character"]
+    assert spoken == ["Neither do I."]
+
+    # And it must not reappear once the transcript is reloaded.
+    messages = (await app_client.get(f"/api/v1/sessions/{session['id']}/messages")).json()
+    assert all("never trust coincidences" not in m["content"] for m in messages)
+
+
+async def test_a_character_sharing_the_players_name_still_speaks(
+    app_client: AsyncClient,
+) -> None:
+    """The guard keys on attribution, not on the name alone."""
+    world, session = await bootstrap(app_client)
+    twin = (
+        await app_client.post(f"/api/v1/worlds/{world['id']}/characters", json={"name": "Rin"})
+    ).json()
+    set_generator(
+        app_client,
+        ScriptedStoryGenerator(
+            TurnGeneration(
+                narration="Two people answer at once.",
+                dialogue=[
+                    DialogueLine(
+                        character_id=uuid.UUID(twin["id"]),
+                        speaker="Rin",
+                        text="That is my name too.",
+                    )
+                ],
+                suggested_actions=["Ask which"],
+            )
+        ),
+    )
+
+    body = (
+        await app_client.post(
+            f"/api/v1/sessions/{session['id']}/turns", json={"action": "I call out a name."}
+        )
+    ).json()
+
+    assert [m["content"] for m in body["messages"] if m["role"] == "character"] == [
+        "That is my name too."
+    ]
