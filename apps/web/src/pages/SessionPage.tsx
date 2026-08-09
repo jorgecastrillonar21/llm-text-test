@@ -6,6 +6,7 @@ import { Button, Spinner } from '@/components/ui';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Timeline } from '@/features/sessions/Timeline';
 import { Composer } from '@/features/sessions/Composer';
+import { FictionalClock } from '@/features/sessions/FictionalClock';
 
 export function SessionPage() {
   const { sessionId = '' } = useParams();
@@ -56,6 +57,8 @@ export function SessionPage() {
             {aiStatus.data ? <StatusBadge state={aiStatus.data.story.state} /> : null}
           </div>
         </div>
+        {/* Next to the turn count, not instead of it: they measure different things. */}
+        <FictionalClock time={session.data.time} />
       </header>
 
       <div className="flex-1">

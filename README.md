@@ -190,6 +190,7 @@ It triggers on pushes to `master` and on pull requests. The push filter previous
 - [Architecture](docs/architecture.md) — modules, ports, request and turn lifecycles
 - [AI contract](docs/ai-contract.md) — `StoryContext`, `TurnGeneration`, semantics
 - [World rules](docs/world-rules.md) — how a universe is configured, and the presets
+- [Simulation time](docs/world-state-time.md) — the fictional clock, calendar, scheduling
 - [Development](docs/development.md) — workflows, migrations, testing, contract sync
 - [Mobile access](docs/mobile-access.md) — LAN, PWA, HTTPS, security
 - [Roadmap](docs/roadmap.md) — what comes next

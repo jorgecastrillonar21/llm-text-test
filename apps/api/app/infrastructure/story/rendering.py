@@ -144,6 +144,13 @@ def render_context(context: StoryContext) -> str:
 
     lines.append("\n# Session")
     lines.append(f"Turn: {context.session.turn_index}")
+    # One line, not a block: the clock is context for the scene, and the rule that
+    # the director cannot move it lives in the system prompt where it is stated once.
+    lines.append(
+        f"Now: {context.time.calendar_date}, {context.time.clock} "
+        f"({_words(context.time.period)}) — {context.time.elapsed_since_start} "
+        f"into this story"
+    )
     lines.append(f"Location: {context.session.current_location or 'unspecified'}")
     if context.session.summary:
         lines.append(f"Story so far: {context.session.summary}")

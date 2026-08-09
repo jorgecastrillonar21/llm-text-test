@@ -97,6 +97,25 @@ export interface CharacterCreate {
   secrets?: string[];
 }
 
+export type TimeOfDay = 'dawn' | 'morning' | 'afternoon' | 'evening' | 'night' | 'late_night';
+
+/**
+ * The session's fictional clock.
+ *
+ * `elapsed_minutes` is the only number the backend stores; everything under
+ * `display` is derived from it and the world's start date on every read. Nothing
+ * here is writable — time moves when the game moves it. See docs/world-state-time.md.
+ */
+export interface SessionTime {
+  elapsed_minutes: number;
+  display: {
+    date: string;
+    time: string;
+    period: TimeOfDay;
+    elapsed: string;
+  };
+}
+
 export interface GameSession {
   id: string;
   world_id: string;
@@ -106,12 +125,15 @@ export interface GameSession {
   current_location: string;
   summary: string;
   turn_index: number;
+  /** Independent of `turn_index`: neither can be computed from the other. */
+  elapsed_minutes: number;
   created_at: string;
   updated_at: string;
 }
 
 export interface SessionDetail extends GameSession {
   world: World;
+  time: SessionTime;
 }
 
 export interface SessionCreate {

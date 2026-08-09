@@ -305,6 +305,12 @@ async def _persist_events(
             NewEvent(
                 session_id=session.id,
                 turn_index=turn_index,
+                # A turn does not move the clock, so everything it records happens at
+                # the session's current fictional minute. Turn index and fictional
+                # time are stamped separately because they answer different
+                # questions -- and because a later action that costs eight hours will
+                # make them diverge sharply.
+                occurred_at=session.elapsed_minutes,
                 type=event.type,
                 description=event.description,
             )

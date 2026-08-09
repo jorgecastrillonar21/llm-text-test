@@ -16,11 +16,13 @@ from app.application.story_context import (
     PlayerContext,
     SessionContext,
     StoryContext,
+    TimeContext,
     WorldContext,
 )
 from app.config import ImageProvider, Settings, StoryProvider
 from app.domain.enums import Language
 from app.domain.world_rules import default_world_rules
+from app.domain.world_time import TimeOfDay
 from app.infrastructure.db.base import Base
 from app.infrastructure.db.engine import create_engine, create_session_factory
 from app.infrastructure.db.models import Character, World
@@ -86,6 +88,14 @@ def make_story_context():
             player=PlayerContext(name="Rin", description=""),
             session=SessionContext(
                 id=uuid.uuid4(), title="s", current_location="", summary="", turn_index=0
+            ),
+            # Spelled out rather than projected, so the fixture states what a session
+            # at minute zero of a default world actually looks like.
+            time=TimeContext(
+                calendar_date="1 January, 1",
+                clock="08:00",
+                period=TimeOfDay.MORNING,
+                elapsed_since_start="0 minutes",
             ),
             player_action=action,
         )

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import register_exception_handlers
 from app.api.schemas import HealthResponse
+from app.api.v1 import dev
 from app.api.v1.router import api_router
 from app.config import Settings, get_settings
 from app.infrastructure.db.engine import create_engine, create_session_factory, verify_schema
@@ -70,6 +71,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     register_exception_handlers(app)
     app.include_router(api_router)
+
+    # Mounted per application instance rather than folded into `api_router`, which is
+    # a module-level singleton: conditionally including a route into it would leak
+    # into every app built afterwards in the same process.
+    if resolved.dev_endpoints_enabled:
+        app.include_router(dev.router, prefix="/api/v1")
 
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health() -> HealthResponse:

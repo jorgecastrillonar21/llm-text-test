@@ -35,6 +35,7 @@ from app.domain.enums import Language, MemoryKind
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector
 from app.domain.world_rules import default_world_rules
+from app.domain.world_time import DEFAULT_INITIAL_DATETIME
 
 SESSION_ID = uuid.uuid4()
 WORLD_ID = uuid.uuid4()
@@ -44,7 +45,9 @@ ELENA_ID = uuid.uuid4()
 class FakeTurnGateway:
     """In-memory TurnGatewayPort. Records what the use case asked it to do."""
 
-    def __init__(self, *, player_name: str = "Rin", turn_index: int = 0) -> None:
+    def __init__(
+        self, *, player_name: str = "Rin", turn_index: int = 0, elapsed_minutes: int = 0
+    ) -> None:
         self.session = SessionSnapshot(
             id=SESSION_ID,
             world_id=WORLD_ID,
@@ -54,6 +57,7 @@ class FakeTurnGateway:
             current_location="a town",
             summary="",
             turn_index=turn_index,
+            elapsed_minutes=elapsed_minutes,
         )
         self.world = WorldSnapshot(
             id=WORLD_ID,
@@ -63,6 +67,7 @@ class FakeTurnGateway:
             setting="a town",
             language=Language.EN,
             rules=default_world_rules(),
+            initial_datetime=DEFAULT_INITIAL_DATETIME,
         )
         self.characters = [
             CharacterRecord(

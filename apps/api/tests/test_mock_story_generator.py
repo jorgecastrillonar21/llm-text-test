@@ -12,10 +12,12 @@ from app.application.story_context import (
     PlayerContext,
     SessionContext,
     StoryContext,
+    TimeContext,
     WorldContext,
 )
 from app.domain.enums import Language
 from app.domain.world_rules import default_world_rules
+from app.domain.world_time import TimeOfDay
 from app.infrastructure.story.mock import MockStoryGenerator
 
 ELENA_ID = uuid.uuid4()
@@ -36,6 +38,12 @@ def build_context(action: str, language: Language = Language.EN, turn: int = 0) 
         player=PlayerContext(name="Rin", description="a traveller"),
         session=SessionContext(
             id=uuid.uuid4(), title="s", current_location="the market", summary="", turn_index=turn
+        ),
+        time=TimeContext(
+            calendar_date="13 May, 842",
+            clock="16:42",
+            period=TimeOfDay.AFTERNOON,
+            elapsed_since_start="20 days, 3 hours",
         ),
         relevant_characters=[
             CharacterContext(

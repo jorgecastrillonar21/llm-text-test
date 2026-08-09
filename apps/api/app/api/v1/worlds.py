@@ -26,8 +26,9 @@ async def create_world(payload: WorldCreate, db: DbSession) -> models.World:
     # preset, from the request, or from the defaults is not recorded: two worlds
     # with the same resolved rules are the same world as far as the engine cares.
     world = models.World(
-        **payload.model_dump(exclude={"rules_preset", "rules"}),
+        **payload.model_dump(exclude={"rules_preset", "rules", "initial_datetime"}),
         rules_json=payload.resolved_rules().model_dump(mode="json"),
+        initial_datetime=payload.resolved_initial_datetime().model_dump(mode="json"),
     )
     db.add(world)
     await db.commit()

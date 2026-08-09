@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.persistence import TurnGatewayPort
+from app.application.persistence import SessionClockPort, TurnGatewayPort
 from app.application.ports import ImageGeneratorPort, StoryGeneratorPort
 from app.config import Settings
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
@@ -46,6 +46,16 @@ def get_turn_gateway(session: Annotated[AsyncSession, Depends(get_db)]) -> TurnG
     return SqlAlchemyTurnGateway(session)
 
 
+def get_session_clock(session: Annotated[AsyncSession, Depends(get_db)]) -> SessionClockPort:
+    """The same adapter, seen through the narrower port the time service needs.
+
+    A separate dependency rather than reusing `TurnGateway` so the signature says
+    what advancing time is allowed to touch: the clock, the scheduled events and the
+    audit trail, and not the transcript or the relationships.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
 def get_settings_dep(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
@@ -63,6 +73,7 @@ def get_image_generator(request: Request) -> ImageGeneratorPort:
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 TurnGateway = Annotated[TurnGatewayPort, Depends(get_turn_gateway)]
+SessionClock = Annotated[SessionClockPort, Depends(get_session_clock)]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 StoryGen = Annotated[StoryGeneratorPort, Depends(get_story_generator)]
 ImageGen = Annotated[ImageGeneratorPort, Depends(get_image_generator)]

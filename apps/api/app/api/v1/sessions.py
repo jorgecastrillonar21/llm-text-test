@@ -13,11 +13,13 @@ from app.api.schemas import (
     SessionCreate,
     SessionDetail,
     SessionRead,
+    SessionTimeRead,
     TurnRequest,
     TurnResponse,
 )
 from app.application.turn_service import execute_turn
 from app.domain.errors import NotFoundError
+from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
 
 router = APIRouter(tags=["sessions"])
@@ -54,7 +56,16 @@ async def get_session(session_id: uuid.UUID, db: DbSession) -> SessionDetail:
     if world is None:
         raise NotFoundError("World", session.world_id)
     return SessionDetail.model_validate(
-        {**SessionRead.model_validate(session).model_dump(), "world": world}
+        {
+            **SessionRead.model_validate(session).model_dump(),
+            "world": world,
+            # Projected on every read from the session's clock and the world's start
+            # date. Nothing caches it, so it cannot go stale.
+            "time": SessionTimeRead.project(
+                session.elapsed_minutes,
+                FictionalDateTime.model_validate(world.initial_datetime),
+            ),
+        }
     )
 
 

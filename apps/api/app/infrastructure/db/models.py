@@ -7,6 +7,8 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -22,6 +24,7 @@ from sqlalchemy.types import JSON
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import AXIS_MAX, AXIS_MIN
 from app.domain.world_rules import default_world_rules
+from app.domain.world_time import DEFAULT_INITIAL_DATETIME, ScheduledEventStatus
 from app.infrastructure.db.base import Base
 from app.infrastructure.db.types import UtcDateTime, utcnow
 
@@ -37,6 +40,11 @@ def _default_rules_json() -> dict[str, Any]:
     re-established by `parse_world_rules` on every read.
     """
     return default_world_rules().model_dump(mode="json")
+
+
+def _default_initial_datetime() -> dict[str, Any]:
+    """The fictional instant a session's `elapsed_minutes = 0` corresponds to."""
+    return DEFAULT_INITIAL_DATETIME.model_dump(mode="json")
 
 
 class World(Base):
@@ -55,6 +63,12 @@ class World(Base):
     # boundaries by parse_world_rules, not by the schema.
     rules_json: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=_default_rules_json, nullable=False
+    )
+    # The fictional date and time that every session of this world starts at. Five
+    # small integers rather than five columns: they are read as one value, and a
+    # world with a month but no year is not a thing anyone wants to represent.
+    initial_datetime: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=_default_initial_datetime, nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -95,6 +109,9 @@ class Character(Base):
 
 class GameSession(Base):
     __tablename__ = "game_sessions"
+    __table_args__ = (
+        CheckConstraint("elapsed_minutes >= 0", name="ck_game_sessions_elapsed_nonnegative"),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     world_id: Mapped[uuid.UUID] = mapped_column(
@@ -107,6 +124,11 @@ class GameSession(Base):
     # Rolling recap of turns older than the recent-message window. Phase 2 fills this.
     summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     turn_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # The authoritative simulation clock, counted from this session's own start.
+    # BigInteger because it is the one number a long-running story keeps adding to,
+    # and because a 32-bit column would quietly cap a world at roughly four thousand
+    # fictional years. The hour, the date and the season are derived, never stored.
+    elapsed_minutes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
@@ -190,14 +212,64 @@ class Relationship(Base):
 
 
 class GameEvent(Base):
+    """Something that happened, stamped with both of the times that matter."""
+
     __tablename__ = "game_events"
-    __table_args__ = (Index("ix_game_events_session_turn", "session_id", "turn_index"),)
+    __table_args__ = (
+        Index("ix_game_events_session_turn", "session_id", "turn_index"),
+        Index("ix_game_events_session_time", "session_id", "occurred_at", "event_sequence"),
+        # A per-session counter has to actually be unique to be an ordering. Two
+        # writers racing for the same number is a loud integrity error here rather
+        # than two events that silently swap places on the next read.
+        UniqueConstraint("session_id", "event_sequence", name="uq_game_events_session_sequence"),
+        CheckConstraint("occurred_at >= 0", name="ck_game_events_occurred_at_nonnegative"),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     session_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
     )
     turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    # When it happened in the fiction. Independent of turn_index: a whole turn may
+    # occupy one minute, and one turn may cover a season.
+    occurred_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Ties are the normal case, not the exception -- everything in a turn usually
+    # shares a minute -- so ordering needs a second key. A monotonic per-session
+    # counter, rather than inventing seconds the game clock does not have.
+    event_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     type: Mapped[str] = mapped_column(String(80), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+
+
+class ScheduledEvent(Base):
+    """Something due at a future point on the session clock.
+
+    Fictional scheduling: nothing here runs on its own, and nothing fires while the
+    application is closed. Pending rows are only ever looked at during an explicit
+    time advance. See `app.domain.world_time.scheduling`.
+    """
+
+    __tablename__ = "scheduled_events"
+    __table_args__ = (
+        # The only query this table has: what is still pending, due by when.
+        Index("ix_scheduled_events_pending", "session_id", "status", "due_at"),
+        CheckConstraint("due_at >= 0", name="ck_scheduled_events_due_at_nonnegative"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Absolute session time, never a delay. "In three days" is resolved when the row
+    # is written, so the event does not change meaning depending on when it is read.
+    due_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    type: Mapped[str] = mapped_column(String(80), nullable=False)
+    # Genuinely arbitrary JSON: this table is generic infrastructure and the systems
+    # that will give the payload a shape do not exist yet.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[ScheduledEventStatus] = mapped_column(
+        String(20), default=ScheduledEventStatus.PENDING, nullable=False
+    )
+    interrupt_player_action: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)

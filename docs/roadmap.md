@@ -20,6 +20,17 @@ deliberately did not decide.
 The systems below that read those rules — WorldState, CharacterSheet, PowerSystem, rules
 resolution, world simulation — are each their own epic and none of them is started.
 
+## Phase 1.6 — WorldState: simulation time ✅
+
+The first piece of `WorldState`, and the foundation every later simulation system needs:
+an authoritative per-session clock in fictional minutes, a calendar projection, an
+explicit advancement path that only application code may use, and a generic scheduled
+event model. Turn count and fictional time are independent, and a turn does not move
+the clock. See [world-state-time.md](world-state-time.md).
+
+Deliberately absent: locations, NPC schedules, weather, travel, combat duration, the
+seeded RNG, and any form of real-time synchronisation.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.
@@ -64,8 +75,12 @@ See [ai-contract.md](ai-contract.md#future-semantic-retrieval) for the seam.
 ## Phase 6 — World simulation
 
 - Locations as first-class entities, with a map.
-- Time of day and calendar.
-- NPC schedules — characters exist when the player is not looking.
+- Per-world calendars: custom month names, month lengths, week structures, eras. The
+  clock and the projection landed in Phase 1.6; only the authoring half is missing.
+- NPC schedules — characters exist when the player is not looking. The generic
+  `ScheduledEvent` model exists; nothing produces one yet.
+- Action durations: a resolved action that actually costs fictional time, with variance
+  drawn from the seeded game RNG rather than from model sampling.
 - Factions and reputation.
 - Autonomous events between turns.
 

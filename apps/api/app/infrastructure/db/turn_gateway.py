@@ -1,9 +1,10 @@
 """SQLAlchemy implementation of the application's persistence ports.
 
-One adapter satisfies all three ports because a turn is one transaction: the
-reads that build the context and the writes that record the outcome have to see
-the same uncommitted state. Splitting it into three objects over one session
-would be three names for the same thing.
+One adapter satisfies every port a session request needs, because they all run in
+one transaction: the reads that build the context, the writes that record a turn's
+outcome, and the clock the time service moves have to see the same uncommitted
+state. Splitting it into four objects over one database session would be four names
+for the same thing.
 
 Queries and row-to-DTO mapping live here. Retrieval *policy* -- how many
 messages, how many memories, what gets into StoryContext -- stays in the
@@ -14,7 +15,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.persistence import (
@@ -23,18 +24,39 @@ from app.application.persistence import (
     NewEvent,
     NewMemory,
     NewMessage,
+    NewScheduledEvent,
     RelationshipRecord,
+    ScheduledEventRecord,
     SessionSnapshot,
     TranscriptMessage,
     WorldSnapshot,
 )
 from app.domain.relationships import RelationshipVector
 from app.domain.world_rules import parse_world_rules
+from app.domain.world_time import FictionalDateTime, ScheduledEventStatus
 from app.infrastructure.db import models
 
 
+def _to_scheduled_event(row: models.ScheduledEvent) -> ScheduledEventRecord:
+    return ScheduledEventRecord(
+        id=row.id,
+        session_id=row.session_id,
+        due_at=row.due_at,
+        type=row.type,
+        payload=dict(row.payload or {}),
+        status=row.status,
+        interrupt_player_action=row.interrupt_player_action,
+    )
+
+
 class SqlAlchemyTurnGateway:
-    """Implements StoryContextReaderPort, TurnPersistencePort and TurnUnitOfWorkPort."""
+    """Implements StoryContextReaderPort, TurnPersistencePort, TurnUnitOfWorkPort
+    and SessionClockPort.
+
+    Named for the turn because that is the transaction it was shaped around. The
+    session clock joined later and runs inside the same one, which is why it is here
+    rather than in a second adapter that would have to re-map the same rows.
+    """
 
     def __init__(self, session: AsyncSession) -> None:
         self._db = session
@@ -142,6 +164,7 @@ class SqlAlchemyTurnGateway:
             current_location=row.current_location,
             summary=row.summary,
             turn_index=row.turn_index,
+            elapsed_minutes=row.elapsed_minutes,
         )
 
     async def get_world(self, world_id: uuid.UUID) -> WorldSnapshot | None:
@@ -159,6 +182,7 @@ class SqlAlchemyTurnGateway:
             # rules_json raises here rather than reaching the Story Director as a
             # document nobody wrote.
             rules=parse_world_rules(row.rules_json),
+            initial_datetime=FictionalDateTime.model_validate(row.initial_datetime),
         )
 
     async def known_character_ids(self, world_id: uuid.UUID) -> set[uuid.UUID]:
@@ -197,10 +221,16 @@ class SqlAlchemyTurnGateway:
             models.GameEvent(
                 session_id=event.session_id,
                 turn_index=event.turn_index,
+                occurred_at=event.occurred_at,
+                event_sequence=await self._next_event_sequence(event.session_id),
                 type=event.type,
                 description=event.description,
             )
         )
+        # Flushed immediately so the next event in this turn sees this one when it
+        # asks for the next number. Without it a turn's events would all be handed
+        # the same sequence and the unique constraint would fail the whole turn.
+        await self._db.flush()
 
     async def get_relationship(
         self, session_id: uuid.UUID, character_id: uuid.UUID
@@ -236,12 +266,82 @@ class SqlAlchemyTurnGateway:
         row.turn_index = turn_index
         await self._db.flush()
 
+    # -- SessionClockPort -------------------------------------------------------
+
+    async def set_elapsed_minutes(self, session_id: uuid.UUID, elapsed_minutes: int) -> None:
+        row = await self._db.get(models.GameSession, session_id)
+        if row is None:  # pragma: no cover - the caller loaded it moments earlier
+            raise LookupError(f"GameSession {session_id} vanished mid-advance")
+        row.elapsed_minutes = elapsed_minutes
+        await self._db.flush()
+
+    async def add_scheduled_event(self, event: NewScheduledEvent) -> uuid.UUID:
+        row = models.ScheduledEvent(
+            session_id=event.session_id,
+            due_at=event.due_at,
+            type=event.type,
+            payload=dict(event.payload),
+            status=ScheduledEventStatus.PENDING,
+            interrupt_player_action=event.interrupt_player_action,
+        )
+        self._db.add(row)
+        await self._db.flush()
+        return row.id
+
+    async def get_scheduled_event(self, event_id: uuid.UUID) -> ScheduledEventRecord | None:
+        row = await self._db.get(models.ScheduledEvent, event_id)
+        return None if row is None else _to_scheduled_event(row)
+
+    async def load_due_scheduled_events(
+        self, session_id: uuid.UUID, *, through: int
+    ) -> list[ScheduledEventRecord]:
+        rows = (
+            await self._db.execute(
+                select(models.ScheduledEvent)
+                .where(
+                    models.ScheduledEvent.session_id == session_id,
+                    models.ScheduledEvent.status == ScheduledEventStatus.PENDING,
+                    models.ScheduledEvent.due_at <= through,
+                )
+                # Chronological, then by insertion, so two events due in the same
+                # fictional minute always resolve in the order they were scheduled.
+                .order_by(models.ScheduledEvent.due_at, models.ScheduledEvent.created_at)
+            )
+        ).scalars()
+        return [_to_scheduled_event(row) for row in rows]
+
+    async def set_scheduled_event_status(
+        self, event_id: uuid.UUID, status: ScheduledEventStatus
+    ) -> None:
+        row = await self._db.get(models.ScheduledEvent, event_id)
+        if row is None:  # pragma: no cover - the caller loaded it moments earlier
+            raise LookupError(f"ScheduledEvent {event_id} vanished mid-advance")
+        row.status = status
+        await self._db.flush()
+
     # -- TurnUnitOfWorkPort -----------------------------------------------------
 
     async def commit(self) -> None:
         await self._db.commit()
 
     # -- internals --------------------------------------------------------------
+
+    async def _next_event_sequence(self, session_id: uuid.UUID) -> int:
+        """One past the highest sequence this session has used.
+
+        Derived rather than kept in a counter column, so there is no second number
+        that can disagree with the rows themselves. The unique constraint on
+        (session_id, event_sequence) turns any race into a failed transaction rather
+        than two events quietly claiming the same position.
+        """
+        highest = (
+            await self._db.execute(
+                select(func.max(models.GameEvent.event_sequence)).where(
+                    models.GameEvent.session_id == session_id
+                )
+            )
+        ).scalar()
+        return (highest or 0) + 1
 
     async def _find_relationship(
         self, session_id: uuid.UUID, character_id: uuid.UUID

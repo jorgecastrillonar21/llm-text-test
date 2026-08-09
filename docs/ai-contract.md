@@ -14,6 +14,7 @@ no database session.
 | `world_rules` | the world's rules, projected and flattened | — |
 | `player` | name, description | — |
 | `session` | title, current location, summary, turn index | — |
+| `time` | fictional date, hour, part of day, elapsed since start | — |
 | `relevant_characters` | full profiles incl. goals and secrets | 12 |
 | `recent_messages` | transcript, oldest-first | 20 |
 | `relevant_memories` | importance desc, then recency | 30 |
@@ -48,6 +49,28 @@ system prompt because they never vary; only the values are re-sent per turn.
 Like secrets, this is a prompt-level guarantee. A model that ignores its rules produces a
 bad turn, not a corrupted save — nothing the model returns bypasses contract validation.
 Full semantics: [world-rules.md](world-rules.md).
+
+### Time in the context
+
+`time` is a `TimeContext`, derived on every turn from the session's `elapsed_minutes`
+and the world's start date. It renders as one line:
+
+```text
+Now: 2 June, 842, 16:42 (afternoon) — 20 days, 3 hours into this story
+```
+
+The raw minute counter is deliberately absent. A narrator has no use for "29022" and
+would only be tempted to do arithmetic on it.
+
+**The model cannot move the clock, and this one is not merely a prompt-level
+guarantee.** `TurnGeneration` has no field that reaches `elapsed_minutes`, and adding
+one would make token sampling the arbiter of how long a journey took — the same mistake
+as letting `temperature` resolve a dice roll. A turn leaves the clock exactly where it
+was; only `application/time_service.py` moves it. What *is* prompt-level is the
+instruction not to narrate around the clock — not to announce that a night passed, and
+not to state an hour other than the one given. A model that ignores it writes a scene
+that disagrees with the header, not a corrupted save.
+Full semantics: [world-state-time.md](world-state-time.md).
 
 ## TurnGeneration — what the model returns
 

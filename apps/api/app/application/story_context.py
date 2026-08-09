@@ -28,6 +28,7 @@ from app.domain.world_rules.enums import (
     SubstanceUsePolicy,
     TimeProgression,
 )
+from app.domain.world_time import TimeOfDay
 
 
 class WorldContext(BaseModel):
@@ -56,6 +57,25 @@ class SessionContext(BaseModel):
     current_location: str
     summary: str
     turn_index: int
+
+
+class TimeContext(BaseModel):
+    """What time it is in the fiction, as the Story Director should read it.
+
+    Every field is derived from the session's `elapsed_minutes`. The raw counter is
+    deliberately not here: a narrator has no use for "28980" and would only be tempted
+    to do arithmetic on it, while the phrasing below is what actually shapes a scene.
+
+    Read-only in the strongest sense available -- the director's response schema has
+    no field that reaches the clock, so the only way time moves is application code.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    calendar_date: str
+    clock: str
+    period: TimeOfDay
+    elapsed_since_start: str
 
 
 class CharacterContext(BaseModel):
@@ -204,6 +224,7 @@ class StoryContext(BaseModel):
     world_rules: WorldRulesContext
     player: PlayerContext
     session: SessionContext
+    time: TimeContext
     relevant_characters: list[CharacterContext] = Field(default_factory=list)
     recent_messages: list[MessageContext] = Field(default_factory=list)
     relevant_memories: list[MemoryContext] = Field(default_factory=list)

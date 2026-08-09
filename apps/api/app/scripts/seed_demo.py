@@ -17,6 +17,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.domain.enums import Language
 from app.domain.world_rules import WorldRulesPreset, build_preset
+from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
 from app.infrastructure.db.engine import create_engine, create_session_factory, session_scope
 
@@ -29,6 +30,7 @@ DEMO_WORLD_NAME = "The Fractured Crown"
 # constant trouble, rarely fatal -- and it makes the danger/lethality split visible in
 # the one world people actually run: danger 75 against lethality 30.
 DEMO_WORLD_PRESET = WorldRulesPreset.SHONEN
+DEMO_WORLD_START = FictionalDateTime(year=842, month=10, day=3, hour=18, minute=20)
 
 
 class SeedCharacter(TypedDict):
@@ -113,6 +115,9 @@ async def seed() -> None:
                 ),
                 language=Language.EN,
                 rules_json=build_preset(DEMO_WORLD_PRESET).model_dump(mode="json"),
+                # An evening in autumn, so a new session starts somewhere with a mood
+                # rather than at the default first morning of year one.
+                initial_datetime=DEMO_WORLD_START.model_dump(mode="json"),
             )
             db.add(world)
             await db.flush()

@@ -4,19 +4,27 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.application.ports import ProviderState
 from app.application.turn_service import AppliedRelationship, TurnMessage
 from app.domain.enums import Language, MemoryKind, MessageRole
+from app.domain.errors import ValidationError as DomainValidationError
 from app.domain.world_rules import (
     WorldRules,
     WorldRulesPreset,
     WorldRulesV1,
     build_preset,
     default_world_rules,
+)
+from app.domain.world_time import (
+    DEFAULT_INITIAL_DATETIME,
+    STANDARD_CALENDAR,
+    FictionalDateTime,
+    TimeOfDay,
+    project_time,
 )
 
 
@@ -33,6 +41,24 @@ class WorldCreate(BaseModel):
 
     rules: WorldRulesV1 | None = None
     """Supply the whole document instead. Mutually exclusive with `rules_preset`."""
+
+    initial_datetime: FictionalDateTime | None = None
+    """The fictional date and time that a session's minute zero corresponds to.
+
+    Omitted means the first morning of year one. Fixed at creation, like the language
+    and the rules: moving a world's origin would silently reinterpret every fictional
+    timestamp already recorded against it.
+    """
+
+    @model_validator(mode="after")
+    def _reject_impossible_start_date(self) -> Self:
+        """A start date the calendar does not have is a 422, not a clamped value."""
+        if self.initial_datetime is not None:
+            try:
+                STANDARD_CALENDAR.check(self.initial_datetime)
+            except DomainValidationError as exc:
+                raise ValueError(str(exc)) from exc
+        return self
 
     @model_validator(mode="after")
     def _reject_ambiguous_rules(self) -> Self:
@@ -58,6 +84,10 @@ class WorldCreate(BaseModel):
             return build_preset(self.rules_preset)
         return default_world_rules()
 
+    def resolved_initial_datetime(self) -> FictionalDateTime:
+        """The fictional instant this world's sessions will start at."""
+        return self.initial_datetime or DEFAULT_INITIAL_DATETIME
+
 
 class WorldRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -68,6 +98,9 @@ class WorldRead(BaseModel):
     genre: str
     setting: str
     language: Language
+    initial_datetime: FictionalDateTime
+    """Small enough to carry in a list, unlike the rules document, and the only way
+    to see what a world was actually created with."""
     created_at: datetime
     updated_at: datetime
 
@@ -119,12 +152,47 @@ class SessionRead(BaseModel):
     current_location: str
     summary: str
     turn_index: int
+    elapsed_minutes: int
+    """The raw simulation clock. `SessionDetail` also carries the readable form; this
+    stays because a caller doing arithmetic should use the number, not parse a
+    sentence."""
     created_at: datetime
     updated_at: datetime
 
 
+class TimeDisplayRead(BaseModel):
+    """The clock as text. Derived per request, stored nowhere."""
+
+    date: str
+    time: str
+    period: TimeOfDay
+    elapsed: str
+
+
+class SessionTimeRead(BaseModel):
+    elapsed_minutes: int
+    display: TimeDisplayRead
+
+    @classmethod
+    def project(cls, elapsed_minutes: int, initial: FictionalDateTime) -> SessionTimeRead:
+        now = project_time(elapsed_minutes, initial=initial)
+        return cls(
+            elapsed_minutes=now.elapsed_minutes,
+            display=TimeDisplayRead(
+                date=now.calendar_date,
+                time=now.clock,
+                period=now.period,
+                elapsed=now.elapsed_since_start,
+            ),
+        )
+
+
 class SessionDetail(SessionRead):
     world: WorldRead
+    time: SessionTimeRead
+    """Served with the session rather than from its own endpoint: the screen that
+    shows the clock already loads this, and a second round trip for four derived
+    strings would be one more thing to keep in sync."""
 
 
 class MessageRead(BaseModel):
@@ -175,6 +243,20 @@ class TurnResponse(BaseModel):
     memories_created: int
     events_created: int
     visual_cue_generated: bool
+
+
+class ScheduledEventCreate(BaseModel):
+    """Body for the development-only scheduling endpoint.
+
+    Takes a delay rather than an absolute time on purpose: "in three days" is what a
+    caller means, and converting it once at the boundary is what keeps `due_at`
+    unambiguous in storage.
+    """
+
+    type: str = Field(min_length=1, max_length=80)
+    delay_minutes: int = Field(ge=0)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    interrupt_player_action: bool = False
 
 
 class ProviderStatusRead(BaseModel):

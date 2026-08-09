@@ -6,7 +6,7 @@ a stale dev database can never be papered over by create_all at startup.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -21,18 +21,30 @@ from sqlalchemy.ext.asyncio import (
 from app.config import Settings
 
 
-def _apply_sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.close()
+def _sqlite_pragmas(enforce_foreign_keys: bool) -> Callable[[Any, Any], None]:
+    def apply(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"PRAGMA foreign_keys={'ON' if enforce_foreign_keys else 'OFF'}")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+
+    return apply
 
 
-def create_engine(settings: Settings) -> AsyncEngine:
+def create_engine(settings: Settings, *, enforce_foreign_keys: bool = True) -> AsyncEngine:
+    """The application's engine. Foreign keys are enforced unless a caller says not to.
+
+    The one caller that says not to is the migration runner, and it has a specific
+    reason: SQLite cannot alter a column in place, so Alembic's batch mode rebuilds
+    the table -- copy, `DROP TABLE`, rename. With enforcement on, that DROP fires
+    every `ON DELETE CASCADE` aimed at the table, so rebuilding `worlds` would take
+    every character, session, message and memory in the database down with it. See
+    `migrations/env.py`.
+    """
     engine = create_async_engine(settings.database_url, echo=False, future=True)
     if engine.dialect.name == "sqlite":
-        event.listen(engine.sync_engine, "connect", _apply_sqlite_pragmas)
+        event.listen(engine.sync_engine, "connect", _sqlite_pragmas(enforce_foreign_keys))
     return engine
 
 

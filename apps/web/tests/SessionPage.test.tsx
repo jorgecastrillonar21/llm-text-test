@@ -14,6 +14,7 @@ const SESSION = {
   current_location: 'the market',
   summary: '',
   turn_index: 0,
+  elapsed_minutes: 29022,
   created_at: '',
   updated_at: '',
   world: {
@@ -23,8 +24,18 @@ const SESSION = {
     genre: 'fantasy',
     setting: '',
     language: 'en',
+    initial_datetime: { year: 842, month: 5, day: 13, hour: 13, minute: 0 },
     created_at: '',
     updated_at: '',
+  },
+  time: {
+    elapsed_minutes: 29022,
+    display: {
+      date: '2 June, 842',
+      time: '16:42',
+      period: 'afternoon',
+      elapsed: '20 days, 3 hours',
+    },
   },
 };
 
@@ -104,6 +115,27 @@ describe('SessionPage', () => {
 
     expect(await screen.findByText('Run 1')).toBeInTheDocument();
     expect(await screen.findByText('The market is loud.')).toBeInTheDocument();
+  });
+
+  it('shows the fictional date and hour alongside the turn count', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    const clock = await screen.findByLabelText('Time in the story');
+    expect(clock).toHaveTextContent('2 June, 842');
+    expect(clock).toHaveTextContent('16:42');
+    // The period is a fixed vocabulary, so it is translated rather than passed through.
+    expect(clock).toHaveTextContent('afternoon');
+    // Turn count and fictional time are both present and measure different things.
+    expect(screen.getByText('Turn 0')).toBeInTheDocument();
+  });
+
+  it('never shows the raw minute counter', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    await screen.findByLabelText('Time in the story');
+    expect(screen.queryByText(/29022/)).not.toBeInTheDocument();
   });
 
   it('sends an action and shows the returned suggestions', async () => {

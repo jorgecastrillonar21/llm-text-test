@@ -44,10 +44,35 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
+def verify_no_orphans(connection: Connection) -> None:
+    """Prove that turning enforcement off did not leave dangling references behind.
+
+    Cheap insurance: without it, "we disabled foreign keys for the migration" would
+    be a hope rather than a checked claim. A violation fails the upgrade loudly
+    instead of leaving a database that only misbehaves later.
+    """
+    if connection.dialect.name != "sqlite":
+        return
+    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(
+            f"Migration left {len(violations)} orphaned row(s): {violations[:5]}. "
+            "The database was not upgraded cleanly."
+        )
+
+
 async def run_migrations_online() -> None:
-    engine = create_engine(settings)
+    # Foreign keys are enforced at runtime, but must not be while migrating. SQLite
+    # cannot alter a column in place, so batch mode rebuilds the table: copy it,
+    # DROP the original, rename the copy. With enforcement on, that DROP fires every
+    # ON DELETE CASCADE pointing at the table -- rebuilding `worlds` would delete
+    # every character, session, message and memory in the database, silently and
+    # successfully. SQLite's own ALTER TABLE guidance is to disable enforcement
+    # around a rebuild; `verify_no_orphans` is what makes that safe to do.
+    engine = create_engine(settings, enforce_foreign_keys=False)
     async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
+        await connection.run_sync(verify_no_orphans)
     await engine.dispose()
 
 

@@ -29,9 +29,11 @@ from app.application.story_context import (
     RelationshipContext,
     SessionContext,
     StoryContext,
+    TimeContext,
     WorldContext,
 )
 from app.domain.enums import MessageRole
+from app.domain.world_time import project_time
 
 RECENT_MESSAGE_LIMIT = 20
 MEMORY_LIMIT = 30
@@ -52,6 +54,10 @@ async def build_story_context(
     memories = await reader.load_memories(session.id, limit=MEMORY_LIMIT)
     relationships = await reader.load_relationships(session.id)
 
+    # Derived here, every turn, from the one number that is stored. There is no
+    # cached "current date" anywhere for this to disagree with.
+    now = project_time(session.elapsed_minutes, initial=world.initial_datetime)
+
     return StoryContext(
         world=WorldContext(
             id=world.id,
@@ -71,6 +77,12 @@ async def build_story_context(
             current_location=session.current_location,
             summary=session.summary,
             turn_index=session.turn_index,
+        ),
+        time=TimeContext(
+            calendar_date=now.calendar_date,
+            clock=now.clock,
+            period=now.period,
+            elapsed_since_start=now.elapsed_since_start,
         ),
         relevant_characters=[_to_character_context(record) for record in characters],
         recent_messages=[_to_message_context(message, names) for message in messages],

@@ -8,7 +8,8 @@ that boundary earns its keep: external AI systems and the database.
 ```text
 apps/api/app/
 ├── domain/           pure Python: enums, relationship rules, errors. No I/O, no ORM.
-│   └── world_rules/      WorldRulesV1, its enums, presets, versioned parsing
+│   ├── world_rules/      WorldRulesV1, its enums, presets, versioned parsing
+│   └── world_time/       the simulation clock, calendar projection, scheduling
 ├── application/      use cases, the AI contract, ports. Depends on domain only.
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
@@ -16,7 +17,8 @@ apps/api/app/
 │   ├── persistence.py    read/write DTOs + the persistence ports
 │   ├── context_builder.py  all retrieval policy, in one place
 │   ├── rules_projection.py WorldRules → the compact AI-facing view
-│   └── turn_service.py   the turn use case
+│   ├── turn_service.py   the turn use case
+│   └── time_service.py   the only writer of the simulation clock
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
 │   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
 ├── api/              HTTP adapter and composition: routers, DTOs, errors, DI
@@ -132,11 +134,17 @@ The turn use case reaches storage through three Protocols in
 | `StoryContextReaderPort` | the reads that feed context assembly |
 | `TurnPersistencePort` | session/world lookups and every turn write |
 | `TurnUnitOfWorkPort` | `commit()` |
+| `SessionClockPort` | the simulation clock and its scheduled events |
 
-`TurnGatewayPort` composes all three. `build_story_context` takes only the reader —
-functions declare the narrowest port they need — while `execute_turn` takes the
+`TurnGatewayPort` composes the first three. `build_story_context` takes only the reader
+— functions declare the narrowest port they need — while `execute_turn` takes the
 composite, because one transaction genuinely spans all three and splitting it into
 three arguments that must be the same object helps nobody.
+
+`SessionClockPort` is deliberately outside that composite. A turn *reads* the clock and
+never moves it, so `advance_time` gets a port that reaches the clock, the scheduled
+events and the audit trail, and cannot touch the transcript or the relationships. The
+same adapter satisfies it, since both use cases run in one request's transaction.
 
 Limits (`RECENT_MESSAGE_LIMIT`, `MEMORY_LIMIT`, `CHARACTER_LIMIT`) stay in the
 application: how much history is worth sending is policy, not storage. Ordering is
@@ -163,7 +171,10 @@ silently papered over.
   datetimes on write and returns timezone-aware UTC on read — SQLite has no native
   timezone support and would otherwise hand back naive values that break comparisons.
 - **Pragmas** per connection: `foreign_keys=ON`, `journal_mode=WAL`,
-  `synchronous=NORMAL`.
+  `synchronous=NORMAL`. Migrations are the one exception and run with `foreign_keys=OFF`:
+  SQLite cannot alter a column in place, so Alembic's batch mode rebuilds the table by
+  dropping it, and with enforcement on that DROP cascades away every child row. See
+  [world-state-time.md](world-state-time.md#persistence).
 - **Indexes** follow real access patterns: `(session_id, turn_index)` for transcripts,
   `(session_id, importance, created_at)` for memory retrieval.
 - **Check constraints** enforce `importance BETWEEN 1 AND 5` and the `-100..100`
@@ -174,6 +185,12 @@ silently papered over.
   cost every read a join. It is never treated as an arbitrary dictionary: everything in
   and out goes through `parse_world_rules`, and a corrupt row fails loudly instead of
   defaulting. See [world-rules.md](world-rules.md#persistence).
+- **`game_sessions.elapsed_minutes`** is the authoritative simulation clock, and the
+  only stored temporal value: the date, the hour and the part of the day are projected
+  from it on every read, so there is nothing that can disagree with it. `game_events`
+  carry `occurred_at` alongside `turn_index` and an `event_sequence` that is unique per
+  session, because everything in a turn usually shares a fictional minute and ordering
+  needs a real tiebreak. See [world-state-time.md](world-state-time.md).
 
 ## AI provider boundaries
 

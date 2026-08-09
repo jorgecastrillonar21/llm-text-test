@@ -118,6 +118,14 @@ const en = {
   'session.turnFailedRetry': 'Nothing was saved. You can try again.',
   'session.narrator': 'Narrator',
   'session.you': 'You',
+  // The fictional clock. Read-only on purpose: the game moves time, never the UI.
+  'session.time.label': 'Time in the story',
+  'session.time.dawn': 'dawn',
+  'session.time.morning': 'morning',
+  'session.time.afternoon': 'afternoon',
+  'session.time.evening': 'evening',
+  'session.time.night': 'night',
+  'session.time.lateNight': 'late night',
 
   'settings.heading': 'Settings',
   'settings.uiLanguage': 'Interface language',
@@ -243,6 +251,13 @@ const es: Record<MessageKey, string> = {
   'session.turnFailedRetry': 'No se ha guardado nada. Puedes intentarlo de nuevo.',
   'session.narrator': 'Narrador',
   'session.you': 'Tú',
+  'session.time.label': 'Hora en la historia',
+  'session.time.dawn': 'amanecer',
+  'session.time.morning': 'mañana',
+  'session.time.afternoon': 'tarde',
+  'session.time.evening': 'atardecer',
+  'session.time.night': 'noche',
+  'session.time.lateNight': 'madrugada',
 
   'settings.heading': 'Ajustes',
   'settings.uiLanguage': 'Idioma de la interfaz',

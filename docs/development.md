@@ -64,6 +64,14 @@ Autogenerate compares `Base.metadata` against the live database — **always rea
 generated migration before committing it**. SQLite cannot `ALTER` most things in place,
 so `render_as_batch=True` is enabled; batch mode rewrites the table.
 
+"Rewrites the table" means copy, `DROP TABLE`, rename — and a DROP fires every
+`ON DELETE CASCADE` aimed at that table. `migrations/env.py` therefore runs migrations
+with `PRAGMA foreign_keys=OFF` and checks `PRAGMA foreign_key_check` afterwards. Without
+that, altering a column on `worlds` deletes every character, session, message and memory
+in the database, and the migration reports success. If you write a migration that touches
+a table other rows point at, extend `tests/test_migrations.py` to migrate a *populated*
+database and assert the rows are still there — that is the only check that catches this.
+
 Models use `UtcDateTime`, so generated migrations reference
 `app.infrastructure.db.types`. The migration template imports it for you.
 

@@ -146,7 +146,13 @@ async def test_turn_index_and_events_are_persisted(
     gateway = SqlAlchemyTurnGateway(db_session)
 
     await gateway.add_event(
-        NewEvent(session_id=session.id, turn_index=1, type="arrival", description="Rin arrived.")
+        NewEvent(
+            session_id=session.id,
+            turn_index=1,
+            occurred_at=0,
+            type="arrival",
+            description="Rin arrived.",
+        )
     )
     await gateway.set_turn_index(session.id, 7)
     await gateway.commit()

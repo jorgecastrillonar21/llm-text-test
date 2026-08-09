@@ -80,6 +80,15 @@ class Settings(BaseSettings):
         return value
 
     @property
+    def dev_endpoints_enabled(self) -> bool:
+        """Whether `/api/v1/dev/*` is mounted.
+
+        An allowlist, not a "not production" check: a typo in APP_ENV should leave
+        developer tooling switched off rather than quietly switch it on.
+        """
+        return self.app_env.strip().casefold() in {"development", "test"}
+
+    @property
     def workflow_path(self) -> Path | None:
         if not self.comfyui_workflow_path.strip():
             return None

@@ -43,6 +43,14 @@ class UnsupportedRulesVersionError(InvalidWorldRulesError):
         self.supported = supported
 
 
+class TimeProgressionError(ValidationError):
+    """Something asked to advance the clock in a world whose rules do not allow it.
+
+    Distinct from a malformed request: the request was well-formed and the world said
+    no. A paused world stays paused even when the caller is confident.
+    """
+
+
 class StoryGenerationError(DomainError):
     """The story provider could not produce a valid turn.
 
