@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.application.ports import ProviderState
 from app.application.turn_service import AppliedRelationship, TurnMessage
 from app.domain.enums import Language, MemoryKind, MessageRole
+from app.domain.world_rules import (
+    WorldRules,
+    WorldRulesPreset,
+    WorldRulesV1,
+    build_preset,
+    default_world_rules,
+)
 
 
 class WorldCreate(BaseModel):
@@ -19,6 +27,36 @@ class WorldCreate(BaseModel):
     setting: str = Field(default="", max_length=4000)
     # Fixed for the lifetime of the world; there is deliberately no update path.
     language: Language = Language.EN
+
+    rules_preset: WorldRulesPreset | None = None
+    """Pick a named starting point. Resolved at creation; the name is not stored."""
+
+    rules: WorldRulesV1 | None = None
+    """Supply the whole document instead. Mutually exclusive with `rules_preset`."""
+
+    @model_validator(mode="after")
+    def _reject_ambiguous_rules(self) -> Self:
+        """Both fields at once is a 422, not a precedence rule.
+
+        Silently preferring one would make the ignored half look like it took
+        effect, and a caller who sent both does not agree with themselves about
+        what the world should be. Better to ask.
+        """
+        if self.rules_preset is not None and self.rules is not None:
+            raise ValueError(
+                "Provide either 'rules_preset' or 'rules', not both. "
+                "To start from a preset and adjust it, read the preset's rules "
+                "and send the modified document as 'rules'."
+            )
+        return self
+
+    def resolved_rules(self) -> WorldRules:
+        """The rules this world will actually be created with."""
+        if self.rules is not None:
+            return self.rules
+        if self.rules_preset is not None:
+            return build_preset(self.rules_preset)
+        return default_world_rules()
 
 
 class WorldRead(BaseModel):

@@ -21,6 +21,28 @@ class ValidationError(DomainError):
     """Caller supplied semantically invalid input."""
 
 
+class InvalidWorldRulesError(ValidationError):
+    """A WorldRules document could not be read.
+
+    A subclass of ValidationError so the existing 422 mapping applies, but distinct
+    so a caller can tell "your rules are malformed" from any other bad input.
+    """
+
+
+class UnsupportedRulesVersionError(InvalidWorldRulesError):
+    """The document declares a version this build does not know how to read.
+
+    Deliberately fatal rather than best-effort: guessing at an unknown schema would
+    quietly hand a language model rules nobody wrote.
+    """
+
+    def __init__(self, version: object, supported: tuple[int, ...]) -> None:
+        listed = ", ".join(str(v) for v in supported)
+        super().__init__(f"Unsupported WorldRules version {version!r}; this build reads {listed}.")
+        self.version = version
+        self.supported = supported
+
+
 class StoryGenerationError(DomainError):
     """The story provider could not produce a valid turn.
 

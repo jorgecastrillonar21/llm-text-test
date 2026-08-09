@@ -34,6 +34,7 @@ from app.application.turn_service import execute_turn
 from app.domain.enums import Language, MemoryKind
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector
+from app.domain.world_rules import default_world_rules
 
 SESSION_ID = uuid.uuid4()
 WORLD_ID = uuid.uuid4()
@@ -61,6 +62,7 @@ class FakeTurnGateway:
             genre="fantasy",
             setting="a town",
             language=Language.EN,
+            rules=default_world_rules(),
         )
         self.characters = [
             CharacterRecord(

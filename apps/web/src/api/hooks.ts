@@ -11,11 +11,13 @@ import type {
   TurnResponse,
   World,
   WorldCreate,
+  WorldRules,
 } from './types';
 
 export const queryKeys = {
   worlds: ['worlds'] as const,
   world: (id: string) => ['worlds', id] as const,
+  worldRules: (id: string) => ['worlds', id, 'rules'] as const,
   characters: (worldId: string) => ['worlds', worldId, 'characters'] as const,
   sessions: (worldId?: string) => ['sessions', worldId ?? 'all'] as const,
   session: (id: string) => ['sessions', id] as const,
@@ -31,6 +33,17 @@ export function useWorld(id: string) {
   return useQuery({
     queryKey: queryKeys.world(id),
     queryFn: () => api.get<World>(`/api/v1/worlds/${id}`),
+  });
+}
+
+export function useWorldRules(id: string) {
+  return useQuery({
+    queryKey: queryKeys.worldRules(id),
+    // Its own endpoint because the document is ~3 KB and the world list would
+    // otherwise carry a copy per row. Rules never change after creation, so this
+    // is fetched once and kept.
+    queryFn: () => api.get<WorldRules>(`/api/v1/worlds/${id}/rules`),
+    staleTime: Infinity,
   });
 }
 

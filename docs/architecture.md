@@ -8,12 +8,14 @@ that boundary earns its keep: external AI systems and the database.
 ```text
 apps/api/app/
 ├── domain/           pure Python: enums, relationship rules, errors. No I/O, no ORM.
+│   └── world_rules/      WorldRulesV1, its enums, presets, versioned parsing
 ├── application/      use cases, the AI contract, ports. Depends on domain only.
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
 │   ├── ports.py          StoryGeneratorPort, ImageGeneratorPort (Protocols)
 │   ├── persistence.py    read/write DTOs + the persistence ports
 │   ├── context_builder.py  all retrieval policy, in one place
+│   ├── rules_projection.py WorldRules → the compact AI-facing view
 │   └── turn_service.py   the turn use case
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
 │   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
@@ -166,6 +168,12 @@ silently papered over.
   `(session_id, importance, created_at)` for memory retrieval.
 - **Check constraints** enforce `importance BETWEEN 1 AND 5` and the `-100..100`
   relationship range at the database level, in addition to application clamping.
+- **`worlds.rules_json`** stores a whole `WorldRulesV1` document in one JSON column
+  rather than a table per section. It is static configuration with no independent
+  lifecycle and no queries of its own, so relational decomposition would buy nothing and
+  cost every read a join. It is never treated as an arbitrary dictionary: everything in
+  and out goes through `parse_world_rules`, and a corrupt row fails loudly instead of
+  defaulting. See [world-rules.md](world-rules.md#persistence).
 
 ## AI provider boundaries
 

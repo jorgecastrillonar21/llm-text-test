@@ -49,6 +49,46 @@ const en = {
   'world.form.language': 'Story language',
   'world.form.languageHelp':
     'The language the story is written in. This is fixed once the world is created.',
+  'world.form.preset': 'World style',
+  'world.form.presetHelp': 'How harsh, hopeful and fast this world is. Chosen once, at creation.',
+
+  'rules.heading': 'World rules',
+  'rules.field.danger': 'Danger',
+  'rules.field.lethality': 'Lethality',
+  'rules.field.plotArmor': 'Plot armor',
+  'rules.field.consequences': 'Consequences',
+  'rules.field.progression': 'Progression',
+  'rules.field.simulation': 'World clock',
+  'rules.field.enforcement': 'Rules',
+
+  'rules.level.veryLow': 'Very low',
+  'rules.level.low': 'Low',
+  'rules.level.moderate': 'Moderate',
+  'rules.level.high': 'High',
+  'rules.level.veryHigh': 'Very high',
+
+  'rules.pace.off': 'None',
+  'rules.pace.verySlow': 'Very slow',
+  'rules.pace.slow': 'Slow',
+  'rules.pace.medium': 'Medium',
+  'rules.pace.fast': 'Fast',
+  'rules.pace.animeFast': 'Explosive',
+
+  'rules.time.paused': 'Paused',
+  'rules.time.actionBased': 'Moves with you',
+  'rules.time.active': 'Always running',
+
+  'rules.enforcement.cinematic': 'Cinematic',
+  'rules.enforcement.flexible': 'Flexible',
+  'rules.enforcement.strict': 'Strict',
+  'rules.enforcement.simulationist': 'Simulationist',
+
+  'rules.preset.balanced': 'Balanced',
+  'rules.preset.cozyFantasy': 'Cozy fantasy',
+  'rules.preset.shonen': 'Shonen',
+  'rules.preset.darkFantasy': 'Dark fantasy',
+  'rules.preset.simulationist': 'Simulationist',
+  'rules.preset.isekaiPowerFantasy': 'Isekai power fantasy',
 
   'world.characters': 'Characters',
   'world.charactersEmpty': 'No characters yet. Add one so the world has someone in it.',
@@ -133,6 +173,47 @@ const es: Record<MessageKey, string> = {
   'world.form.language': 'Idioma de la historia',
   'world.form.languageHelp':
     'El idioma en el que se escribe la historia. No se puede cambiar una vez creado el mundo.',
+  'world.form.preset': 'Estilo del mundo',
+  'world.form.presetHelp':
+    'Cuán duro, esperanzador y rápido es este mundo. Se elige una vez, al crearlo.',
+
+  'rules.heading': 'Reglas del mundo',
+  'rules.field.danger': 'Peligro',
+  'rules.field.lethality': 'Letalidad',
+  'rules.field.plotArmor': 'Protección del guion',
+  'rules.field.consequences': 'Consecuencias',
+  'rules.field.progression': 'Progresión',
+  'rules.field.simulation': 'Reloj del mundo',
+  'rules.field.enforcement': 'Reglas',
+
+  'rules.level.veryLow': 'Muy baja',
+  'rules.level.low': 'Baja',
+  'rules.level.moderate': 'Moderada',
+  'rules.level.high': 'Alta',
+  'rules.level.veryHigh': 'Muy alta',
+
+  'rules.pace.off': 'Ninguna',
+  'rules.pace.verySlow': 'Muy lenta',
+  'rules.pace.slow': 'Lenta',
+  'rules.pace.medium': 'Media',
+  'rules.pace.fast': 'Rápida',
+  'rules.pace.animeFast': 'Explosiva',
+
+  'rules.time.paused': 'En pausa',
+  'rules.time.actionBased': 'Avanza contigo',
+  'rules.time.active': 'Siempre en marcha',
+
+  'rules.enforcement.cinematic': 'Cinematográfico',
+  'rules.enforcement.flexible': 'Flexible',
+  'rules.enforcement.strict': 'Estricto',
+  'rules.enforcement.simulationist': 'Simulacionista',
+
+  'rules.preset.balanced': 'Equilibrado',
+  'rules.preset.cozyFantasy': 'Fantasía acogedora',
+  'rules.preset.shonen': 'Shonen',
+  'rules.preset.darkFantasy': 'Fantasía oscura',
+  'rules.preset.simulationist': 'Simulacionista',
+  'rules.preset.isekaiPowerFantasy': 'Isekai de poder',
 
   'world.characters': 'Personajes',
   'world.charactersEmpty': 'Todavía no hay personajes. Añade uno para que el mundo tenga vida.',

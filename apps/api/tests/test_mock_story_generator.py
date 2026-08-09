@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from app.application.rules_projection import project_world_rules
 from app.application.story_context import (
     CharacterContext,
     PlayerContext,
@@ -14,6 +15,7 @@ from app.application.story_context import (
     WorldContext,
 )
 from app.domain.enums import Language
+from app.domain.world_rules import default_world_rules
 from app.infrastructure.story.mock import MockStoryGenerator
 
 ELENA_ID = uuid.uuid4()
@@ -30,6 +32,7 @@ def build_context(action: str, language: Language = Language.EN, turn: int = 0) 
             setting="the capital",
             language=language,
         ),
+        world_rules=project_world_rules(default_world_rules()),
         player=PlayerContext(name="Rin", description="a traveller"),
         session=SessionContext(
             id=uuid.uuid4(), title="s", current_location="the market", summary="", turn_index=turn

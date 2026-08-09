@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -20,12 +21,22 @@ from sqlalchemy.types import JSON
 
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import AXIS_MAX, AXIS_MIN
+from app.domain.world_rules import default_world_rules
 from app.infrastructure.db.base import Base
 from app.infrastructure.db.types import UtcDateTime, utcnow
 
 
 def _uuid_pk() -> Mapped[uuid.UUID]:
     return mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+
+def _default_rules_json() -> dict[str, Any]:
+    """Balanced defaults, so a world created without rules still has valid ones.
+
+    `dict[str, Any]` because that is what a JSON column round-trips to; the shape is
+    re-established by `parse_world_rules` on every read.
+    """
+    return default_world_rules().model_dump(mode="json")
 
 
 class World(Base):
@@ -38,6 +49,13 @@ class World(Base):
     setting: Mapped[str] = mapped_column(Text, default="", nullable=False)
     # Immutable after creation -- see Language docstring.
     language: Mapped[Language] = mapped_column(String(8), default=Language.EN, nullable=False)
+    # The whole WorldRules document as one JSON column rather than a dozen tables.
+    # It is static configuration read as a unit and never queried by field, so
+    # normalising it would buy joins and nothing else. Validity is enforced at the
+    # boundaries by parse_world_rules, not by the schema.
+    rules_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=_default_rules_json, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False

@@ -11,6 +11,7 @@ no database session.
 | Field | Contents | Bound |
 |---|---|---|
 | `world` | name, description, genre, setting, **language** | — |
+| `world_rules` | the world's rules, projected and flattened | — |
 | `player` | name, description | — |
 | `session` | title, current location, summary, turn index | — |
 | `relevant_characters` | full profiles incl. goals and secrets | 12 |
@@ -26,6 +27,27 @@ produces the same mock turn, which is what makes the E2E flow assertable.
 deflect, or lie about a secret. The prompt forbids stating them outright. This is a
 prompt-level guarantee, not an enforced one — a weak model may leak. Treat NPC secrets
 as flavour, not as a security boundary.
+
+### World rules in the context
+
+`world_rules` is a `WorldRulesContext` — a flattened projection of the world's
+`WorldRulesV1`, built by `application/rules_projection.py`. The provider never receives
+the domain document: the full thing is ~3 KB of JSON carrying sections that only future
+deterministic systems care about, and the prompt budget is a real constraint.
+
+The projection is rendered as a `# World rules` block in plain sentences, not as JSON.
+Sections dropped on the way: `society`, `resources`, power tier ceilings, progression
+sub-blocks, and the `chance` details beyond model and rerolls.
+
+The rules are **authoritative** — the prompt's first section says so, and its ten
+principles cover the failure modes that matter: plot armor acts before an outcome and
+never after, darkness is not danger, content settings describe rather than decide, and
+the model's own randomness is never the game's randomness. Those principles live in the
+system prompt because they never vary; only the values are re-sent per turn.
+
+Like secrets, this is a prompt-level guarantee. A model that ignores its rules produces a
+bad turn, not a corrupted save — nothing the model returns bypasses contract validation.
+Full semantics: [world-rules.md](world-rules.md).
 
 ## TurnGeneration — what the model returns
 

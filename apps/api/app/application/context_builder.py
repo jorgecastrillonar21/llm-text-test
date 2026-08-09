@@ -20,6 +20,7 @@ from app.application.persistence import (
     TranscriptMessage,
     WorldSnapshot,
 )
+from app.application.rules_projection import project_world_rules
 from app.application.story_context import (
     CharacterContext,
     MemoryContext,
@@ -60,6 +61,9 @@ async def build_story_context(
             setting=world.setting,
             language=world.language,
         ),
+        # Projected, not passed whole: the director gets the rules that shape a turn,
+        # not the sections reserved for future deterministic systems.
+        world_rules=project_world_rules(world.rules),
         player=PlayerContext(name=session.player_name, description=session.player_description),
         session=SessionContext(
             id=session.id,

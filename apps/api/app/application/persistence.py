@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import RelationshipVector
+from app.domain.world_rules import WorldRules
 
 # ---------------------------------------------------------------------------
 # Read DTOs
@@ -38,6 +39,11 @@ class WorldSnapshot(BaseModel):
     genre: str
     setting: str
     language: Language
+
+    rules: WorldRules
+    """Already validated. Adapters parse the stored document; nothing downstream
+    re-checks it, and there is deliberately no default -- an adapter that forgets to
+    map this fails loudly instead of quietly running a world on someone else's rules."""
 
 
 class SessionSnapshot(BaseModel):

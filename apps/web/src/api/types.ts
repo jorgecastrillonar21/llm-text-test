@@ -29,6 +29,46 @@ export interface WorldCreate {
   genre?: string;
   setting?: string;
   language: Language;
+  /**
+   * A named starting point for the world's rules. Omitted means balanced defaults.
+   *
+   * The backend also accepts a full `rules` document instead, and rejects a request
+   * carrying both. This client only ever sends a preset, so it cannot hit that case.
+   */
+  rules_preset?: WorldRulesPreset;
+}
+
+export const WORLD_RULES_PRESETS = [
+  'balanced',
+  'cozy_fantasy',
+  'shonen',
+  'dark_fantasy',
+  'simulationist',
+  'isekai_power_fantasy',
+] as const;
+
+export type WorldRulesPreset = (typeof WORLD_RULES_PRESETS)[number];
+
+export type ProgressionPace = 'very_slow' | 'slow' | 'medium' | 'fast' | 'anime_fast';
+export type TimeProgression = 'paused' | 'action_based' | 'active';
+export type RulesEnforcement = 'cinematic' | 'flexible' | 'strict' | 'simulationist';
+
+/**
+ * The parts of a world's rules this interface reads.
+ *
+ * Deliberately partial. The stored document has thirteen sections and the summary
+ * card shows seven values; typing the rest would be a second copy of the domain
+ * model to keep in sync for no benefit. Extra keys arrive over the wire and are
+ * simply ignored. See docs/world-rules.md for the whole document.
+ */
+export interface WorldRules {
+  version: number;
+  narrative: { plot_armor: { player: number } };
+  danger: { baseline: number; lethality: number };
+  consequences: { severity: number };
+  progression: { enabled: boolean; pace: ProgressionPace };
+  simulation: { time_progression: TimeProgression };
+  rules: { enforcement: RulesEnforcement };
 }
 
 export interface Character {

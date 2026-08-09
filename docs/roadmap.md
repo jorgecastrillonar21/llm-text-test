@@ -9,6 +9,17 @@ Current iteration. Monorepo, persistence with migrations, the AI contract, mock 
 Ollama story providers, the ComfyUI adapter boundary, one complete turn loop, a usable
 mobile-first PWA in English and Spanish, and tests that actually run.
 
+## Phase 1.5 — World rules ✅
+
+Every world now carries a validated, versioned `WorldRulesV1` document describing how its
+universe works, six presets to start from, and an authoritative rules block in the Story
+Director's context. Configuration only: no dice, no combat, no simulation engine. See
+[world-rules.md](world-rules.md), whose *deferred questions* section lists what this
+deliberately did not decide.
+
+The systems below that read those rules — WorldState, CharacterSheet, PowerSystem, rules
+resolution, world simulation — are each their own epic and none of them is started.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.

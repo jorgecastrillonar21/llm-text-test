@@ -16,12 +16,19 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.domain.enums import Language
+from app.domain.world_rules import WorldRulesPreset, build_preset
 from app.infrastructure.db import models
 from app.infrastructure.db.engine import create_engine, create_session_factory, session_scope
 
 logger = logging.getLogger(__name__)
 
 DEMO_WORLD_NAME = "The Fractured Crown"
+
+# Written explicitly rather than left to the column default, so the seed exercises the
+# same path the API uses. Shonen suits the genre string and keeps the demo playable --
+# constant trouble, rarely fatal -- and it makes the danger/lethality split visible in
+# the one world people actually run: danger 75 against lethality 30.
+DEMO_WORLD_PRESET = WorldRulesPreset.SHONEN
 
 
 class SeedCharacter(TypedDict):
@@ -105,6 +112,7 @@ async def seed() -> None:
                     "in the capital is deciding which side they were always on."
                 ),
                 language=Language.EN,
+                rules_json=build_preset(DEMO_WORLD_PRESET).model_dump(mode="json"),
             )
             db.add(world)
             await db.flush()
@@ -114,6 +122,7 @@ async def seed() -> None:
             await db.flush()
 
             print(f"Created demo world: {world.id}")
+            print(f"Rules: {DEMO_WORLD_PRESET.value}")
             print(f"Characters: {', '.join(c['name'] for c in CHARACTERS)}")
     finally:
         await engine.dispose()

@@ -11,6 +11,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.ports import StoryGeneratorPort
+from app.application.rules_projection import project_world_rules
 from app.application.story_context import (
     PlayerContext,
     SessionContext,
@@ -19,6 +20,7 @@ from app.application.story_context import (
 )
 from app.config import ImageProvider, Settings, StoryProvider
 from app.domain.enums import Language
+from app.domain.world_rules import default_world_rules
 from app.infrastructure.db.base import Base
 from app.infrastructure.db.engine import create_engine, create_session_factory
 from app.infrastructure.db.models import Character, World
@@ -80,6 +82,7 @@ def make_story_context():
                 setting="a town",
                 language=Language.EN,
             ),
+            world_rules=project_world_rules(default_world_rules()),
             player=PlayerContext(name="Rin", description=""),
             session=SessionContext(
                 id=uuid.uuid4(), title="s", current_location="", summary="", turn_index=0

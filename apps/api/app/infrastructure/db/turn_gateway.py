@@ -29,6 +29,7 @@ from app.application.persistence import (
     WorldSnapshot,
 )
 from app.domain.relationships import RelationshipVector
+from app.domain.world_rules import parse_world_rules
 from app.infrastructure.db import models
 
 
@@ -154,6 +155,10 @@ class SqlAlchemyTurnGateway:
             genre=row.genre,
             setting=row.setting,
             language=row.language,
+            # Validated on the way out, every read. A hand-edited or half-migrated
+            # rules_json raises here rather than reaching the Story Director as a
+            # document nobody wrote.
+            rules=parse_world_rules(row.rules_json),
         )
 
     async def known_character_ids(self, world_id: uuid.UUID) -> set[uuid.UUID]:

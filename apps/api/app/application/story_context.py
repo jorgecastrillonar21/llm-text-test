@@ -12,6 +12,22 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.enums import Language, MemoryKind, MessageRole
+from app.domain.world_rules.enums import (
+    ChanceModel,
+    ContentIntensity,
+    DeathFinality,
+    IncapacitationPolicy,
+    PowerGapSignificance,
+    PowerScale,
+    ProgressionPace,
+    PublicAwareness,
+    Rarity,
+    RomancePolicy,
+    RulesEnforcement,
+    SexualContentPolicy,
+    SubstanceUsePolicy,
+    TimeProgression,
+)
 
 
 class WorldContext(BaseModel):
@@ -87,10 +103,105 @@ class RelationshipContext(BaseModel):
     fear: int
 
 
+class PlotArmorContext(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    player: int
+    important_npcs: int
+    ordinary_npcs: int
+
+
+class WorldRulesContext(BaseModel):
+    """The rules the Story Director is allowed to see.
+
+    A curated subset of `WorldRulesV1`, not the whole document. Left out on purpose:
+    society, resources, and the finer power/consequence dials. Those exist for future
+    deterministic systems, and a per-turn narration prompt is not improved by knowing
+    that medicine scarcity is 35 -- it is only made longer, and prompt length is a
+    measured constraint on this project.
+
+    Flat rather than nested so the renderer can produce short lines without walking a
+    tree, and so adding a field is an explicit decision rather than a side effect of
+    adding one to the domain.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    # -- narrative shape
+    optimism: int
+    darkness: int
+    protagonist_centrality: int
+    deus_ex_machina: int
+    coincidence_frequency: int
+    consequence_persistence: int
+    plot_armor: PlotArmorContext
+
+    # -- mortality
+    player_death: bool
+    npc_death: bool
+    death_finality: DeathFinality
+    permanent_injury: bool
+    incapacitation_before_death: IncapacitationPolicy
+    resurrection_enabled: bool
+    resurrection_rarity: Rarity
+
+    # -- danger
+    danger_baseline: int
+    encounter_frequency: int
+    encounter_severity: int
+    escalation_rate: int
+    lethality: int
+    safe_zones_exist: bool
+
+    # -- consequences
+    consequence_severity: int
+    social_memory: int
+    actions_can_close_content: bool
+    irreversible_outcomes: bool
+
+    # -- power
+    power_scale: PowerScale
+    power_gap_significance: PowerGapSignificance
+    rule_breaking_allowed: Rarity
+    rule_breaking_requires_explanation: bool
+
+    # -- supernatural
+    supernatural_enabled: bool
+    supernatural_prevalence: Rarity
+    supernatural_public_awareness: PublicAwareness
+
+    # -- progression
+    progression_enabled: bool
+    progression_pace: ProgressionPace
+
+    # -- simulation
+    world_continues_without_player: bool
+    npc_autonomy: int
+    faction_autonomy: int
+    offscreen_events: bool
+    missed_opportunities: bool
+    time_progression: TimeProgression
+
+    # -- authority
+    enforcement: RulesEnforcement
+    chance_model: ChanceModel
+    narrative_rerolls: bool
+
+    # -- content presentation
+    violence: ContentIntensity
+    gore: ContentIntensity
+    horror: ContentIntensity
+    romance: RomancePolicy
+    sexual_content: SexualContentPolicy
+    substance_use: SubstanceUsePolicy
+    profanity: ContentIntensity
+
+
 class StoryContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     world: WorldContext
+    world_rules: WorldRulesContext
     player: PlayerContext
     session: SessionContext
     relevant_characters: list[CharacterContext] = Field(default_factory=list)
