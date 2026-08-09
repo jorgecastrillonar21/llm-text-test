@@ -32,6 +32,19 @@ from app.domain.world_facts import (
     SetFact,
     WorldFact,
 )
+from app.domain.world_locations import (
+    ConnectionCategory,
+    LocationAccessibility,
+    LocationCategory,
+    LocationCondition,
+    LocationConnection,
+    LocationConnectionState,
+    LocationDefinition,
+    LocationScale,
+    LocationState,
+    LocationZone,
+    PhysicalDistance,
+)
 from app.domain.world_rules import WorldRules
 from app.domain.world_time import FictionalDateTime, ScheduledEventStatus
 
@@ -195,6 +208,89 @@ class ScheduledEventRecord(BaseModel):
     interrupt_player_action: bool
 
 
+class NewLocation(BaseModel):
+    """A place to be written, with the application already having decided everything.
+
+    The id is deliberately absent: the application mints it. A caller that supplied one
+    could collide with an existing row, and the one caller most likely to try is a
+    language model reproducing a uuid it saw in a prompt.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    world_id: uuid.UUID
+    origin_session_id: uuid.UUID | None = None
+    """None writes reusable template geography. A session id writes canon local to one
+    save, which is what generative creation during a turn produces."""
+
+    name: str
+    description: str = ""
+    category: LocationCategory
+    subtype: str | None = None
+    scale: LocationScale
+    parent_location_id: uuid.UUID | None = None
+    importance: int = 3
+    tags: tuple[str, ...] = ()
+    spatial_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class NewConnection(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    world_id: uuid.UUID
+    origin_session_id: uuid.UUID | None = None
+    from_location_id: uuid.UUID
+    to_location_id: uuid.UUID
+    bidirectional: bool = True
+    category: ConnectionCategory
+    subtype: str | None = None
+    physical_distance: PhysicalDistance | None = None
+    base_travel_minutes: int | None = None
+    importance: int = 3
+    tags: tuple[str, ...] = ()
+
+
+class NewZone(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    location_id: uuid.UUID
+    name: str
+    category: str | None = None
+    description: str = ""
+    importance: int = 2
+    tags: tuple[str, ...] = ()
+
+
+class LocationStateWrite(BaseModel):
+    """A resolved location state, ready to insert or replace.
+
+    Whole-row rather than partial: the application has already read the current state,
+    applied the mutation's changes to it and produced the result. Partial updates stop
+    at the port so the adapter never has to know what "leave this field alone" means.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    session_id: uuid.UUID
+    location_id: uuid.UUID
+    condition: LocationCondition
+    accessibility: LocationAccessibility
+    security_level: int
+    local_danger_modifier: int
+    owner_entity_id: uuid.UUID | None = None
+    controller_entity_id: uuid.UUID | None = None
+
+
+class ConnectionStateWrite(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    session_id: uuid.UUID
+    connection_id: uuid.UUID
+    condition: LocationCondition
+    accessibility: LocationAccessibility
+    traversal_modifier: int
+
+
 class NewFact(BaseModel):
     """A fact as the application has decided it, ready to be written.
 
@@ -244,7 +340,71 @@ class FactReaderPort(Protocol):
         ...
 
 
-class StoryContextReaderPort(FactReaderPort, Protocol):
+class SpatialReaderPort(Protocol):
+    """Reading a session's spatial reality.
+
+    Every method takes `session_id` and every implementation must apply the same
+    visibility rule: template geography (`origin_session_id IS NULL`) plus this
+    session's own, and nothing from any other session. Stated on the port because it is
+    the one rule that, if an adapter forgets it, leaks another save's canon into this
+    one with no error anywhere.
+    """
+
+    async def load_locations(
+        self, session_id: uuid.UUID | None, *, world_id: uuid.UUID, limit: int
+    ) -> list[LocationDefinition]:
+        """Every location this session can see, most important first, then by name.
+
+        Loaded whole rather than walked, because containment questions need more than
+        one node at a time and a narrative world holds tens to low hundreds of places.
+        `limit` is the guard on that assumption rather than a page size; when a world
+        outgrows it, this is the method that becomes a recursive CTE.
+        """
+        ...
+
+    async def get_location(
+        self, session_id: uuid.UUID | None, location_id: uuid.UUID
+    ) -> LocationDefinition | None:
+        """One location, or None -- including when it exists but belongs to another
+        session, which from here is indistinguishable from not existing, and should be."""
+        ...
+
+    async def load_connections(
+        self, session_id: uuid.UUID | None, *, world_id: uuid.UUID, limit: int
+    ) -> list[LocationConnection]:
+        """Every traversal this session can see. Same visibility rule."""
+        ...
+
+    async def load_zones(self, location_id: uuid.UUID) -> list[LocationZone]:
+        """Zones of one location, most important first, then by name.
+
+        No session parameter: zones hang off a definition and have no state of their
+        own, so a zone is visible exactly when its location is.
+        """
+        ...
+
+    async def load_location_states(self, session_id: uuid.UUID) -> list[LocationState]:
+        """Every location state in this session. One row per place that has one."""
+        ...
+
+    async def load_connection_states(
+        self, session_id: uuid.UUID
+    ) -> list[LocationConnectionState]: ...
+
+    async def get_location_state(
+        self, session_id: uuid.UUID, location_id: uuid.UUID
+    ) -> LocationState | None: ...
+
+    async def get_connection_state(
+        self, session_id: uuid.UUID, connection_id: uuid.UUID
+    ) -> LocationConnectionState | None: ...
+
+    async def get_connection(
+        self, session_id: uuid.UUID | None, connection_id: uuid.UUID
+    ) -> LocationConnection | None: ...
+
+
+class StoryContextReaderPort(FactReaderPort, SpatialReaderPort, Protocol):
     """Reads that feed context assembly.
 
     Limits are passed in by the caller because how much history is worth
@@ -451,8 +611,54 @@ class WorldStatePort(FactReaderPort, TurnUnitOfWorkPort, Protocol):
         ...
 
 
+class SpatialPort(SpatialReaderPort, TurnUnitOfWorkPort, Protocol):
+    """What changing spatial reality needs, and nothing else.
+
+    Narrow in the same way `SessionClockPort` and `WorldStatePort` are. This can read
+    the graph, add to it and write per-session state. It cannot touch the transcript,
+    the relationships, the clock or the facts, and the signature is what says so.
+    """
+
+    async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...
+
+    async def get_world(self, world_id: uuid.UUID) -> WorldSnapshot | None: ...
+
+    async def add_location(self, location: NewLocation) -> uuid.UUID:
+        """Write a definition and return the id the application minted for it."""
+        ...
+
+    async def add_connection(self, connection: NewConnection) -> uuid.UUID: ...
+
+    async def add_zone(self, zone: NewZone) -> uuid.UUID: ...
+
+    async def set_location_state(self, state: LocationStateWrite) -> uuid.UUID:
+        """Insert or replace this session's state for one place, in place.
+
+        In place, like `set_fact`: one current state per session and location is the
+        invariant, enforced by a unique constraint rather than by this method
+        remembering to delete first.
+        """
+        ...
+
+    async def set_connection_state(self, state: ConnectionStateWrite) -> uuid.UUID: ...
+
+
+class StateStorePort(WorldStatePort, SpatialPort, Protocol):
+    """What `state_service` needs to apply one batch of changes.
+
+    Facts and space together, because a batch may contain both and a collapsing bridge
+    that changed the connection but not the fact would be exactly the half-applied
+    outcome the batch exists to prevent. Everything else -- the transcript, the
+    relationships, the clock -- is still out of reach.
+    """
+
+
 class TurnGatewayPort(
-    StoryContextReaderPort, TurnPersistencePort, WorldStatePort, TurnUnitOfWorkPort, Protocol
+    StoryContextReaderPort,
+    TurnPersistencePort,
+    StateStorePort,
+    TurnUnitOfWorkPort,
+    Protocol,
 ):
     """The ports a turn needs, as one object, because one transaction spans them all.
 
@@ -465,4 +671,9 @@ class TurnGatewayPort(
     `WorldStatePort` joined when the Story Director gained the ability to propose
     facts: a turn now reads current truth for its context, and writes the proposals
     that survive review, inside the transaction that already covers the transcript.
+
+    `SpatialPort` joined for the same reason one step later. A turn reads where it is
+    happening to build its context, and may write a location the story just
+    established -- both inside that same transaction, so a failed turn takes the new
+    bookshop with it rather than leaving geography nobody visited.
     """

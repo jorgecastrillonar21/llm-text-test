@@ -45,6 +45,19 @@ Deliberately absent: inventory, hit points, skills, combat, magic, economy, auto
 offscreen simulation, `KnowledgeState`, `BeliefState`, `SceneState`, semantic
 contradiction detection, and any domain-specific state aggregate.
 
+## Phase 1.8 — WorldState: locations and spatial state ✅
+
+The third piece of `WorldState`: persistent places, what contains what, what connects to
+what, and what is currently true of each in one save. Containment, connectivity and
+proximity are kept apart on purpose — being inside somewhere is not being able to walk
+there, and sharing a location is not being near someone. Definitions are shared across
+saves and state is not; gameplay may invent small places that become deterministic canon
+for that session and are invisible to every other. See
+[world-state-locations.md](world-state-locations.md).
+
+Deliberately absent: `CharacterState` and canonical position, travel, scenes, tactical
+space, perception, interaction range, weather, and any interactive map.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.

@@ -28,13 +28,17 @@ that moves when nothing moved is worse than useless to whatever ends up watching
 Changing an established fact needs a game system with the authority to do it. There is
 no path here by which narration edits what narration already fixed.
 
-# Locations and factions
+# Subjects the director may speak about
 
-The director may only speak about the world and about characters, because those are
-the only ids this application can check. A proposal about `location:<uuid>` would name
-an entity nothing can confirm exists, and an unverifiable subject is a fact that may
-be about nothing at all. When locations become real rows, this restriction is one line
-to relax.
+The world, characters and locations -- the three whose ids this application can check.
+Factions have no table yet, so a proposal about one names an entity nothing can
+confirm exists, and an unverifiable subject is a fact that may be about nothing at all.
+
+Locations are a narrower permission than they look. A place's *reputation* is narrative
+truth and belongs here; its condition, accessibility, security, owner and controller
+belong to `LocationState`, and proposing them is refused with a message saying where
+they live instead. Two tables claiming whether the bridge is standing is exactly what
+dedicated state exists to prevent.
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 
 from app.application.contracts import FactProposal
-from app.application.persistence import WorldSnapshot, WorldStatePort
+from app.application.persistence import StateStorePort, WorldSnapshot
 from app.domain.errors import ValidationError as DomainValidationError
 from app.domain.world_facts import (
     FactAuthority,
@@ -56,6 +60,7 @@ from app.domain.world_facts import (
     FactSubjectType,
     SetFact,
     check_rules_compatibility,
+    location_dedicated_owner,
     parse_property,
     require_permitted,
     resolve_policy,
@@ -63,8 +68,16 @@ from app.domain.world_facts import (
 
 logger = logging.getLogger(__name__)
 
-DIRECTOR_SUBJECT_TYPES = frozenset({FactSubjectType.WORLD, FactSubjectType.CHARACTER})
-"""The only subjects with ids this application can resolve. See the module docstring."""
+DIRECTOR_SUBJECT_TYPES = frozenset(
+    {FactSubjectType.WORLD, FactSubjectType.CHARACTER, FactSubjectType.LOCATION}
+)
+"""The only subjects with ids this application can resolve. See the module docstring.
+
+Locations joined when they became real rows. What a place is *known for* -- "a meeting
+place for smugglers" -- is narrative truth and exactly what the fact store is for. What
+condition it is in is not: that belongs to `LocationState`, and `_to_mutation` refuses
+the properties a dedicated model owns.
+"""
 
 
 class ProposalOutcome(StrEnum):
@@ -91,7 +104,7 @@ class ProposalReview(BaseModel):
 
 
 async def review_fact_proposals(
-    store: WorldStatePort,
+    store: StateStorePort,
     *,
     session_id: uuid.UUID,
     world: WorldSnapshot,
@@ -108,6 +121,23 @@ async def review_fact_proposals(
             mutation = _to_mutation(proposal, known_character_ids)
         except (DomainValidationError, PydanticValidationError) as exc:
             reviewed.append(_rejected(proposal, _first_line(exc)))
+            continue
+
+        # Checked here rather than in `_to_mutation` because it needs the session: a
+        # location id from another save is not "forbidden", it is invisible.
+        subject_id = mutation.subject.id
+        if (
+            mutation.subject.type is FactSubjectType.LOCATION
+            and subject_id is not None
+            and await store.get_location(session_id, subject_id) is None
+        ):
+            reviewed.append(
+                _rejected(
+                    proposal,
+                    f"No location {subject_id} in this session. Facts reference the "
+                    "location ids given in the context, never names.",
+                )
+            )
             continue
 
         target = mutation.target()
@@ -156,8 +186,8 @@ def _to_mutation(proposal: FactProposal, known_character_ids: set[uuid.UUID]) ->
     """Build the mutation a proposal is asking for, raising if it may not exist."""
     if proposal.subject_type not in DIRECTOR_SUBJECT_TYPES:
         raise DomainValidationError(
-            f"The Story Director may only establish facts about the world or a character, "
-            f"not about a {proposal.subject_type.value}."
+            f"The Story Director may only establish facts about the world, a character or "
+            f"a location, not about a {proposal.subject_type.value}."
         )
 
     subject = FactSubject(type=proposal.subject_type, id=proposal.subject_id)
@@ -171,6 +201,14 @@ def _to_mutation(proposal: FactProposal, known_character_ids: set[uuid.UUID]) ->
     require_permitted(
         FactAuthority.STORY_DIRECTOR, resolve_policy(canonical), canonical_property=canonical
     )
+    if subject.type is FactSubjectType.LOCATION:
+        owner = location_dedicated_owner(canonical)
+        if owner is not None:
+            raise DomainValidationError(
+                f"{canonical!r} is not a fact about a location: {owner} "
+                "Narrative truths about a place -- what it is known for, what happened "
+                "here -- are still facts."
+            )
 
     return SetFact(
         subject=subject,

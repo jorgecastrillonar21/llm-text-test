@@ -190,6 +190,9 @@ export interface TurnResponse {
   facts_established: number;
   /** Proposals the review refused. Normal, and usually the larger number. */
   facts_rejected: number;
+  /** New places this turn established as canon for this session. */
+  locations_created: number;
+  locations_rejected: number;
   visual_cue_generated: boolean;
 }
 

@@ -12,7 +12,12 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.persistence import SessionClockPort, TurnGatewayPort, WorldStatePort
+from app.application.persistence import (
+    SessionClockPort,
+    SpatialPort,
+    StateStorePort,
+    TurnGatewayPort,
+)
 from app.application.ports import ImageGeneratorPort, StoryGeneratorPort
 from app.config import Settings
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
@@ -56,12 +61,25 @@ def get_session_clock(session: Annotated[AsyncSession, Depends(get_db)]) -> Sess
     return SqlAlchemyTurnGateway(session)
 
 
-def get_world_state_store(session: Annotated[AsyncSession, Depends(get_db)]) -> WorldStatePort:
+def get_world_state_store(session: Annotated[AsyncSession, Depends(get_db)]) -> StateStorePort:
     """The same adapter again, seen through the port that changes what is true.
 
     A third dependency for a third use case, for the reason the second one exists: the
-    signature is the documentation. Reading and writing facts must not be able to reach
+    signature is the documentation. Reading and writing state must not be able to reach
     the transcript, and this is what says so at the boundary.
+
+    Facts and space together, because one batch may change both -- a collapsing bridge
+    is a connection, a location and a danger modifier -- and splitting them would split
+    the transaction that makes it one event.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
+def get_spatial_store(session: Annotated[AsyncSession, Depends(get_db)]) -> SpatialPort:
+    """The narrowest spatial view, for handlers that only read or grow the graph.
+
+    Separate from `WorldStateStore` so a locations endpoint cannot reach the fact
+    store: reading where things are and rewriting what is true are different powers.
     """
     return SqlAlchemyTurnGateway(session)
 
@@ -84,7 +102,8 @@ def get_image_generator(request: Request) -> ImageGeneratorPort:
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 TurnGateway = Annotated[TurnGatewayPort, Depends(get_turn_gateway)]
 SessionClock = Annotated[SessionClockPort, Depends(get_session_clock)]
-WorldStateStore = Annotated[WorldStatePort, Depends(get_world_state_store)]
+WorldStateStore = Annotated[StateStorePort, Depends(get_world_state_store)]
+SpatialStore = Annotated[SpatialPort, Depends(get_spatial_store)]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 StoryGen = Annotated[StoryGeneratorPort, Depends(get_story_generator)]
 ImageGen = Annotated[ImageGeneratorPort, Depends(get_image_generator)]

@@ -95,6 +95,37 @@ Selection is importance-ordered and capped, because a session accumulates facts 
 prompt does not grow. That is retrieval policy, so it lives in `context_builder.py` with
 every other retrieval decision.
 
+### Geography in the context
+
+`space` is a `SpatialContext` — where the scene is, what is inside it, what contains it,
+and every way out — or `None` when the world has no geography or the session's location
+matches nothing in it. It renders as:
+
+```text
+# Where this is happening  (authoritative: this is the geography)
+Here: The Broken Crown (tavern, damaged)
+Within: The Lantern Quarter
+Areas here: the bar, the back tables, the fireplace
+Inside this place: The Broken Crown cellar (cellar)
+Ways out:
+- Market Street, via the door, about 0 min  — CLOSED, cannot be used
+- The Broken Crown cellar, via the stairs, about 1 min
+```
+
+No ids, for the same reason facts carry none. Default condition and accessibility are
+omitted — "intact, open" on every place teaches a model to ignore the field. Blocked
+exits are shown and marked rather than hidden: a model that cannot see the barred gate
+writes the player straight through it.
+
+**The model cannot move anyone, and this one is only partly prompt-level.** Travel has a
+cost and a duration and belongs to a system that does not exist yet, so the prompt
+forbids narrating an arrival. What *is* enforced is stronger: `StateMutationBatch`
+refuses to be constructed with a spatial mutation under `story_director` authority, so
+nothing the model returns can open a gate, repair a ruin or change who holds a fort.
+
+Selection is deterministic and tier-capped; see
+[world-state-locations.md](world-state-locations.md#spatial-context).
+
 ## TurnGeneration — what the model returns
 
 ```text
@@ -105,7 +136,8 @@ TurnGeneration
 ├── memory_candidates    : MemoryCandidate[]
 ├── relationship_changes : RelationshipChange[]
 ├── world_events         : WorldEvent[]
-├── fact_proposals       : FactProposal[]   (optional, capped at 5)
+├── fact_proposals       : FactProposal[]      (optional, capped at 5)
+├── location_proposals   : LocationProposal[]  (optional, capped at 3)
 └── visual_cue           : VisualCue
 ```
 
@@ -179,6 +211,30 @@ Three properties of the design worth naming:
   will fill, turning "record what the story established" into "invent something".
 
 Full semantics: [world-state-facts.md](world-state-facts.md).
+
+### Location proposals
+
+```text
+name, description
+category, subtype, scale
+parent_location_id : an existing place, from the context
+```
+
+Somewhere the story just established exists. There is **no `id` field** and there never
+will be: the application mints ids, and the uuid a model would supply is one it read in a
+prompt. `parent_location_id` is the exception, and it is an id the context gave it —
+anything invented there fails to resolve and the proposal is refused.
+
+Refusals are the normal case: anything larger than a site, anything already named,
+anything whose parent this session cannot see. `TurnResponse` reports `locations_created`
+and `locations_rejected`.
+
+What survives becomes **deterministic canon for that session**. Generating "Starfall
+Books, east side of Riverwood" may be stochastic once; afterwards it is in the graph,
+arrives in every later prompt as established geography, and is never re-imagined. It is
+also invisible to every other save of the same world.
+
+Full semantics: [world-state-locations.md](world-state-locations.md).
 
 ### Relationship deltas
 

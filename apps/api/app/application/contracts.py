@@ -16,11 +16,15 @@ from pydantic import ValidationError as PydanticValidationError
 from app.domain.enums import MemoryKind
 from app.domain.relationships import DELTA_MAX, DELTA_MIN
 from app.domain.world_facts import FactSubjectType
+from app.domain.world_locations import LocationCategory, LocationScale
 
 logger = logging.getLogger(__name__)
 
 MAX_SUGGESTED_ACTIONS = 4
 MAX_FACT_PROPOSALS = 5
+MAX_LOCATION_PROPOSALS = 3
+"""Lower than the fact cap. A turn that invents three new places has stopped
+narrating a scene and started drawing a map."""
 
 
 class DialogueLine(BaseModel):
@@ -104,6 +108,35 @@ class FactProposal(BaseModel):
     reason: str = Field(default="", max_length=300, description="What in this turn established it.")
 
 
+class LocationProposal(BaseModel):
+    """Somewhere the story just established exists.
+
+    A *proposal*, like `FactProposal`. The application decides whether it may exist,
+    where it sits, and -- crucially -- what its id is. There is no `id` field here and
+    there never will be: a model that could name a uuid could overwrite a place, and
+    the uuid it would name is one it read in a prompt.
+
+    `parent_location_id` is the exception, and it is an id the context *gave* the
+    model. Anything it invents there fails to resolve and the proposal is refused.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=1000)
+
+    category: LocationCategory
+    subtype: str | None = Field(default=None, max_length=60)
+    scale: LocationScale
+    """How big. This is what the creation policy reads: narration may establish a shop
+    or a room, not a country. See `world_locations.policy`."""
+
+    parent_location_id: uuid.UUID | None = Field(
+        default=None, description="An existing place this sits inside, from the context."
+    )
+    reason: str = Field(default="", max_length=300)
+
+
 class VisualCue(BaseModel):
     """Signals a visually significant moment, not every turn."""
 
@@ -155,6 +188,11 @@ class TurnGeneration(BaseModel):
     # for most turns is zero, and a required field is one a constrained model will fill
     # -- which would turn "record what the story established" into "invent something".
     fact_proposals: list[FactProposal] = Field(default_factory=list)
+
+    # Optional for the same reason, and rarer still. Most turns happen somewhere that
+    # already exists; a model required to name a new place every turn would produce a
+    # world of bookshops nobody entered.
+    location_proposals: list[LocationProposal] = Field(default_factory=list)
 
     visual_cue: VisualCue = Field(default_factory=VisualCue)
 
@@ -217,3 +255,37 @@ class TurnGeneration(BaseModel):
         """A turn establishes a few things at most. The cap is on the contract rather
         than the reviewer so a runaway model costs one truncation, not fifty reads."""
         return value[:MAX_FACT_PROPOSALS]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_unusable_location_proposals(cls, data: object) -> object:
+        """Same judgement as `_drop_unusable_fact_proposals`, same reasoning.
+
+        A model that sends `scale: "huge"` has got one enum wrong in an optional field.
+        Failing the turn over it would roll back the narration and show the player a
+        502 for a bookshop nobody asked for.
+        """
+        if not isinstance(data, dict) or "location_proposals" not in data:
+            return data
+
+        raw = data["location_proposals"]
+        if not isinstance(raw, list):
+            logger.warning(
+                "Story provider sent location_proposals as %s; ignored.", type(raw).__name__
+            )
+            return {**data, "location_proposals": []}
+
+        kept: list[LocationProposal] = []
+        for item in raw:
+            try:
+                kept.append(LocationProposal.model_validate(item))
+            except PydanticValidationError as exc:
+                logger.warning(
+                    "Story provider sent an unusable location proposal; dropped. %s", exc
+                )
+        return {**data, "location_proposals": kept}
+
+    @field_validator("location_proposals")
+    @classmethod
+    def _cap_locations(cls, value: list[LocationProposal]) -> list[LocationProposal]:
+        return value[:MAX_LOCATION_PROPOSALS]

@@ -15,17 +15,23 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import InstrumentedAttribute
 
 from app.application.persistence import (
     CharacterRecord,
+    ConnectionStateWrite,
+    LocationStateWrite,
     MemoryRecord,
+    NewConnection,
     NewEvent,
     NewFact,
+    NewLocation,
     NewMemory,
     NewMessage,
     NewScheduledEvent,
+    NewZone,
     RelationshipRecord,
     ScheduledEventRecord,
     SessionSnapshot,
@@ -34,6 +40,14 @@ from app.application.persistence import (
 )
 from app.domain.relationships import RelationshipVector
 from app.domain.world_facts import FactKind, FactSubject, SetFact, WorldFact
+from app.domain.world_locations import (
+    LocationConnection,
+    LocationConnectionState,
+    LocationDefinition,
+    LocationState,
+    LocationZone,
+    PhysicalDistance,
+)
 from app.domain.world_rules import parse_world_rules
 from app.domain.world_time import FictionalDateTime, ScheduledEventStatus
 from app.infrastructure.db import models
@@ -77,6 +91,114 @@ def _subject_criteria(subject: FactSubject) -> list[ColumnElement[bool]]:
     return criteria
 
 
+def _to_location(row: models.LocationDefinition) -> LocationDefinition:
+    return LocationDefinition(
+        id=row.id,
+        world_id=row.world_id,
+        origin_session_id=row.origin_session_id,
+        name=row.name,
+        description=row.description,
+        category=row.category,
+        subtype=row.subtype,
+        scale=row.scale,
+        parent_location_id=row.parent_location_id,
+        importance=row.importance,
+        tags=tuple(row.tags or ()),
+        spatial_metadata=dict(row.spatial_metadata or {}),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _to_connection(row: models.LocationConnection) -> LocationConnection:
+    # Stored as two nullable columns and rebuilt as one value object, because a number
+    # with no unit is not a distance. The model refuses the half-populated pair; the
+    # columns cannot, so the reassembly is where that invariant is restored.
+    distance = (
+        PhysicalDistance(value=row.distance_value, unit=row.distance_unit)
+        if row.distance_value is not None and row.distance_unit is not None
+        else None
+    )
+    return LocationConnection(
+        id=row.id,
+        world_id=row.world_id,
+        origin_session_id=row.origin_session_id,
+        from_location_id=row.from_location_id,
+        to_location_id=row.to_location_id,
+        bidirectional=row.bidirectional,
+        category=row.category,
+        subtype=row.subtype,
+        physical_distance=distance,
+        base_travel_minutes=row.base_travel_minutes,
+        importance=row.importance,
+        tags=tuple(row.tags or ()),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _to_zone(row: models.LocationZone) -> LocationZone:
+    return LocationZone(
+        id=row.id,
+        location_id=row.location_id,
+        name=row.name,
+        category=row.category,
+        description=row.description,
+        importance=row.importance,
+        tags=tuple(row.tags or ()),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _to_location_state(row: models.LocationState) -> LocationState:
+    return LocationState(
+        id=row.id,
+        session_id=row.session_id,
+        location_id=row.location_id,
+        condition=row.condition,
+        accessibility=row.accessibility,
+        security_level=row.security_level,
+        local_danger_modifier=row.local_danger_modifier,
+        owner_entity_id=row.owner_entity_id,
+        controller_entity_id=row.controller_entity_id,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _to_connection_state(row: models.LocationConnectionState) -> LocationConnectionState:
+    return LocationConnectionState(
+        id=row.id,
+        session_id=row.session_id,
+        connection_id=row.connection_id,
+        condition=row.condition,
+        accessibility=row.accessibility,
+        traversal_modifier=row.traversal_modifier,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _visible_to(
+    session_id: uuid.UUID | None, column: InstrumentedAttribute[uuid.UUID | None]
+) -> ColumnElement[bool]:
+    """Template rows, plus this session's own. `None` asks for the template alone.
+
+    Written once and reused by every spatial query, because it is the leakage rule: an
+    adapter that forgets it on one query hands another save's geography to this one and
+    nothing anywhere reports a problem.
+
+    The `None` case is spelled out rather than left to fall out of `column == None`,
+    which SQL renders as `= NULL` and is never true. It would happen to give the right
+    answer here, for the wrong reason, and the next person to read it would have to
+    work that out.
+    """
+    if session_id is None:
+        return column.is_(None)
+    return or_(column.is_(None), column == session_id)
+
+
 def _to_scheduled_event(row: models.ScheduledEvent) -> ScheduledEventRecord:
     return ScheduledEventRecord(
         id=row.id,
@@ -91,12 +213,12 @@ def _to_scheduled_event(row: models.ScheduledEvent) -> ScheduledEventRecord:
 
 class SqlAlchemyTurnGateway:
     """Implements StoryContextReaderPort, TurnPersistencePort, TurnUnitOfWorkPort,
-    SessionClockPort and WorldStatePort.
+    SessionClockPort, WorldStatePort and SpatialPort.
 
     Named for the turn because that is the transaction it was shaped around. The
-    session clock and the fact store joined later and run inside the same one, which
-    is why they are here rather than in adapters that would have to re-map the same
-    rows and could not see each other's uncommitted writes.
+    session clock, the fact store and the spatial graph joined later and run inside the
+    same one, which is why they are here rather than in adapters that would have to
+    re-map the same rows and could not see each other's uncommitted writes.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -449,6 +571,201 @@ class SqlAlchemyTurnGateway:
         await self._db.flush()
         return row.state_revision
 
+    # -- SpatialPort ------------------------------------------------------------
+
+    async def load_locations(
+        self, session_id: uuid.UUID | None, *, world_id: uuid.UUID, limit: int
+    ) -> list[LocationDefinition]:
+        rows = (
+            await self._db.execute(
+                select(models.LocationDefinition)
+                .where(
+                    models.LocationDefinition.world_id == world_id,
+                    _visible_to(session_id, models.LocationDefinition.origin_session_id),
+                )
+                # Important first so a truncating caller keeps what matters; name last
+                # so the order is total and two reads of one world agree.
+                .order_by(
+                    models.LocationDefinition.importance.desc(),
+                    models.LocationDefinition.name.asc(),
+                )
+                .limit(limit)
+            )
+        ).scalars()
+        return [_to_location(row) for row in rows]
+
+    async def get_location(
+        self, session_id: uuid.UUID | None, location_id: uuid.UUID
+    ) -> LocationDefinition | None:
+        row = (
+            await self._db.execute(
+                select(models.LocationDefinition).where(
+                    models.LocationDefinition.id == location_id,
+                    _visible_to(session_id, models.LocationDefinition.origin_session_id),
+                )
+            )
+        ).scalar_one_or_none()
+        return None if row is None else _to_location(row)
+
+    async def load_connections(
+        self, session_id: uuid.UUID | None, *, world_id: uuid.UUID, limit: int
+    ) -> list[LocationConnection]:
+        rows = (
+            await self._db.execute(
+                select(models.LocationConnection)
+                .where(
+                    models.LocationConnection.world_id == world_id,
+                    _visible_to(session_id, models.LocationConnection.origin_session_id),
+                )
+                .order_by(
+                    models.LocationConnection.importance.desc(),
+                    models.LocationConnection.id.asc(),
+                )
+                .limit(limit)
+            )
+        ).scalars()
+        return [_to_connection(row) for row in rows]
+
+    async def get_connection(
+        self, session_id: uuid.UUID | None, connection_id: uuid.UUID
+    ) -> LocationConnection | None:
+        row = (
+            await self._db.execute(
+                select(models.LocationConnection).where(
+                    models.LocationConnection.id == connection_id,
+                    _visible_to(session_id, models.LocationConnection.origin_session_id),
+                )
+            )
+        ).scalar_one_or_none()
+        return None if row is None else _to_connection(row)
+
+    async def load_zones(self, location_id: uuid.UUID) -> list[LocationZone]:
+        rows = (
+            await self._db.execute(
+                select(models.LocationZone)
+                .where(models.LocationZone.location_id == location_id)
+                .order_by(
+                    models.LocationZone.importance.desc(),
+                    models.LocationZone.name.asc(),
+                )
+            )
+        ).scalars()
+        return [_to_zone(row) for row in rows]
+
+    async def load_location_states(self, session_id: uuid.UUID) -> list[LocationState]:
+        rows = (
+            await self._db.execute(
+                select(models.LocationState).where(models.LocationState.session_id == session_id)
+            )
+        ).scalars()
+        return [_to_location_state(row) for row in rows]
+
+    async def load_connection_states(self, session_id: uuid.UUID) -> list[LocationConnectionState]:
+        rows = (
+            await self._db.execute(
+                select(models.LocationConnectionState).where(
+                    models.LocationConnectionState.session_id == session_id
+                )
+            )
+        ).scalars()
+        return [_to_connection_state(row) for row in rows]
+
+    async def get_location_state(
+        self, session_id: uuid.UUID, location_id: uuid.UUID
+    ) -> LocationState | None:
+        row = await self._find_location_state(session_id, location_id)
+        return None if row is None else _to_location_state(row)
+
+    async def get_connection_state(
+        self, session_id: uuid.UUID, connection_id: uuid.UUID
+    ) -> LocationConnectionState | None:
+        row = await self._find_connection_state(session_id, connection_id)
+        return None if row is None else _to_connection_state(row)
+
+    async def add_location(self, location: NewLocation) -> uuid.UUID:
+        row = models.LocationDefinition(
+            world_id=location.world_id,
+            origin_session_id=location.origin_session_id,
+            name=location.name,
+            description=location.description,
+            category=location.category,
+            subtype=location.subtype,
+            scale=location.scale,
+            parent_location_id=location.parent_location_id,
+            importance=location.importance,
+            tags=list(location.tags),
+            spatial_metadata=dict(location.spatial_metadata),
+        )
+        self._db.add(row)
+        # Flushed so the id is real and so a location created mid-turn is visible to
+        # the containment checks of anything created after it in the same turn.
+        await self._db.flush()
+        return row.id
+
+    async def add_connection(self, connection: NewConnection) -> uuid.UUID:
+        distance = connection.physical_distance
+        row = models.LocationConnection(
+            world_id=connection.world_id,
+            origin_session_id=connection.origin_session_id,
+            from_location_id=connection.from_location_id,
+            to_location_id=connection.to_location_id,
+            bidirectional=connection.bidirectional,
+            category=connection.category,
+            subtype=connection.subtype,
+            distance_value=None if distance is None else distance.value,
+            distance_unit=None if distance is None else distance.unit,
+            base_travel_minutes=connection.base_travel_minutes,
+            importance=connection.importance,
+            tags=list(connection.tags),
+        )
+        self._db.add(row)
+        await self._db.flush()
+        return row.id
+
+    async def add_zone(self, zone: NewZone) -> uuid.UUID:
+        row = models.LocationZone(
+            location_id=zone.location_id,
+            name=zone.name,
+            category=zone.category,
+            description=zone.description,
+            importance=zone.importance,
+            tags=list(zone.tags),
+        )
+        self._db.add(row)
+        await self._db.flush()
+        return row.id
+
+    async def set_location_state(self, state: LocationStateWrite) -> uuid.UUID:
+        row = await self._find_location_state(state.session_id, state.location_id)
+        if row is None:
+            row = models.LocationState(session_id=state.session_id, location_id=state.location_id)
+            self._db.add(row)
+        # Updated in place on the existing row, like `set_fact`: the state's identity
+        # is the session and the place, so a new condition is the same state with a
+        # different condition. Replacing the row would reset `created_at` to mean
+        # "since the last edit".
+        row.condition = state.condition
+        row.accessibility = state.accessibility
+        row.security_level = state.security_level
+        row.local_danger_modifier = state.local_danger_modifier
+        row.owner_entity_id = state.owner_entity_id
+        row.controller_entity_id = state.controller_entity_id
+        await self._db.flush()
+        return row.id
+
+    async def set_connection_state(self, state: ConnectionStateWrite) -> uuid.UUID:
+        row = await self._find_connection_state(state.session_id, state.connection_id)
+        if row is None:
+            row = models.LocationConnectionState(
+                session_id=state.session_id, connection_id=state.connection_id
+            )
+            self._db.add(row)
+        row.condition = state.condition
+        row.accessibility = state.accessibility
+        row.traversal_modifier = state.traversal_modifier
+        await self._db.flush()
+        return row.id
+
     # -- TurnUnitOfWorkPort -----------------------------------------------------
 
     async def commit(self) -> None:
@@ -482,6 +799,30 @@ class SqlAlchemyTurnGateway:
                     models.WorldFact.session_id == session_id,
                     models.WorldFact.property == canonical_property,
                     *_subject_criteria(subject),
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def _find_location_state(
+        self, session_id: uuid.UUID, location_id: uuid.UUID
+    ) -> models.LocationState | None:
+        return (
+            await self._db.execute(
+                select(models.LocationState).where(
+                    models.LocationState.session_id == session_id,
+                    models.LocationState.location_id == location_id,
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def _find_connection_state(
+        self, session_id: uuid.UUID, connection_id: uuid.UUID
+    ) -> models.LocationConnectionState | None:
+        return (
+            await self._db.execute(
+                select(models.LocationConnectionState).where(
+                    models.LocationConnectionState.session_id == session_id,
+                    models.LocationConnectionState.connection_id == connection_id,
                 )
             )
         ).scalar_one_or_none()

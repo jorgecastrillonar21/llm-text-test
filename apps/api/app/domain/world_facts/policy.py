@@ -40,6 +40,13 @@ class FactPolicy(StrEnum):
     GUARDED = "guarded"
     SYSTEM = "system"
     DERIVED = "derived"
+    DEDICATED = "dedicated"
+    """A dedicated model already owns this. Nobody writes it here.
+
+    Distinct from DERIVED, which is computed and stored nowhere. A location's condition
+    *is* stored -- in `location_states`, with a closed vocabulary and a constraint --
+    and a fact claiming the same thing would be a second answer to a settled question.
+    """
 
 
 class PropertyDefinition(BaseModel):
@@ -117,6 +124,27 @@ KNOWN_PROPERTIES: dict[str, PropertyDefinition] = {
         summary="What a character is, in worlds where that can be more than human.",
         requires_supernatural=True,
     ),
+    # -- owned by a dedicated model. Registered so the obvious spellings are a named
+    #    refusal that says where the real answer lives, rather than landing in SYSTEM
+    #    and being writable by an engine that should be updating the other table.
+    "system.location_condition": PropertyDefinition(
+        policy=FactPolicy.DEDICATED, summary="LocationState.condition owns this."
+    ),
+    "system.location_accessibility": PropertyDefinition(
+        policy=FactPolicy.DEDICATED, summary="LocationState.accessibility owns this."
+    ),
+    "system.location_security": PropertyDefinition(
+        policy=FactPolicy.DEDICATED, summary="LocationState.security_level owns this."
+    ),
+    "system.location_owner": PropertyDefinition(
+        policy=FactPolicy.DEDICATED, summary="LocationState.owner_entity_id owns this."
+    ),
+    "system.location_controller": PropertyDefinition(
+        policy=FactPolicy.DEDICATED, summary="LocationState.controller_entity_id owns this."
+    ),
+    "system.connection_accessibility": PropertyDefinition(
+        policy=FactPolicy.DEDICATED, summary="LocationConnectionState.accessibility owns this."
+    ),
     # -- derived. Registered so that storing one is a named refusal rather than an
     #    unknown property that would otherwise land in GUARDED.
     "derived.is_night": PropertyDefinition(
@@ -147,3 +175,22 @@ def resolve_policy(canonical_property: str) -> FactPolicy:
 def definition_for(canonical_property: str) -> PropertyDefinition | None:
     """The registered definition, or None for an unregistered extension property."""
     return KNOWN_PROPERTIES.get(canonical_property)
+
+
+_LOCATION_DEDICATED: dict[str, str] = {
+    # Registered by name in KNOWN_PROPERTIES as GUARDED, because for the world itself
+    # or for an object it is an ordinary diegetic truth. Only for a *location* subject
+    # does it collide with a dedicated model, so the refusal needs the subject too.
+    "world.condition": "LocationState.condition owns a location's physical state.",
+}
+
+
+def location_dedicated_owner(canonical_property: str) -> str | None:
+    """The dedicated model owning this property when the subject is a location.
+
+    Separate from the `DEDICATED` policy because the policy is a property of the
+    property alone, and this one depends on what the fact is about. `world.condition`
+    of a *sword* is a fact; of the Broken Crown it is `location_states.condition`
+    wearing a fact's clothes.
+    """
+    return _LOCATION_DEDICATED.get(canonical_property)

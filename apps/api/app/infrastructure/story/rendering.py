@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from app.application.story_context import StoryContext, WorldRulesContext
+from app.application.story_context import (
+    PlaceContext,
+    SpatialContext,
+    StoryContext,
+    WorldRulesContext,
+)
 from app.domain.enums import LANGUAGE_NAMES
 
 
@@ -116,6 +121,51 @@ def _render_world_rules(rules: WorldRulesContext) -> list[str]:
     ]
 
 
+def _place_line(place: PlaceContext) -> str:
+    """`The Broken Crown (tavern)`, or `The east bridge (bridge, destroyed, blocked)`.
+
+    Condition and accessibility appear only when they are not the ordinary case; the
+    context builder leaves them None otherwise. A prompt that says "intact, open" about
+    every room spends tokens teaching a model to ignore the field.
+    """
+    detail = [place.kind]
+    if place.condition is not None:
+        detail.append(_words(place.condition))
+    if place.accessibility is not None:
+        detail.append(_words(place.accessibility))
+    return f"{place.name} ({', '.join(detail)})"
+
+
+def _render_space(space: SpatialContext | None) -> list[str]:
+    """Where the scene is, as five short lists.
+
+    Omitted entirely when there is no known place, rather than printed empty: a heading
+    with nothing under it tells the model the game tracks geography and has none.
+    """
+    if space is None:
+        return []
+
+    lines = ["\n# Where this is happening  (authoritative: this is the geography)"]
+    lines.append(f"Here: {_place_line(space.current)}")
+    if space.within:
+        # Nearest container first, so the sentence reads inward-out the way an address
+        # does: "the Broken Crown, in Riverwood, in the Northern Province".
+        lines.append(f"Within: {' < '.join(place.name for place in space.within)}")
+    if space.zones:
+        lines.append(f"Areas here: {', '.join(space.zones)}")
+    if space.contains:
+        lines.append(f"Inside this place: {', '.join(_place_line(p) for p in space.contains)}")
+    if space.exits:
+        lines.append("Ways out:")
+        for exit_ in space.exits:
+            cost = "" if exit_.travel_minutes is None else f", about {exit_.travel_minutes} min"
+            # Blocked exits are listed and marked rather than hidden. A model that
+            # cannot see the barred gate writes the player straight through it.
+            state = "" if exit_.passable else "  — CLOSED, cannot be used"
+            lines.append(f"- {exit_.name}, via the {exit_.via}{cost}{state}")
+    return lines
+
+
 def render_context(context: StoryContext) -> str:
     lines: list[str] = []
 
@@ -154,6 +204,8 @@ def render_context(context: StoryContext) -> str:
     lines.append(f"Location: {context.session.current_location or 'unspecified'}")
     if context.session.summary:
         lines.append(f"Story so far: {context.session.summary}")
+
+    lines.extend(_render_space(context.space))
 
     facts = context.world_facts
     if facts.critical or facts.relevant:

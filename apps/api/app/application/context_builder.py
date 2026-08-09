@@ -21,6 +21,7 @@ from app.application.persistence import (
     WorldSnapshot,
 )
 from app.application.rules_projection import project_world_rules
+from app.application.spatial_context import build_scene_spatial_context
 from app.application.story_context import (
     CharacterContext,
     FactContext,
@@ -67,6 +68,16 @@ async def build_story_context(
     relationships = await reader.load_relationships(session.id)
     facts = await reader.load_facts(session.id, limit=FACT_LIMIT)
 
+    # None when the world has no geography, or when the session's location string
+    # matches nothing in it -- which is most sessions today. See
+    # `spatial_context.resolve_scene_location` for why that string is the input.
+    space = await build_scene_spatial_context(
+        reader,
+        session_id=session.id,
+        world_id=world.id,
+        current_location=session.current_location,
+    )
+
     # Derived here, every turn, from the one number that is stored. There is no
     # cached "current date" anywhere for this to disagree with.
     now = project_time(session.elapsed_minutes, initial=world.initial_datetime)
@@ -97,6 +108,7 @@ async def build_story_context(
             period=now.period,
             elapsed_since_start=now.elapsed_since_start,
         ),
+        space=space,
         world_facts=_to_facts_context(facts, names, world.name),
         relevant_characters=[_to_character_context(record) for record in characters],
         recent_messages=[_to_message_context(message, names) for message in messages],

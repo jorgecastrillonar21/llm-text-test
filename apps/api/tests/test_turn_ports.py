@@ -37,6 +37,13 @@ from app.domain.enums import Language, MemoryKind
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector
 from app.domain.world_facts import FactKind, FactSubject, SetFact, WorldFact
+from app.domain.world_locations import (
+    LocationConnection,
+    LocationConnectionState,
+    LocationDefinition,
+    LocationState,
+    LocationZone,
+)
 from app.domain.world_rules import default_world_rules
 from app.domain.world_time import DEFAULT_INITIAL_DATETIME
 
@@ -97,6 +104,7 @@ class FakeTurnGateway:
         # current values for one subject and property either.
         self.facts: dict[tuple[str, str], WorldFact] = {}
         self.initial_facts: list[SetFact] = []
+        self.locations: list[LocationDefinition] = []
         self.state_revision = 0
 
     # -- reads ------------------------------------------------------------------
@@ -164,6 +172,51 @@ class FakeTurnGateway:
 
     async def load_initial_facts(self, world_id: uuid.UUID) -> list[SetFact]:
         return list(self.initial_facts)
+
+    # -- spatial reads ----------------------------------------------------------
+    #
+    # A world with no geography, which is the ordinary case and the one this file
+    # exists to prove still works: a turn must run without a spatial graph, without a
+    # database, and without noticing that either is missing.
+
+    async def load_locations(
+        self, session_id: uuid.UUID, *, world_id: uuid.UUID, limit: int
+    ) -> list[LocationDefinition]:
+        return list(self.locations)[:limit]
+
+    async def get_location(
+        self, session_id: uuid.UUID, location_id: uuid.UUID
+    ) -> LocationDefinition | None:
+        return next((place for place in self.locations if place.id == location_id), None)
+
+    async def load_connections(
+        self, session_id: uuid.UUID, *, world_id: uuid.UUID, limit: int
+    ) -> list[LocationConnection]:
+        return []
+
+    async def get_connection(
+        self, session_id: uuid.UUID, connection_id: uuid.UUID
+    ) -> LocationConnection | None:
+        return None
+
+    async def load_zones(self, location_id: uuid.UUID) -> list[LocationZone]:
+        return []
+
+    async def load_location_states(self, session_id: uuid.UUID) -> list[LocationState]:
+        return []
+
+    async def load_connection_states(self, session_id: uuid.UUID) -> list[LocationConnectionState]:
+        return []
+
+    async def get_location_state(
+        self, session_id: uuid.UUID, location_id: uuid.UUID
+    ) -> LocationState | None:
+        return None
+
+    async def get_connection_state(
+        self, session_id: uuid.UUID, connection_id: uuid.UUID
+    ) -> LocationConnectionState | None:
+        return None
 
     async def get_fact(
         self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str

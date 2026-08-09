@@ -25,6 +25,11 @@ reason that says so; see `docs/world-state-facts.md`.
 Nobody may write DERIVED. Not the engine, not admin. A derived property has no
 storage by definition -- persisting one creates a second copy of a truth that already
 exists somewhere else, and the two will disagree.
+
+Nobody may write DEDICATED either, for the neighbouring reason: that truth *is*
+stored, just not here. A location's condition lives in `location_states`, typed and
+constrained, and a fact asserting it would be a second answer that drifts from the
+first the moment either is written alone.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from __future__ import annotations
 from enum import StrEnum
 
 from app.domain.errors import FactPolicyError
-from app.domain.world_facts.policy import FactPolicy
+from app.domain.world_facts.policy import FactPolicy, definition_for
 
 
 class FactAuthority(StrEnum):
@@ -96,6 +101,13 @@ def require_permitted(
         raise FactPolicyError(
             f"{canonical_property!r} is a derived property and is never stored. "
             "It is computed from authoritative state; write that state instead."
+        )
+    if policy is FactPolicy.DEDICATED:
+        owner = definition_for(canonical_property)
+        raise FactPolicyError(
+            f"{canonical_property!r} is not a fact: "
+            f"{owner.summary if owner else 'a dedicated model owns it'} "
+            "Change it there, with the mutation built for it."
         )
     if authority is FactAuthority.STORY_DIRECTOR and policy is FactPolicy.GUARDED:
         raise FactPolicyError(

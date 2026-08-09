@@ -117,6 +117,12 @@ DELETE /api/v1/dev/scheduled-events/{id}
 POST   /api/v1/dev/sessions/{id}/world-state/changes
 ```
 
+That last one carries spatial mutations too -- `update_location_state` and
+`update_connection_state` travel in the same batch as fact changes, so one event can
+collapse a bridge, block the crossing and raise the local danger together or not at all.
+Authoring geography is a different act and lives on the ordinary API under `/worlds`; see
+[world-state-locations.md](world-state-locations.md#http-surface).
+
 None of them is a shortcut. Each goes through the same application service a real caller
 will use, so a paused world still refuses to advance and a state change is still checked
 against the property's policy, the world's rules and the session's revision. `admin`

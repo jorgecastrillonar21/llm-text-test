@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.application.contracts import MAX_FACT_PROPOSALS, FactProposal, TurnGeneration
 from app.application.fact_proposals import ProposalOutcome, review_fact_proposals
 from app.application.state_service import StateChangeEvent, apply_state_change
+from app.domain.state_mutations import StateMutationBatch
 from app.domain.world_facts import (
     WORLD_SUBJECT,
     FactAuthority,
@@ -21,7 +22,6 @@ from app.domain.world_facts import (
     FactSubject,
     FactSubjectType,
     SetFact,
-    StateMutationBatch,
 )
 from app.domain.world_rules import default_world_rules
 from app.infrastructure.db import models

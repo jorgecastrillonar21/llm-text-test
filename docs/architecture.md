@@ -10,8 +10,11 @@ apps/api/app/
 ├── domain/           pure Python: enums, relationship rules, errors. No I/O, no ORM.
 │   ├── world_rules/      WorldRulesV1, its enums, presets, versioned parsing
 │   ├── world_time/       the simulation clock, calendar projection, scheduling
-│   └── world_facts/      what is objectively true: values, properties, policy,
-│                         authority, mutations, world-rules compatibility
+│   ├── world_facts/      what is objectively true: values, properties, policy,
+│   │                     authority, mutations, world-rules compatibility
+│   ├── world_locations/  where things are: definitions, containment, connections,
+│   │                     per-session state, creation policy
+│   └── state_mutations.py  the one batch that carries fact and spatial changes
 ├── application/      use cases, the AI contract, ports. Depends on domain only.
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
@@ -21,8 +24,11 @@ apps/api/app/
 │   ├── rules_projection.py WorldRules → the compact AI-facing view
 │   ├── turn_service.py   the turn use case
 │   ├── time_service.py   the only writer of the simulation clock
-│   ├── state_service.py  the only writer of world facts
-│   └── fact_proposals.py reviewing what the Story Director claims is true
+│   ├── state_service.py  the only writer of world facts and spatial state
+│   ├── spatial_service.py  the spatial graph, materialisation, place creation
+│   ├── spatial_context.py  deterministic, scene-sized geography for the prompt
+│   ├── fact_proposals.py reviewing what the Story Director claims is true
+│   └── location_proposals.py reviewing the places it says the story found
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
 │   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
 ├── api/              HTTP adapter and composition: routers, DTOs, errors, DI
@@ -208,6 +214,17 @@ silently papered over.
   backwards. None of the three can be computed from another.
 - **`worlds.initial_facts`** stores a world's starting facts as `SetFact` documents,
   copied into each new session and never written back to during play.
+- **The five spatial tables** split along one line: `location_definitions`,
+  `location_connections` and `location_zones` belong to the *world* and are shared by
+  every save of it; `location_states` and `location_connection_states` belong to a
+  *session* and are not. Ten sessions read one Broken Crown and each keeps its own answer
+  to whether it is still standing. `origin_session_id` marks geography that gameplay
+  invented inside one save, and visibility is "template, or mine" -- a disjunction no
+  foreign key expresses, so every spatial query filters on it and the gateway is the only
+  place that filter is written. Containment is one nullable self-referencing column with
+  `ON DELETE SET NULL`, because losing a container must not delete what was inside it;
+  the acyclicity no database can enforce lives in `world_locations.hierarchy`. See
+  [world-state-locations.md](world-state-locations.md).
 
 ## AI provider boundaries
 

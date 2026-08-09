@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from app.application.context_builder import build_story_context
 from app.application.contracts import DialogueLine, TurnGeneration
 from app.application.fact_proposals import ProposalReview, review_fact_proposals
+from app.application.location_proposals import review_location_proposals
 from app.application.persistence import (
     NewEvent,
     NewMemory,
@@ -42,7 +43,8 @@ from app.application.state_service import stage_state_change
 from app.domain.enums import MessageRole
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector, clamp_delta
-from app.domain.world_facts import FactAuthority, StateMutationBatch
+from app.domain.state_mutations import StateMutationBatch
+from app.domain.world_facts import FactAuthority
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,10 @@ class TurnResult(BaseModel):
     """How many of the Story Director's fact proposals survived review. Usually zero,
     and a turn where it is not is worth being able to see without reading the log."""
     facts_rejected: int
+    locations_created: int
+    """New places the turn established. Usually zero -- most scenes happen somewhere
+    that already exists."""
+    locations_rejected: int
     visual_cue_generated: bool
 
 
@@ -196,6 +202,16 @@ async def execute_turn(
     memories_created = await _persist_memories(gateway, session, generation, known_character_ids)
     relationships = await _apply_relationships(gateway, session, generation, known_character_ids)
     events_created = await _persist_events(gateway, session, generation, turn_index)
+
+    # Places first, then facts. A proposal may be about somewhere this turn just
+    # established, and the fact reviewer resolves location ids against what exists --
+    # so the geography has to be there before the truths about it are judged.
+    places = await review_location_proposals(
+        gateway,
+        session_id=session.id,
+        world_id=world.id,
+        proposals=generation.location_proposals,
+    )
     review = await _establish_proposed_facts(
         gateway, session, world, generation, known_character_ids
     )
@@ -217,6 +233,8 @@ async def execute_turn(
         events_created=events_created,
         facts_established=len(review.accepted),
         facts_rejected=len(review.reviewed) - len(review.accepted),
+        locations_created=len(places.created),
+        locations_rejected=len(places.reviewed) - len(places.created),
         visual_cue_generated=generation.visual_cue.generate,
     )
 

@@ -20,6 +20,7 @@ from app.api.schemas import (
     WorldFactRead,
     WorldStateRead,
 )
+from app.application.spatial_service import materialize_initial_spatial_state
 from app.application.state_service import materialize_initial_facts
 from app.application.turn_service import execute_turn
 from app.domain.errors import NotFoundError, ValidationError
@@ -50,12 +51,16 @@ async def list_sessions(
 async def create_session(
     payload: SessionCreate, db: DbSession, store: WorldStateStore
 ) -> models.GameSession:
-    """Start a session, and copy the world's starting facts into it.
+    """Start a session, and give it the world's starting truth and geography.
 
     One transaction: flush so the seeding can read the session it is seeding, then
-    commit both together. A session that exists without the truths its world declared
-    would be a world the player is playing a different version of, and there is no
-    retry that would fix it after the fact.
+    commit all of it together. A session that exists without the truths its world
+    declared, or without a state row for the places in it, would be a world the player
+    is playing a different version of, and there is no retry that fixes it afterwards.
+
+    Facts and spatial state are seeded by different services because they are different
+    kinds of thing -- one is a batch of mutations that moves the state revision, the
+    other is materialising defaults that no event caused.
     """
     world = await db.get(models.World, payload.world_id)
     if world is None:
@@ -66,6 +71,7 @@ async def create_session(
 
     # Same AsyncSession behind the port, so it sees the row above without committing.
     await materialize_initial_facts(store, session_id=session.id)
+    await materialize_initial_spatial_state(store, session_id=session.id)
 
     await db.commit()
     return session

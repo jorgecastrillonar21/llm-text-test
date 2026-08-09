@@ -36,20 +36,14 @@ from app.domain.world_facts.facts import (
     Importance,
     WorldFact,
 )
-from app.domain.world_facts.mutations import (
-    MAX_MUTATIONS_PER_BATCH,
-    FactMutation,
-    RemoveFact,
-    SetFact,
-    StateMutationBatch,
-    require_no_conflicts,
-)
+from app.domain.world_facts.mutations import FactMutation, RemoveFact, SetFact
 from app.domain.world_facts.policy import (
     KNOWN_PROPERTIES,
     SYSTEM_ALIVE,
     FactPolicy,
     PropertyDefinition,
     definition_for,
+    location_dedicated_owner,
     resolve_policy,
 )
 from app.domain.world_facts.properties import (
@@ -62,7 +56,6 @@ from app.domain.world_facts.values import FactScalar, FactValue, check_fact_valu
 
 __all__ = [
     "KNOWN_PROPERTIES",
-    "MAX_MUTATIONS_PER_BATCH",
     "MAX_TAGS",
     "PROPERTY_ALIASES",
     "SUPERNATURAL_TAG",
@@ -81,15 +74,14 @@ __all__ = [
     "PropertyNamespace",
     "RemoveFact",
     "SetFact",
-    "StateMutationBatch",
     "WorldFact",
     "check_fact_value",
     "check_rules_compatibility",
     "definition_for",
     "is_permitted",
+    "location_dedicated_owner",
     "namespace_of",
     "parse_property",
-    "require_no_conflicts",
     "require_permitted",
     "requires_source_event",
     "resolve_policy",

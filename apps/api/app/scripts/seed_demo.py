@@ -14,10 +14,16 @@ import uuid
 from typing import TypedDict
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.domain.enums import Language
 from app.domain.world_facts import WORLD_SUBJECT, FactSubject, FactSubjectType, SetFact
+from app.domain.world_locations import (
+    ConnectionCategory,
+    LocationCategory,
+    LocationScale,
+)
 from app.domain.world_rules import WorldRulesPreset, build_preset
 from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
@@ -126,6 +132,133 @@ def _initial_facts(elena_id: uuid.UUID, kael_id: uuid.UUID) -> list[SetFact]:
     ]
 
 
+DEMO_START_LOCATION = "The Broken Crown"
+"""Where a demo session begins. Matches `SessionCreate.current_location` exactly, which
+is how the scene finds its place until CharacterPosition exists -- see
+`app.application.spatial_context.resolve_scene_location`."""
+
+
+async def _seed_geography(db: AsyncSession, world_id: uuid.UUID) -> list[str]:
+    """A small template graph: a district, three places in it, and the ways between.
+
+    Deliberately shallow and deliberately incomplete. It exists to exercise the model
+    -- containment, a one-way drop, a blocked crossing a session can later reopen, a
+    tavern with zones -- not to be a map of a city. Lazy granularity is the rule: the
+    cellar is a location because it can be entered and can hold state; the fireplace is
+    a zone because it is somewhere to stand.
+
+    Written directly rather than through the API for the same reason the facts are:
+    world, characters and geography go in as one transaction, and the authoring
+    endpoints create a world before it has anywhere in it.
+    """
+    quarter = models.LocationDefinition(
+        world_id=world_id,
+        name="The Lantern Quarter",
+        description="Narrow streets under failing wardlight, north of the palace approach.",
+        category=LocationCategory.AREA,
+        subtype="city_district",
+        scale=LocationScale.DISTRICT,
+        importance=4,
+    )
+    db.add(quarter)
+    await db.flush()
+
+    tavern = models.LocationDefinition(
+        world_id=world_id,
+        name=DEMO_START_LOCATION,
+        description="A tavern named for a joke nobody finds funny this year.",
+        category=LocationCategory.STRUCTURE,
+        subtype="tavern",
+        scale=LocationScale.BUILDING,
+        parent_location_id=quarter.id,
+        importance=4,
+    )
+    street = models.LocationDefinition(
+        world_id=world_id,
+        name="Market Street",
+        description="Half the stalls are shuttered; the other half are pretending not to be.",
+        category=LocationCategory.TRANSIT,
+        subtype="street",
+        scale=LocationScale.SITE,
+        parent_location_id=quarter.id,
+        importance=3,
+    )
+    db.add_all([tavern, street])
+    await db.flush()
+
+    # A location rather than a zone: it can be entered, it can be flooded or sealed, and
+    # a scene can happen in it. The fireplace below is a zone, because it is somewhere
+    # to stand. See docs/world-state-locations.md.
+    cellar = models.LocationDefinition(
+        world_id=world_id,
+        name="The Broken Crown cellar",
+        description="Cold, dry, and further under the street than it has any right to be.",
+        category=LocationCategory.INTERIOR,
+        subtype="cellar",
+        scale=LocationScale.ROOM,
+        parent_location_id=tavern.id,
+        importance=2,
+    )
+    db.add(cellar)
+    await db.flush()
+
+    db.add_all(
+        [
+            models.LocationZone(
+                location_id=tavern.id, name="the bar", category="counter", importance=3
+            ),
+            models.LocationZone(
+                location_id=tavern.id, name="the fireplace", category="seating", importance=2
+            ),
+            models.LocationZone(
+                location_id=tavern.id, name="the back tables", category="seating", importance=2
+            ),
+        ]
+    )
+
+    db.add_all(
+        [
+            # Containment does not imply a route, so the door is written down. Without
+            # this row the tavern would be inside the quarter and unreachable from it.
+            models.LocationConnection(
+                world_id=world_id,
+                from_location_id=street.id,
+                to_location_id=tavern.id,
+                bidirectional=True,
+                category=ConnectionCategory.PASSAGE,
+                subtype="door",
+                base_travel_minutes=0,
+                importance=4,
+            ),
+            models.LocationConnection(
+                world_id=world_id,
+                from_location_id=tavern.id,
+                to_location_id=cellar.id,
+                bidirectional=True,
+                category=ConnectionCategory.VERTICAL,
+                subtype="stairs",
+                base_travel_minutes=1,
+                importance=2,
+            ),
+            # One-way on purpose, so the demo world contains something the model must
+            # not quietly reverse: you can drop into the cellar from the street, and you
+            # cannot climb back out that way.
+            models.LocationConnection(
+                world_id=world_id,
+                from_location_id=street.id,
+                to_location_id=cellar.id,
+                bidirectional=False,
+                category=ConnectionCategory.VERTICAL,
+                subtype="coal_chute",
+                base_travel_minutes=1,
+                importance=1,
+            ),
+        ]
+    )
+    await db.flush()
+    return [quarter.name, street.name, tavern.name, cellar.name]
+
+
 async def seed() -> None:
     settings = get_settings()
     engine = create_engine(settings)
@@ -176,10 +309,13 @@ async def seed() -> None:
             ]
             await db.flush()
 
+            places = await _seed_geography(db, world.id)
+
             print(f"Created demo world: {world.id}")
             print(f"Rules: {DEMO_WORLD_PRESET.value}")
             print(f"Characters: {', '.join(c['name'] for c in CHARACTERS)}")
             print(f"Initial facts: {len(world.initial_facts)}")
+            print(f"Locations: {', '.join(places)}")
     finally:
         await engine.dispose()
 

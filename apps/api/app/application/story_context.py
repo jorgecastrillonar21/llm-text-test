@@ -12,6 +12,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.enums import Language, MemoryKind, MessageRole
+from app.domain.world_locations import LocationAccessibility, LocationCondition
 from app.domain.world_rules.enums import (
     ChanceModel,
     ContentIntensity,
@@ -111,6 +112,73 @@ class WorldFactsContext(BaseModel):
 
     relevant: list[FactContext] = Field(default_factory=list)
     """Established details that colour a scene without dominating it."""
+
+
+class PlaceContext(BaseModel):
+    """One place, phrased for a reader.
+
+    No id, like `FactContext`. The director narrates geography and never addresses it;
+    a uuid in the prompt is tokens spent on something no sentence will use, and an id a
+    model has seen is an id it will eventually invent a sibling for.
+
+    Condition and accessibility are None when they are the ordinary case. Sending
+    "intact, open" for every place would drown the one entry that says "destroyed".
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    kind: str
+    """The subtype if the world gave one, otherwise the category: `tavern`, `structure`."""
+
+    condition: LocationCondition | None = None
+    accessibility: LocationAccessibility | None = None
+
+
+class ConnectedPlaceContext(BaseModel):
+    """Somewhere reachable in one step, and what stands between."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    via: str
+    """How: `door`, `stairs`, `imperial highway`. Rendered from the connection's
+    subtype or category."""
+
+    passable: bool
+    """False for a blocked, sealed or collapsed crossing. Sent rather than filtered:
+    a model that cannot see the barred gate writes the player straight through it."""
+
+    travel_minutes: int | None = None
+    """The connection's nominal crossing time, when the world declared one. Not a
+    promise about how long a journey takes -- that is the future TravelEngine's, and
+    it will read more than this number."""
+
+
+class SpatialContext(BaseModel):
+    """Where the scene is, and what that place is next to and inside of.
+
+    A slice of the graph, never the graph. Selection is deterministic and lives in
+    `spatial_context.py` with the reasoning about tiers.
+
+    Absent from this model on purpose: proximity between characters, line of sight,
+    interaction range and anything tactical. Sharing a location is not being near
+    someone, and a field here saying otherwise would make every scene wrong in the
+    same way.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    current: PlaceContext
+    zones: list[str] = Field(default_factory=list)
+    """Named areas within the current place -- the bar, the fireplace. Names only:
+    zones carry no state, and a scene needs somewhere to stand, not a record."""
+
+    contains: list[PlaceContext] = Field(default_factory=list)
+    exits: list[ConnectedPlaceContext] = Field(default_factory=list)
+    within: list[PlaceContext] = Field(default_factory=list)
+    """Containers, nearest first. `District, City, Region` -- enough for a scene to
+    know where in the world it is."""
 
 
 class CharacterContext(BaseModel):
@@ -260,6 +328,11 @@ class StoryContext(BaseModel):
     player: PlayerContext
     session: SessionContext
     time: TimeContext
+    space: SpatialContext | None = None
+    """None when the world has no geography, or when the session is not in a place the
+    graph knows. Optional rather than empty: an empty spatial block tells a model the
+    game tracks places and has none, which reads worse than saying nothing."""
+
     world_facts: WorldFactsContext = Field(default_factory=WorldFactsContext)
     relevant_characters: list[CharacterContext] = Field(default_factory=list)
     recent_messages: list[MessageContext] = Field(default_factory=list)

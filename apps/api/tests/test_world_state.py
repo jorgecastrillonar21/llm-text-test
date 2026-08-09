@@ -30,6 +30,7 @@ from app.domain.errors import (
     StaleStateError,
     ValidationError,
 )
+from app.domain.state_mutations import StateMutationBatch
 from app.domain.world_facts import (
     WORLD_SUBJECT,
     FactAuthority,
@@ -38,7 +39,6 @@ from app.domain.world_facts import (
     FactSubjectType,
     RemoveFact,
     SetFact,
-    StateMutationBatch,
 )
 from app.infrastructure.db import models
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway

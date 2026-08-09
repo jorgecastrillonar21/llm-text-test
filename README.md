@@ -192,6 +192,7 @@ It triggers on pushes to `master` and on pull requests. The push filter previous
 - [World rules](docs/world-rules.md) — how a universe is configured, and the presets
 - [Simulation time](docs/world-state-time.md) — the fictional clock, calendar, scheduling
 - [World facts](docs/world-state-facts.md) — objective truth, authority, state changes
+- [Locations](docs/world-state-locations.md) — places, containment, connections, spatial state
 - [Development](docs/development.md) — workflows, migrations, testing, contract sync
 - [Mobile access](docs/mobile-access.md) — LAN, PWA, HTTPS, security
 - [Roadmap](docs/roadmap.md) — what comes next

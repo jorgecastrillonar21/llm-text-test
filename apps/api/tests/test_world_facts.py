@@ -17,6 +17,7 @@ from app.domain.errors import (
     IncompatibleFactError,
     ValidationError,
 )
+from app.domain.state_mutations import StateMutationBatch, require_no_conflicts
 from app.domain.world_facts import (
     WORLD_SUBJECT,
     FactAuthority,
@@ -26,13 +27,11 @@ from app.domain.world_facts import (
     FactSubjectType,
     RemoveFact,
     SetFact,
-    StateMutationBatch,
     WorldFact,
     check_fact_value,
     check_rules_compatibility,
     is_permitted,
     parse_property,
-    require_no_conflicts,
     require_permitted,
     requires_source_event,
     resolve_policy,

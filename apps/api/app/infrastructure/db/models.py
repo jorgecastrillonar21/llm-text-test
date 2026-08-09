@@ -10,6 +10,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -25,6 +26,13 @@ from sqlalchemy.types import JSON
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import AXIS_MAX, AXIS_MIN
 from app.domain.world_facts import FactAuthority, FactKind, FactSubjectType
+from app.domain.world_locations import (
+    ConnectionCategory,
+    LocationAccessibility,
+    LocationCategory,
+    LocationCondition,
+    LocationScale,
+)
 from app.domain.world_rules import default_world_rules
 from app.domain.world_time import DEFAULT_INITIAL_DATETIME, ScheduledEventStatus
 from app.infrastructure.db.base import Base
@@ -379,3 +387,265 @@ class ScheduledEvent(Base):
     )
     interrupt_player_action: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+
+
+class LocationDefinition(Base):
+    """A place that persistently exists. See app.domain.world_locations.
+
+    # Template rows are shared, not copied
+
+    `origin_session_id IS NULL` marks reusable world geography that every session of
+    that world reads. A non-null value marks canon that gameplay invented inside one
+    save, and no other save may see it. There is deliberately no per-session copy of
+    template definitions: ten sessions read the same rows and differ only in their
+    `location_states`.
+
+    That is also why the leakage rule cannot be a foreign key. Visibility is
+    "template, or mine" -- a disjunction no single FK expresses -- so every query that
+    loads definitions filters on it, and the spatial gateway is the only place that
+    filter is written.
+
+    # Containment is a column, not a table
+
+    One `parent_location_id` gives at most one direct parent for free, which is half
+    the tree invariant. The other half -- no cycles -- cannot be a constraint in SQLite
+    or PostgreSQL, so it lives in `world_locations.hierarchy.check_parent` and runs
+    before every write that sets containment.
+    """
+
+    __tablename__ = "location_definitions"
+    __table_args__ = (
+        # The two reads this table has: everything visible to a session, and the
+        # children of a place. Both filter on origin, so it leads the first index.
+        Index("ix_location_definitions_world_origin", "world_id", "origin_session_id"),
+        Index("ix_location_definitions_parent", "parent_location_id"),
+        CheckConstraint("importance BETWEEN 1 AND 5", name="ck_location_definitions_importance"),
+        CheckConstraint(
+            "parent_location_id IS NULL OR parent_location_id <> id",
+            name="ck_location_definitions_not_self_parent",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    world_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("worlds.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    origin_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=True
+    )
+
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+    category: Mapped[LocationCategory] = mapped_column(String(20), nullable=False)
+    subtype: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    scale: Mapped[LocationScale] = mapped_column(String(20), nullable=False)
+
+    # SET NULL rather than CASCADE: deleting a container must not delete what was
+    # inside it. A district that loses its city becomes a root, which is recoverable;
+    # a district that vanishes with it takes canon nobody asked to remove.
+    parent_location_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="SET NULL"), nullable=True
+    )
+
+    importance: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    # Optional, and never required. Real measurements for the rare world that has
+    # them; see `world_locations.definitions.check_spatial_metadata`.
+    spatial_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class LocationZone(Base):
+    """A named area inside a location. Lighter than a location, on purpose.
+
+    No state, no connections, no children, not a travel destination. A zone exists so a
+    scene can say "by the fireplace" without minting a definition -- and a
+    `location_states` row in every session -- for a hearth.
+    """
+
+    __tablename__ = "location_zones"
+    __table_args__ = (
+        UniqueConstraint("location_id", "name", name="uq_location_zones_name"),
+        CheckConstraint("importance BETWEEN 1 AND 5", name="ck_location_zones_importance"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    category: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    importance: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class LocationConnection(Base):
+    """A declared traversal between two places.
+
+    Never inferred. Sharing a parent does not connect two rooms, and a cellar inside a
+    tavern is not reachable from it until somebody writes the stairs down.
+
+    Endpoints are `RESTRICT`, unlike the containment link above: a connection with one
+    end missing is not a degraded edge but a broken one, and keeping it would leave the
+    graph claiming a route to nowhere.
+    """
+
+    __tablename__ = "location_connections"
+    __table_args__ = (
+        # Traversal is looked up from one end at a time, and a bidirectional edge is
+        # found from either -- so both endpoints are indexed rather than a composite.
+        Index("ix_location_connections_from", "from_location_id"),
+        Index("ix_location_connections_to", "to_location_id"),
+        Index("ix_location_connections_world_origin", "world_id", "origin_session_id"),
+        CheckConstraint(
+            "from_location_id <> to_location_id", name="ck_location_connections_distinct_ends"
+        ),
+        CheckConstraint(
+            "base_travel_minutes IS NULL OR base_travel_minutes >= 0",
+            name="ck_location_connections_travel_nonnegative",
+        ),
+        CheckConstraint("importance BETWEEN 1 AND 5", name="ck_location_connections_importance"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    world_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("worlds.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    origin_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=True
+    )
+
+    from_location_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="RESTRICT"), nullable=False
+    )
+    to_location_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="RESTRICT"), nullable=False
+    )
+    # False is honoured, never quietly reversed: a drop shaft, a waterfall and a
+    # one-way portal all go somewhere you cannot come back from.
+    bidirectional: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    category: Mapped[ConnectionCategory] = mapped_column(String(20), nullable=False)
+    subtype: Mapped[str | None] = mapped_column(String(60), nullable=True)
+
+    # Distance and duration are stored separately and neither is derived from the
+    # other. A portal is four thousand kilometres and one minute.
+    distance_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    distance_unit: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    base_travel_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    importance: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class LocationState(Base):
+    """What is currently true about one place, in one session.
+
+    One row per (session, location), enforced -- two rows would be two answers to "is
+    the bridge standing?".
+
+    Definitions are shared across saves and this is not, which is the whole reason the
+    two tables are separate. Deleting a session takes its states; the geography it was
+    played on stays exactly where it was.
+    """
+
+    __tablename__ = "location_states"
+    __table_args__ = (
+        UniqueConstraint("session_id", "location_id", name="uq_location_states_session_location"),
+        CheckConstraint(
+            "security_level BETWEEN 0 AND 100", name="ck_location_states_security_range"
+        ),
+        CheckConstraint(
+            "local_danger_modifier BETWEEN -100 AND 100", name="ck_location_states_danger_range"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    # Two independent axes. `destroyed` + `open` is the ruins somebody can still walk
+    # into, and a definition is never deleted for reaching `destroyed`.
+    condition: Mapped[LocationCondition] = mapped_column(
+        String(20), default=LocationCondition.INTACT, nullable=False
+    )
+    accessibility: Mapped[LocationAccessibility] = mapped_column(
+        String(20), default=LocationAccessibility.OPEN, nullable=False
+    )
+
+    security_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Shifts the world's baseline danger rather than replacing it; a per-location copy
+    # of the whole danger configuration would be free to drift from the world's rules.
+    local_danger_modifier: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # No foreign key: an owner may be a character today and a faction when factions
+    # exist, and a column that can point at two tables cannot constrain either.
+    owner_entity_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    controller_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class LocationConnectionState(Base):
+    """Whether one traversal can currently be made, in one session.
+
+    Usually the state that decides whether somewhere is reachable. A castle stays
+    `open` after its gate is barred -- what changed is the edge -- so anything asking
+    "can I get in?" has to read this table and not only `location_states`.
+    """
+
+    __tablename__ = "location_connection_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "connection_id", name="uq_connection_states_session_connection"
+        ),
+        CheckConstraint(
+            "traversal_modifier BETWEEN -100 AND 100", name="ck_connection_states_modifier_range"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("location_connections.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    condition: Mapped[LocationCondition] = mapped_column(
+        String(20), default=LocationCondition.INTACT, nullable=False
+    )
+    accessibility: Mapped[LocationAccessibility] = mapped_column(
+        String(20), default=LocationAccessibility.OPEN, nullable=False
+    )
+    traversal_modifier: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )

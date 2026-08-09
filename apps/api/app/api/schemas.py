@@ -13,14 +13,27 @@ from app.application.state_service import StateChangeEvent
 from app.application.turn_service import AppliedRelationship, TurnMessage
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.errors import ValidationError as DomainValidationError
+from app.domain.state_mutations import StateMutationBatch
 from app.domain.world_facts import (
     FactAuthority,
     FactKind,
     FactSubjectType,
     FactValue,
     SetFact,
-    StateMutationBatch,
     WorldFact,
+)
+from app.domain.world_locations import (
+    MAX_NAME_LENGTH,
+    MAX_SUBTYPE_LENGTH,
+    ConnectionCategory,
+    LocationAccessibility,
+    LocationCategory,
+    LocationCondition,
+    LocationConnection,
+    LocationDefinition,
+    LocationScale,
+    LocationZone,
+    PhysicalDistance,
 )
 from app.domain.world_rules import (
     WorldRules,
@@ -267,6 +280,9 @@ class TurnResponse(BaseModel):
     """Fact proposals that survived review and are now established truth."""
     facts_rejected: int
     """Proposals the review refused. Normal, and usually the larger number."""
+    locations_created: int
+    """New places this turn established as canon for this session."""
+    locations_rejected: int
     visual_cue_generated: bool
 
 
@@ -327,6 +343,99 @@ class WorldStateRead(BaseModel):
     truncated: bool
     """True when the session has more facts than `limit` returned. A client that sees
     this and treats the page as the whole world state is wrong, and should know."""
+
+
+class LocationCreate(BaseModel):
+    """Author a place into a world's reusable template.
+
+    No `origin_session_id`: this endpoint writes template geography by definition, and
+    a field that could make it session-local would be a second way to do what the turn
+    pipeline already does properly.
+
+    No `id` either. The application mints it, here as everywhere.
+    """
+
+    name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    description: str = Field(default="", max_length=4000)
+    category: LocationCategory
+    subtype: str | None = Field(default=None, max_length=MAX_SUBTYPE_LENGTH)
+    scale: LocationScale
+    parent_location_id: uuid.UUID | None = None
+    importance: int = Field(default=3, ge=1, le=5)
+    tags: list[str] = Field(default_factory=list)
+    spatial_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConnectionCreate(BaseModel):
+    from_location_id: uuid.UUID
+    to_location_id: uuid.UUID
+    bidirectional: bool = True
+    category: ConnectionCategory
+    subtype: str | None = Field(default=None, max_length=MAX_SUBTYPE_LENGTH)
+    physical_distance: PhysicalDistance | None = None
+    base_travel_minutes: int | None = Field(default=None, ge=0)
+    """Kept separate from the distance, and neither derived from the other. A portal is
+    four thousand kilometres and one minute."""
+    importance: int = Field(default=3, ge=1, le=5)
+    tags: list[str] = Field(default_factory=list)
+
+
+class ZoneCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    category: str | None = Field(default=None, max_length=MAX_SUBTYPE_LENGTH)
+    description: str = Field(default="", max_length=4000)
+    importance: int = Field(default=2, ge=1, le=5)
+    tags: list[str] = Field(default_factory=list)
+
+
+class LocationStateRead(BaseModel):
+    """One session's current view of a place, flattened for a client."""
+
+    condition: LocationCondition
+    accessibility: LocationAccessibility
+    security_level: int
+    local_danger_modifier: int
+    owner_entity_id: uuid.UUID | None
+    controller_entity_id: uuid.UUID | None
+    updated_at: datetime
+
+
+class LocationRead(BaseModel):
+    """A place, with this session's state when there is a session in the request.
+
+    Definition and state are nested rather than merged, because they have different
+    lifetimes: the definition is shared by every save of the world and the state is
+    not. Flattening them into one object is how a client ends up believing a world can
+    be "damaged".
+    """
+
+    definition: LocationDefinition
+    state: LocationStateRead | None = None
+
+
+class ConnectionStateRead(BaseModel):
+    condition: LocationCondition
+    accessibility: LocationAccessibility
+    traversal_modifier: int
+    updated_at: datetime
+
+
+class ConnectionRead(BaseModel):
+    connection: LocationConnection
+    state: ConnectionStateRead | None = None
+
+
+class LocationDetailRead(LocationRead):
+    """One place and its immediate neighbourhood, for a diagnostics view.
+
+    Children and exits, but not descendants and not routes. Anything that walks further
+    than one step is a question for the spatial context endpoint, which has the tier
+    budget written into it.
+    """
+
+    zones: list[LocationZone] = Field(default_factory=list)
+    children: list[LocationRead] = Field(default_factory=list)
+    connections: list[ConnectionRead] = Field(default_factory=list)
 
 
 class StateChangeRequest(BaseModel):

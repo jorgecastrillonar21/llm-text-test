@@ -34,27 +34,48 @@ to know what a partial world change means, and nothing does.
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.application.persistence import NewEvent, NewFact, WorldStatePort
-from app.domain.errors import NotFoundError, StaleStateError, ValidationError
+from app.application.persistence import (
+    ConnectionStateWrite,
+    LocationStateWrite,
+    NewEvent,
+    NewFact,
+    StateStorePort,
+)
+from app.domain.errors import (
+    FactPolicyError,
+    NotFoundError,
+    StaleStateError,
+    ValidationError,
+)
+from app.domain.state_mutations import (
+    StateMutation,
+    StateMutationBatch,
+    require_no_conflicts,
+)
 from app.domain.world_facts import (
     FactAuthority,
-    FactMutation,
     FactSubject,
     FactSubjectType,
     RemoveFact,
     SetFact,
-    StateMutationBatch,
     WorldFact,
     check_rules_compatibility,
-    require_no_conflicts,
+    location_dedicated_owner,
     require_permitted,
     requires_source_event,
     resolve_policy,
+)
+from app.domain.world_locations import (
+    LocationConnectionState,
+    LocationState,
+    UpdateConnectionState,
+    UpdateLocationState,
 )
 from app.domain.world_rules import WorldRules
 
@@ -79,11 +100,19 @@ class StateChangeEvent(BaseModel):
 
 
 class AppliedMutation(BaseModel):
+    """One change that landed, reported back in the shape the batch identified it by.
+
+    `scope` and `target` are exactly what `mutation.target()` returned, so there is one
+    definition of "which thing did this touch" rather than a second one written for the
+    response. For a fact that reads `character:<id>` / `narrative.birthplace`; for
+    spatial state, `location_state` / `<id>`.
+    """
+
     model_config = ConfigDict(frozen=True)
 
-    op: Literal["set_fact", "remove_fact"]
-    subject: FactSubject
-    property: str
+    op: Literal["set_fact", "remove_fact", "update_location_state", "update_connection_state"]
+    scope: str
+    target: str
 
 
 class StateChangeResult(BaseModel):
@@ -99,7 +128,7 @@ class StateChangeResult(BaseModel):
 
 
 async def stage_state_change(
-    store: WorldStatePort,
+    store: StateStorePort,
     *,
     session_id: uuid.UUID,
     batch: StateMutationBatch,
@@ -172,11 +201,15 @@ async def stage_state_change(
                     tags=mutation.tags,
                 )
             )
-        else:
+        elif isinstance(mutation, RemoveFact):
             await store.remove_fact(session_id, mutation.subject, mutation.property)
-        applied.append(
-            AppliedMutation(op=mutation.op, subject=mutation.subject, property=mutation.property)
-        )
+        elif isinstance(mutation, UpdateLocationState):
+            await _apply_location_update(store, session_id=session_id, mutation=mutation)
+        else:
+            await _apply_connection_update(store, session_id=session_id, mutation=mutation)
+
+        scope, target = mutation.target()
+        applied.append(AppliedMutation(op=mutation.op, scope=scope, target=target))
 
     revision = await store.bump_state_revision(session_id)
 
@@ -186,7 +219,7 @@ async def stage_state_change(
 
 
 async def apply_state_change(
-    store: WorldStatePort,
+    store: StateStorePort,
     *,
     session_id: uuid.UUID,
     batch: StateMutationBatch,
@@ -204,7 +237,7 @@ async def apply_state_change(
 
 
 async def materialize_initial_facts(
-    store: WorldStatePort, *, session_id: uuid.UUID
+    store: StateStorePort, *, session_id: uuid.UUID
 ) -> StateChangeResult | None:
     """Copy the world template's starting facts into a new session.
 
@@ -235,30 +268,36 @@ async def materialize_initial_facts(
 
 
 async def _validate(
-    store: WorldStatePort,
+    store: StateStorePort,
     *,
     session_id: uuid.UUID,
     rules: WorldRules,
     batch: StateMutationBatch,
     known_character_ids: set[uuid.UUID],
-) -> list[tuple[FactMutation, WorldFact | None]]:
+) -> list[tuple[StateMutation, WorldFact | None]]:
     """Check every mutation against policy, entities, storage and the world's rules.
 
-    Returns each mutation paired with the fact it currently replaces, so the caller
-    does not read twice. Raises on the first problem: a batch is all-or-nothing, so
-    collecting further failures would be reporting on work that was never going to
-    happen.
+    Returns each mutation paired with the fact it currently replaces -- None for the
+    spatial ones, which replace no fact -- so the caller does not read twice. Raises on
+    the first problem: a batch is all-or-nothing, so collecting further failures would
+    be reporting on work that was never going to happen.
     """
     require_no_conflicts(batch)
 
-    checked: list[tuple[FactMutation, WorldFact | None]] = []
+    checked: list[tuple[StateMutation, WorldFact | None]] = []
     for mutation in batch.mutations:
+        if isinstance(mutation, UpdateLocationState | UpdateConnectionState):
+            await _validate_spatial(store, session_id=session_id, mutation=mutation)
+            checked.append((mutation, None))
+            continue
+
         _require_resolvable_subject(mutation.subject, known_character_ids)
         require_permitted(
             batch.authority,
             resolve_policy(mutation.property),
             canonical_property=mutation.property,
         )
+        _require_not_owned_elsewhere(mutation.subject, mutation.property)
 
         current = await store.get_fact(session_id, mutation.subject, mutation.property)
         if isinstance(mutation, RemoveFact) and current is None:
@@ -274,16 +313,134 @@ async def _validate(
     return checked
 
 
+async def _validate_spatial(
+    store: StateStorePort,
+    *,
+    session_id: uuid.UUID,
+    mutation: UpdateLocationState | UpdateConnectionState,
+) -> None:
+    """The target must exist and be visible to this session.
+
+    Visibility is the check that matters: another session's generated geography is
+    not "somewhere I may not write", it is somewhere this session cannot see at all,
+    and the adapter's filter makes it indistinguishable from missing.
+
+    Authority is not re-checked here -- `StateMutationBatch` refuses to be constructed
+    with a spatial mutation under a narrative authority, and `require_no_conflicts`
+    re-checks it for objects that skipped validation.
+    """
+    if isinstance(mutation, UpdateLocationState):
+        if await store.get_location(session_id, mutation.location_id) is None:
+            raise NotFoundError("Location", mutation.location_id)
+        return
+    if await store.get_connection(session_id, mutation.connection_id) is None:
+        raise NotFoundError("LocationConnection", mutation.connection_id)
+
+
+async def _apply_location_update(
+    store: StateStorePort, *, session_id: uuid.UUID, mutation: UpdateLocationState
+) -> None:
+    """Merge a partial update onto the current state and write the whole row.
+
+    Read here rather than trusted from the caller, for the same reason facts have no
+    `previous_value`: the freshest read is the one inside this transaction.
+
+    A place with no state row yet -- geography created before this session started, or
+    a materialisation that has not run -- gets the defaults merged into, so a mutation
+    against it is a change rather than an error.
+    """
+    current = await store.get_location_state(session_id, mutation.location_id)
+    base = current or LocationState(
+        id=uuid.uuid4(),
+        session_id=session_id,
+        location_id=mutation.location_id,
+        created_at=dt.datetime.now(dt.UTC),
+        updated_at=dt.datetime.now(dt.UTC),
+    )
+    await store.set_location_state(
+        LocationStateWrite(
+            session_id=session_id,
+            location_id=mutation.location_id,
+            condition=mutation.condition or base.condition,
+            accessibility=mutation.accessibility or base.accessibility,
+            # `or` would treat a deliberate 0 as "unset", and 0 is the most common
+            # value either of these takes.
+            security_level=(
+                base.security_level if mutation.security_level is None else mutation.security_level
+            ),
+            local_danger_modifier=(
+                base.local_danger_modifier
+                if mutation.local_danger_modifier is None
+                else mutation.local_danger_modifier
+            ),
+            owner_entity_id=(
+                None if mutation.clear_owner else (mutation.owner_entity_id or base.owner_entity_id)
+            ),
+            controller_entity_id=(
+                None
+                if mutation.clear_controller
+                else (mutation.controller_entity_id or base.controller_entity_id)
+            ),
+        )
+    )
+
+
+async def _apply_connection_update(
+    store: StateStorePort, *, session_id: uuid.UUID, mutation: UpdateConnectionState
+) -> None:
+    current = await store.get_connection_state(session_id, mutation.connection_id)
+    base = current or LocationConnectionState(
+        id=uuid.uuid4(),
+        session_id=session_id,
+        connection_id=mutation.connection_id,
+        created_at=dt.datetime.now(dt.UTC),
+        updated_at=dt.datetime.now(dt.UTC),
+    )
+    await store.set_connection_state(
+        ConnectionStateWrite(
+            session_id=session_id,
+            connection_id=mutation.connection_id,
+            condition=mutation.condition or base.condition,
+            accessibility=mutation.accessibility or base.accessibility,
+            traversal_modifier=(
+                base.traversal_modifier
+                if mutation.traversal_modifier is None
+                else mutation.traversal_modifier
+            ),
+        )
+    )
+
+
 def _require_resolvable_subject(subject: FactSubject, known_character_ids: set[uuid.UUID]) -> None:
     """A fact must be about something that exists.
 
     Characters are the only entity this application can currently resolve, so they are
-    the only ones checked. Locations and factions have no tables yet; their ids are
-    accepted on trust and will become checkable when those systems arrive. That is
-    recorded here rather than silently tolerated, because an unverifiable id is a fact
-    that may be about nothing.
+    the only ones checked. Locations are checked separately by the proposal reviewer,
+    which has the session in hand; factions have no table yet and their ids are
+    accepted on trust. That is recorded here rather than silently tolerated, because an
+    unverifiable id is a fact that may be about nothing.
     """
     if subject.type is not FactSubjectType.CHARACTER:
         return
     if subject.id not in known_character_ids:
         raise NotFoundError("Character", subject.id)
+
+
+def _require_not_owned_elsewhere(subject: FactSubject, canonical_property: str) -> None:
+    """Refuse a fact that duplicates something a dedicated model already owns.
+
+    The policy registry catches the obvious spellings for any subject. This catches the
+    one that depends on what the fact is about: `world.condition` of a sword is an
+    ordinary truth, and of a location it is `location_states.condition` with a fact's
+    clothes on. Two rows claiming whether the bridge is standing is exactly the
+    situation dedicated models exist to prevent.
+    """
+    if subject.type is not FactSubjectType.LOCATION:
+        return
+    owner = location_dedicated_owner(canonical_property)
+    if owner is not None:
+        raise FactPolicyError(
+            f"{canonical_property!r} is not a fact about a location: {owner} "
+            "Use UpdateLocationState. Narrative truths about a place -- what it is known "
+            "for, what happened here -- are still facts."
+        )
