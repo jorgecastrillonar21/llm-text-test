@@ -78,6 +78,41 @@ class TimeContext(BaseModel):
     elapsed_since_start: str
 
 
+class FactContext(BaseModel):
+    """One established truth, phrased for a reader rather than a query.
+
+    The subject is a *label* -- "King Aldren", "the world" -- resolved from the ids the
+    context builder already loaded. The id itself is deliberately absent: the director
+    does not address facts, it reads them, and a uuid in a prompt is tokens spent on
+    something no sentence will ever use.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    subject: str
+    property: str
+    value: str
+    """Rendered, not raw. `false` reads the same to a model whether it arrived as a
+    bool or a string, and the prompt is prose."""
+
+
+class WorldFactsContext(BaseModel):
+    """What is currently true, split by how much it should weigh on the scene.
+
+    Not every fact: a session accumulates them and a prompt does not grow. Selection is
+    importance-ordered and deterministic, which is retrieval policy and therefore lives
+    in `context_builder` with every other retrieval decision.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    critical: list[FactContext] = Field(default_factory=list)
+    """Facts that reshape the story. Deaths, ruined places, changed regimes."""
+
+    relevant: list[FactContext] = Field(default_factory=list)
+    """Established details that colour a scene without dominating it."""
+
+
 class CharacterContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -225,6 +260,7 @@ class StoryContext(BaseModel):
     player: PlayerContext
     session: SessionContext
     time: TimeContext
+    world_facts: WorldFactsContext = Field(default_factory=WorldFactsContext)
     relevant_characters: list[CharacterContext] = Field(default_factory=list)
     recent_messages: list[MessageContext] = Field(default_factory=list)
     relevant_memories: list[MemoryContext] = Field(default_factory=list)

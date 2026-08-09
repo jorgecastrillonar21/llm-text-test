@@ -3,9 +3,10 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Query, status
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 
-from app.api.deps import DbSession, StoryGen, TurnGateway
+from app.api.deps import DbSession, StoryGen, TurnGateway, WorldStateStore
 from app.api.schemas import (
     MemoryRead,
     MessageRead,
@@ -16,13 +17,22 @@ from app.api.schemas import (
     SessionTimeRead,
     TurnRequest,
     TurnResponse,
+    WorldFactRead,
+    WorldStateRead,
 )
+from app.application.state_service import materialize_initial_facts
 from app.application.turn_service import execute_turn
-from app.domain.errors import NotFoundError
+from app.domain.errors import NotFoundError, ValidationError
+from app.domain.world_facts import FactKind, FactSubject, FactSubjectType
 from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
 
 router = APIRouter(tags=["sessions"])
+
+FACT_PAGE_LIMIT = 200
+"""Ceiling for one read of a session's facts. High enough that no real session hits
+it today, present so that a session which one day does cannot return an unbounded
+response. `WorldStateRead.truncated` is how a caller finds out it did."""
 
 
 @router.get("/sessions", response_model=list[SessionRead])
@@ -37,12 +47,26 @@ async def list_sessions(
 
 
 @router.post("/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED)
-async def create_session(payload: SessionCreate, db: DbSession) -> models.GameSession:
+async def create_session(
+    payload: SessionCreate, db: DbSession, store: WorldStateStore
+) -> models.GameSession:
+    """Start a session, and copy the world's starting facts into it.
+
+    One transaction: flush so the seeding can read the session it is seeding, then
+    commit both together. A session that exists without the truths its world declared
+    would be a world the player is playing a different version of, and there is no
+    retry that would fix it after the fact.
+    """
     world = await db.get(models.World, payload.world_id)
     if world is None:
         raise NotFoundError("World", payload.world_id)
     session = models.GameSession(**payload.model_dump())
     db.add(session)
+    await db.flush()
+
+    # Same AsyncSession behind the port, so it sees the row above without committing.
+    await materialize_initial_facts(store, session_id=session.id)
+
     await db.commit()
     return session
 
@@ -104,6 +128,60 @@ async def list_relationships(session_id: uuid.UUID, db: DbSession) -> list[model
         select(models.Relationship).where(models.Relationship.session_id == session_id)
     )
     return list(rows.scalars())
+
+
+@router.get("/sessions/{session_id}/world-state/facts", response_model=WorldStateRead)
+async def list_world_facts(
+    session_id: uuid.UUID,
+    store: WorldStateStore,
+    subject_type: FactSubjectType | None = Query(default=None),
+    subject_id: uuid.UUID | None = Query(default=None),
+    kind: FactKind | None = Query(default=None),
+    min_importance: int | None = Query(default=None, ge=1, le=5),
+    limit: int = Query(default=FACT_PAGE_LIMIT, ge=1, le=FACT_PAGE_LIMIT),
+) -> WorldStateRead:
+    """What is currently true in this session.
+
+    Read-only, and the only fact endpoint that is not development-only. Changing state
+    is something game systems do through `app.application.state_service`; there is
+    deliberately no gameplay CRUD over facts, because a client that could write one
+    could write `system.alive` and the whole authority model would be decoration.
+
+    `subject_id` narrows within a `subject_type`; sending it alone is a 422, since an
+    id without a type is not a subject.
+    """
+    session = await store.get_session(session_id)
+    if session is None:
+        raise NotFoundError("GameSession", session_id)
+
+    subject = _requested_subject(subject_type, subject_id)
+    # One past the ceiling, so a full page can be reported as truncated rather than
+    # silently looking like the whole of the world's state.
+    facts = await store.load_facts(
+        session_id, subject=subject, kind=kind, min_importance=min_importance, limit=limit + 1
+    )
+    return WorldStateRead(
+        session_id=session_id,
+        state_revision=session.state_revision,
+        facts=[WorldFactRead.of(fact) for fact in facts[:limit]],
+        truncated=len(facts) > limit,
+    )
+
+
+def _requested_subject(
+    subject_type: FactSubjectType | None, subject_id: uuid.UUID | None
+) -> FactSubject | None:
+    if subject_type is None:
+        if subject_id is not None:
+            raise ValidationError("'subject_id' needs a 'subject_type' to mean anything.")
+        return None
+    try:
+        # FactSubject enforces the rest: the world takes no id, everything else needs
+        # one. Translated here because a pydantic error raised inside a handler is a
+        # 500, and a bad query string is the caller's problem, not the server's.
+        return FactSubject(type=subject_type, id=subject_id)
+    except PydanticValidationError as exc:
+        raise ValidationError(str(exc).splitlines()[0]) from exc
 
 
 @router.post("/sessions/{session_id}/turns", response_model=TurnResponse)

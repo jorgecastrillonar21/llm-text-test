@@ -127,6 +127,12 @@ export interface GameSession {
   turn_index: number;
   /** Independent of `turn_index`: neither can be computed from the other. */
   elapsed_minutes: number;
+  /**
+   * How many batches of state changes this session has applied. A third independent
+   * counter — turns, minutes and changes each move for their own reasons, and a turn
+   * of pure conversation moves only the first. See docs/world-state-facts.md.
+   */
+  state_revision: number;
   created_at: string;
   updated_at: string;
 }
@@ -180,6 +186,10 @@ export interface TurnResponse {
   relationships: AppliedRelationship[];
   memories_created: number;
   events_created: number;
+  /** Fact proposals that survived review and are now established truth. */
+  facts_established: number;
+  /** Proposals the review refused. Normal, and usually the larger number. */
+  facts_rejected: number;
   visual_cue_generated: boolean;
 }
 

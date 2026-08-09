@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.persistence import SessionClockPort, TurnGatewayPort
+from app.application.persistence import SessionClockPort, TurnGatewayPort, WorldStatePort
 from app.application.ports import ImageGeneratorPort, StoryGeneratorPort
 from app.config import Settings
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
@@ -56,6 +56,16 @@ def get_session_clock(session: Annotated[AsyncSession, Depends(get_db)]) -> Sess
     return SqlAlchemyTurnGateway(session)
 
 
+def get_world_state_store(session: Annotated[AsyncSession, Depends(get_db)]) -> WorldStatePort:
+    """The same adapter again, seen through the port that changes what is true.
+
+    A third dependency for a third use case, for the reason the second one exists: the
+    signature is the documentation. Reading and writing facts must not be able to reach
+    the transcript, and this is what says so at the boundary.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
 def get_settings_dep(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
@@ -74,6 +84,7 @@ def get_image_generator(request: Request) -> ImageGeneratorPort:
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 TurnGateway = Annotated[TurnGatewayPort, Depends(get_turn_gateway)]
 SessionClock = Annotated[SessionClockPort, Depends(get_session_clock)]
+WorldStateStore = Annotated[WorldStatePort, Depends(get_world_state_store)]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 StoryGen = Annotated[StoryGeneratorPort, Depends(get_story_generator)]
 ImageGen = Annotated[ImageGeneratorPort, Depends(get_image_generator)]

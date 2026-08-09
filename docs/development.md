@@ -104,6 +104,26 @@ from `Base.metadata`. The Alembic migration itself is verified separately by
 `tests/conftest.py` exposes `FailingStoryGenerator` for provider-failure paths, and
 `make_story_context` for exercising providers directly.
 
+### Development-only endpoints
+
+`/api/v1/dev/*` is mounted only when `APP_ENV` is `development` or `test` — an
+allowlist, so a typo leaves developer tooling off rather than quietly switching it on.
+It exists because nothing in the game moves time or changes state yet:
+
+```text
+POST   /api/v1/dev/sessions/{id}/advance-time
+POST   /api/v1/dev/sessions/{id}/scheduled-events
+DELETE /api/v1/dev/scheduled-events/{id}
+POST   /api/v1/dev/sessions/{id}/world-state/changes
+```
+
+None of them is a shortcut. Each goes through the same application service a real caller
+will use, so a paused world still refuses to advance and a state change is still checked
+against the property's policy, the world's rules and the session's revision. `admin`
+authority does not bypass the world's rules, and `story_director` sent to the mutation
+endpoint still reaches `OPEN` properties and nothing else. See
+[world-state-facts.md](world-state-facts.md).
+
 ### E2E
 
 Playwright drives the real backend in mock mode. **Start the API first**, then:

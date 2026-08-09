@@ -7,14 +7,20 @@ constrained to. The model proposes; the application layer decides what to persis
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import ValidationError as PydanticValidationError
 
 from app.domain.enums import MemoryKind
 from app.domain.relationships import DELTA_MAX, DELTA_MIN
+from app.domain.world_facts import FactSubjectType
+
+logger = logging.getLogger(__name__)
 
 MAX_SUGGESTED_ACTIONS = 4
+MAX_FACT_PROPOSALS = 5
 
 
 class DialogueLine(BaseModel):
@@ -62,6 +68,42 @@ class WorldEvent(BaseModel):
     description: str = Field(min_length=1, max_length=500)
 
 
+class FactProposal(BaseModel):
+    """Something the model believes the story just established as objectively true.
+
+    A *proposal*. Nothing here is written; every one is reviewed against the property's
+    policy, the model's authority, what is already established and the world's rules,
+    and most of what a model proposes is refused. See `app.application.fact_proposals`.
+
+    The model never returns a replacement WorldState and has no way to express one:
+    this is a list of individual claims about single properties, which is the shape
+    that can be adjudicated one at a time.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    subject_type: FactSubjectType
+    subject_id: uuid.UUID | None = Field(
+        default=None, description="Required for anything but the world itself."
+    )
+    property: str = Field(
+        min_length=1,
+        max_length=120,
+        description="Canonical snake_case name, e.g. 'narrative.birthplace'.",
+    )
+
+    value: bool | int | float | str | list[str] | None
+    """Scalars and short string lists only -- narrower than what a fact can hold.
+
+    Structured objects are excluded deliberately: a model proposing one is proposing an
+    aggregate, and aggregates are what the fact store exists to keep out. It also keeps
+    the JSON schema flat, which matters for grammar-constrained decoding.
+    """
+
+    importance: int = Field(default=2, ge=1, le=5)
+    reason: str = Field(default="", max_length=300, description="What in this turn established it.")
+
+
 class VisualCue(BaseModel):
     """Signals a visually significant moment, not every turn."""
 
@@ -107,6 +149,13 @@ class TurnGeneration(BaseModel):
     memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
     relationship_changes: list[RelationshipChange] = Field(default_factory=list)
     world_events: list[WorldEvent] = Field(default_factory=list)
+
+    # Optional, unlike `suggested_actions`, and for the opposite reason. Suggestions
+    # are wanted every turn, so the schema demands them. The right number of new facts
+    # for most turns is zero, and a required field is one a constrained model will fill
+    # -- which would turn "record what the story established" into "invent something".
+    fact_proposals: list[FactProposal] = Field(default_factory=list)
+
     visual_cue: VisualCue = Field(default_factory=VisualCue)
 
     @model_validator(mode="before")
@@ -126,8 +175,45 @@ class TurnGeneration(BaseModel):
             return {**data, "suggested_actions": []}
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_unusable_fact_proposals(cls, data: object) -> object:
+        """A malformed proposal is discarded, never fatal.
+
+        The same judgement as the validator above, applied to a field where the stakes
+        are higher. One proposal with a bad subject type would otherwise fail the whole
+        `TurnGeneration`, roll back a turn of real prose, and show the player a 502 --
+        because the model got a detail wrong in an optional extra it was not obliged to
+        send at all.
+
+        Malformed proposals are logged rather than silently dropped: a model that keeps
+        emitting them is a prompt problem, and the log is where that shows up.
+        """
+        if not isinstance(data, dict) or "fact_proposals" not in data:
+            return data
+
+        raw = data["fact_proposals"]
+        if not isinstance(raw, list):
+            logger.warning("Story provider sent fact_proposals as %s; ignored.", type(raw).__name__)
+            return {**data, "fact_proposals": []}
+
+        kept: list[FactProposal] = []
+        for item in raw:
+            try:
+                kept.append(FactProposal.model_validate(item))
+            except PydanticValidationError as exc:
+                logger.warning("Story provider sent an unusable fact proposal; dropped. %s", exc)
+        return {**data, "fact_proposals": kept}
+
     @field_validator("suggested_actions")
     @classmethod
     def _trim_suggestions(cls, value: list[str]) -> list[str]:
         cleaned = [item.strip() for item in value if item.strip()]
         return cleaned[:MAX_SUGGESTED_ACTIONS]
+
+    @field_validator("fact_proposals")
+    @classmethod
+    def _cap_proposals(cls, value: list[FactProposal]) -> list[FactProposal]:
+        """A turn establishes a few things at most. The cap is on the contract rather
+        than the reviewer so a runaway model costs one truncation, not fifty reads."""
+        return value[:MAX_FACT_PROPOSALS]

@@ -28,17 +28,21 @@ from pydantic import BaseModel
 
 from app.application.context_builder import build_story_context
 from app.application.contracts import DialogueLine, TurnGeneration
+from app.application.fact_proposals import ProposalReview, review_fact_proposals
 from app.application.persistence import (
     NewEvent,
     NewMemory,
     NewMessage,
     SessionSnapshot,
     TurnGatewayPort,
+    WorldSnapshot,
 )
 from app.application.ports import StoryGeneratorPort
+from app.application.state_service import stage_state_change
 from app.domain.enums import MessageRole
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector, clamp_delta
+from app.domain.world_facts import FactAuthority, StateMutationBatch
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,10 @@ class TurnResult(BaseModel):
     relationships: list[AppliedRelationship]
     memories_created: int
     events_created: int
+    facts_established: int
+    """How many of the Story Director's fact proposals survived review. Usually zero,
+    and a turn where it is not is worth being able to see without reading the log."""
+    facts_rejected: int
     visual_cue_generated: bool
 
 
@@ -188,6 +196,9 @@ async def execute_turn(
     memories_created = await _persist_memories(gateway, session, generation, known_character_ids)
     relationships = await _apply_relationships(gateway, session, generation, known_character_ids)
     events_created = await _persist_events(gateway, session, generation, turn_index)
+    review = await _establish_proposed_facts(
+        gateway, session, world, generation, known_character_ids
+    )
 
     await gateway.set_turn_index(session.id, turn_index)
 
@@ -204,8 +215,43 @@ async def execute_turn(
         relationships=relationships,
         memories_created=memories_created,
         events_created=events_created,
+        facts_established=len(review.accepted),
+        facts_rejected=len(review.reviewed) - len(review.accepted),
         visual_cue_generated=generation.visual_cue.generate,
     )
+
+
+async def _establish_proposed_facts(
+    gateway: TurnGatewayPort,
+    session: SessionSnapshot,
+    world: WorldSnapshot,
+    generation: TurnGeneration,
+    known_character_ids: set[uuid.UUID],
+) -> ProposalReview:
+    """Review what the model claims the turn established, and store what survives.
+
+    Staged, not committed: these facts are part of the turn, and a turn is atomic. No
+    GameEvent is minted for them either -- the turn is already the event that produced
+    them, and a `FACT_CREATED` row for "Elena dislikes olives" would bury the history
+    that matters under the history that does not. `story_director` is exempt from the
+    source-event requirement for exactly this case; see `world_facts.authority`.
+    """
+    review = await review_fact_proposals(
+        gateway,
+        session_id=session.id,
+        world=world,
+        proposals=generation.fact_proposals,
+        known_character_ids=known_character_ids,
+    )
+    if review.accepted:
+        await stage_state_change(
+            gateway,
+            session_id=session.id,
+            batch=StateMutationBatch(
+                authority=FactAuthority.STORY_DIRECTOR, mutations=list(review.accepted)
+            ),
+        )
+    return review
 
 
 def _is_the_player_speaking(line: DialogueLine, session: SessionSnapshot) -> bool:

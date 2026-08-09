@@ -51,6 +51,41 @@ class TimeProgressionError(ValidationError):
     """
 
 
+class FactPolicyError(ValidationError):
+    """Someone tried to write a fact their authority does not reach.
+
+    The request was well formed and the property was real -- the asker simply may not
+    establish it. Kept distinct from a malformed mutation so a caller can tell "I sent
+    nonsense" from "the Story Director does not get to decide who is alive".
+    """
+
+
+class IncompatibleFactError(ValidationError):
+    """The world's own rules forbid the truth this mutation would establish.
+
+    Resurrection in a world where death is permanent, something supernatural in a
+    world with no supernatural. Not a policy problem: nobody is authorised for this,
+    because the universe does not work that way.
+    """
+
+
+class StaleStateError(DomainError):
+    """A mutation batch was decided against a state revision that has since moved.
+
+    Not a `ValidationError`: nothing about the request is wrong, it merely arrived
+    late. The API maps it to 409 rather than 422, because the useful response is
+    "re-read and try again" rather than "fix your input".
+    """
+
+    def __init__(self, *, expected: int, actual: int) -> None:
+        super().__init__(
+            f"Session state has moved on: the batch expected revision {expected}, "
+            f"but the session is at {actual}."
+        )
+        self.expected = expected
+        self.actual = actual
+
+
 class StoryGenerationError(DomainError):
     """The story provider could not produce a valid turn.
 

@@ -23,6 +23,7 @@ from app.application.persistence import (
 from app.application.rules_projection import project_world_rules
 from app.application.story_context import (
     CharacterContext,
+    FactContext,
     MemoryContext,
     MessageContext,
     PlayerContext,
@@ -31,13 +32,24 @@ from app.application.story_context import (
     StoryContext,
     TimeContext,
     WorldContext,
+    WorldFactsContext,
 )
 from app.domain.enums import MessageRole
+from app.domain.world_facts import FactSubjectType, WorldFact
 from app.domain.world_time import project_time
 
 RECENT_MESSAGE_LIMIT = 20
 MEMORY_LIMIT = 30
 CHARACTER_LIMIT = 12
+
+FACT_LIMIT = 40
+"""How many established facts reach the prompt at all. A long session accumulates far
+more than this; the prompt has a budget and importance is what spends it."""
+
+CRITICAL_IMPORTANCE = 4
+"""At or above this, a fact is presented as something the scene must not contradict.
+Below it, as colour. The line is drawn here rather than in the domain because it is a
+prompt-shaping decision, and the domain's 1..5 scale has no opinion about prompts."""
 
 
 async def build_story_context(
@@ -53,6 +65,7 @@ async def build_story_context(
     messages = await reader.load_recent_messages(session.id, limit=RECENT_MESSAGE_LIMIT)
     memories = await reader.load_memories(session.id, limit=MEMORY_LIMIT)
     relationships = await reader.load_relationships(session.id)
+    facts = await reader.load_facts(session.id, limit=FACT_LIMIT)
 
     # Derived here, every turn, from the one number that is stored. There is no
     # cached "current date" anywhere for this to disagree with.
@@ -84,6 +97,7 @@ async def build_story_context(
             period=now.period,
             elapsed_since_start=now.elapsed_since_start,
         ),
+        world_facts=_to_facts_context(facts, names, world.name),
         relevant_characters=[_to_character_context(record) for record in characters],
         recent_messages=[_to_message_context(message, names) for message in messages],
         relevant_memories=[
@@ -108,6 +122,54 @@ async def build_story_context(
         ],
         player_action=player_action,
     )
+
+
+def _to_facts_context(
+    facts: list[WorldFact], names: dict[uuid.UUID, str], world_name: str
+) -> WorldFactsContext:
+    """Split the loaded facts by importance and give each one a readable subject.
+
+    Gameplay flags are included: `palace_secret_discovered` is not a sentence anyone in
+    the world would say, but a director that does not know the secret is out will write
+    a scene where it is still a secret.
+    """
+    critical: list[FactContext] = []
+    relevant: list[FactContext] = []
+    for fact in facts:
+        entry = FactContext(
+            subject=_subject_label(fact, names, world_name),
+            property=fact.property,
+            value=_render_value(fact.value),
+        )
+        bucket = critical if fact.importance >= CRITICAL_IMPORTANCE else relevant
+        bucket.append(entry)
+    return WorldFactsContext(critical=critical, relevant=relevant)
+
+
+def _subject_label(fact: WorldFact, names: dict[uuid.UUID, str], world_name: str) -> str:
+    """A name a sentence could use.
+
+    Falls back to the subject type when an id resolves to nothing -- a character the
+    context did not load, or an entity type with no table yet. Never the bare uuid: an
+    id the model cannot use is an id it should not be shown.
+    """
+    if fact.subject.type is FactSubjectType.WORLD:
+        return world_name
+    if fact.subject.id is not None and fact.subject.id in names:
+        return names[fact.subject.id]
+    return f"an unnamed {fact.subject.type.value}"
+
+
+def _render_value(value: object) -> str:
+    if isinstance(value, bool):  # Before the list branch, and before str(): bool is int.
+        return "yes" if value else "no"
+    if value is None:
+        return "none"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "nothing"
+    if isinstance(value, dict):
+        return ", ".join(f"{key}: {item}" for key, item in value.items())
+    return str(value)
 
 
 def _to_character_context(record: CharacterRecord) -> CharacterContext:

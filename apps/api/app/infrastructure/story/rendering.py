@@ -155,6 +155,22 @@ def render_context(context: StoryContext) -> str:
     if context.session.summary:
         lines.append(f"Story so far: {context.session.summary}")
 
+    facts = context.world_facts
+    if facts.critical or facts.relevant:
+        # Placed before the characters and the transcript on purpose: this is the block
+        # everything below has to agree with, and a model reads a prompt in order.
+        lines.append("\n# Established truth  (authoritative: the game says these are so)")
+        if facts.critical:
+            lines.append("Must not be contradicted:")
+            lines.extend(
+                f"- {fact.subject} — {fact.property}: {fact.value}" for fact in facts.critical
+            )
+        if facts.relevant:
+            lines.append("Also established:")
+            lines.extend(
+                f"- {fact.subject} — {fact.property}: {fact.value}" for fact in facts.relevant
+            )
+
     if context.relevant_characters:
         lines.append("\n# Characters present in this world")
         for character in context.relevant_characters:

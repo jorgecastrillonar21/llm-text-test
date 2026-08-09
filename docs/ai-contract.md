@@ -72,6 +72,29 @@ not to state an hour other than the one given. A model that ignores it writes a 
 that disagrees with the header, not a corrupted save.
 Full semantics: [world-state-time.md](world-state-time.md).
 
+### Established truth in the context
+
+`world_facts` is a `WorldFactsContext` — the session's current objective truth, split
+into `critical` (importance 4-5) and `relevant`. It is rendered **before** the
+characters and the transcript, because it is the block everything below has to agree
+with and a model reads a prompt in order:
+
+```text
+# Established truth  (authoritative: the game says these are so)
+Must not be contradicted:
+- The Fractured Crown — world.political_status: contested
+Also established:
+- Elena — narrative.birthplace: the capital's lower district
+```
+
+Subjects are rendered as *labels*, never as uuids: the director reads facts, it does not
+address them, and an id the model cannot use is an id it should not be shown. Values are
+rendered too — `true` becomes "yes", a list becomes a comma-separated phrase.
+
+Selection is importance-ordered and capped, because a session accumulates facts and a
+prompt does not grow. That is retrieval policy, so it lives in `context_builder.py` with
+every other retrieval decision.
+
 ## TurnGeneration — what the model returns
 
 ```text
@@ -82,6 +105,7 @@ TurnGeneration
 ├── memory_candidates    : MemoryCandidate[]
 ├── relationship_changes : RelationshipChange[]
 ├── world_events         : WorldEvent[]
+├── fact_proposals       : FactProposal[]   (optional, capped at 5)
 └── visual_cue           : VisualCue
 ```
 
@@ -113,6 +137,48 @@ check constraint.
 
 Memories are currently scoped to a session. Promoting durable world facts to
 world-scoped memory is a Phase 2 concern.
+
+A memory is not a fact. A memory is what someone recalls, fallibly; a fact is what the
+game asserts is so. See `fact_proposals` below and
+[world-state-facts.md](world-state-facts.md).
+
+### Fact proposals
+
+```text
+subject_type : world | character | location | faction | other
+subject_id   : UUID | null      (required for anything but the world)
+property     : namespace.snake_case
+value        : bool | int | float | string | string[] | null
+importance   : 1..5
+reason       : string
+```
+
+A *proposal*, and nothing more. The model never writes a fact: each one is reviewed
+against the property's policy, the model's authority, what is already established, and
+the world's rules, and most are refused. `TurnResponse` reports `facts_established` and
+`facts_rejected` so a turn's outcome is visible without reading the log.
+
+This is where the model's authority is at its narrowest by design. **The Story Director
+has the lowest authority over mechanical state of anything in the system**: it reaches
+`OPEN` properties — diegetic colour like `narrative.birthplace` — and nothing else.
+Whether someone is alive, where they are, what they carry, how hurt they are, and every
+other `system.` or `gameplay.` property is decided by game systems and handed to the
+model as an outcome to narrate.
+
+Three properties of the design worth naming:
+
+- **There is no shape in which the model can return a replacement WorldState.** The
+  contract is a list of individual claims about single properties, which is what can be
+  adjudicated one at a time.
+- **A malformed proposal is never fatal.** It is dropped before validation and logged.
+  A 502 over a detail the model was not obliged to send would roll back a turn of real
+  prose to protect an optional extra.
+- **The field is optional**, unlike `suggested_actions` — and for the opposite reason.
+  Suggestions are wanted every turn, so the schema demands them. The right number of new
+  facts for most turns is zero, and a required field is one a grammar-constrained model
+  will fill, turning "record what the story established" into "invent something".
+
+Full semantics: [world-state-facts.md](world-state-facts.md).
 
 ### Relationship deltas
 

@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import TypedDict
 
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.domain.enums import Language
+from app.domain.world_facts import WORLD_SUBJECT, FactSubject, FactSubjectType, SetFact
 from app.domain.world_rules import WorldRulesPreset, build_preset
 from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
@@ -88,6 +90,42 @@ CHARACTERS: list[SeedCharacter] = [
 ]
 
 
+def _initial_facts(elena_id: uuid.UUID, kael_id: uuid.UUID) -> list[SetFact]:
+    """What is already true in the demo world before anyone plays it.
+
+    Deliberately small, and deliberately the two kinds: facts about the world that the
+    director must not contradict, and quiet character detail it may build on. Nothing
+    mechanical -- `system.alive` is not seeded, because a fact's absence is not the
+    same as false and "nothing has happened to Elena yet" is exactly the absent case.
+    """
+    return [
+        SetFact(
+            subject=WORLD_SUBJECT,
+            property="world.political_status",
+            value="contested; the crown has no undisputed heir",
+            importance=4,
+        ),
+        SetFact(
+            subject=WORLD_SUBJECT,
+            property="world.condition",
+            value="the wards around the capital are thinning",
+            importance=4,
+        ),
+        SetFact(
+            subject=FactSubject(type=FactSubjectType.CHARACTER, id=elena_id),
+            property="narrative.birthplace",
+            value="the capital's lower district",
+            importance=1,
+        ),
+        SetFact(
+            subject=FactSubject(type=FactSubjectType.CHARACTER, id=kael_id),
+            property="narrative.birthplace",
+            value="a farming village eight days south",
+            importance=1,
+        ),
+    ]
+
+
 async def seed() -> None:
     settings = get_settings()
     engine = create_engine(settings)
@@ -122,13 +160,26 @@ async def seed() -> None:
             db.add(world)
             await db.flush()
 
-            for data in CHARACTERS:
-                db.add(models.Character(world_id=world.id, **data))
+            characters = {
+                data["name"]: models.Character(world_id=world.id, **data) for data in CHARACTERS
+            }
+            db.add_all(characters.values())
+            await db.flush()
+
+            # Written after the characters exist, because a template fact about Elena
+            # needs her id and there is deliberately no way to name a subject any other
+            # way. Every session made from this world starts with copies of these and
+            # diverges from there; nothing a session does writes back here.
+            world.initial_facts = [
+                fact.model_dump(mode="json")
+                for fact in _initial_facts(characters["Elena"].id, characters["Kael"].id)
+            ]
             await db.flush()
 
             print(f"Created demo world: {world.id}")
             print(f"Rules: {DEMO_WORLD_PRESET.value}")
             print(f"Characters: {', '.join(c['name'] for c in CHARACTERS)}")
+            print(f"Initial facts: {len(world.initial_facts)}")
     finally:
         await engine.dispose()
 

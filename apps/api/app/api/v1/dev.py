@@ -1,17 +1,25 @@
-"""Development-only endpoints for the simulation clock.
+"""Development-only endpoints for the simulation clock and the world's state.
 
 Registered by `create_app` only when `Settings.dev_endpoints_enabled` says so, which
 is a short allowlist of environments rather than "anything that is not production" --
 an unrecognised APP_ENV should switch these off, not on.
 
-They exist because nothing in the game moves time yet. `ActionResolutionService`,
-`TravelService` and `RestService` are the callers this was built for, and until one of
-them exists these two endpoints and the tests are the only way to exercise the clock.
+They exist because nothing in the game moves time or changes state yet.
+`ActionResolutionService`, `TravelService` and `RestService` are the callers this was
+built for, and until one of them exists these endpoints and the tests are the only way
+to exercise either system.
 
-Nothing here is a shortcut. Both go through the same application service any future
-caller will use: a paused world still refuses, the never-backward rule still holds,
-scheduled events still resolve, and the advance is still recorded in the audit trail.
-The only privilege a developer gets is the `debug` reason, which every world accepts.
+Nothing here is a shortcut. Every one goes through the same application service a real
+caller will use: a paused world still refuses to advance, the never-backward rule still
+holds, and a state change is still validated against the property's policy, the
+world's rules and the session's revision before anything is written. The only
+privilege a developer gets is the `debug` reason and the `admin` authority, and even
+admin cannot write a derived property or resurrect someone in a world where death is
+permanent.
+
+This is emphatically not gameplay CRUD over facts. It is mounted under `/dev`, it is
+off by default, and the day a resolution service exists it should be the first thing
+reconsidered.
 """
 
 from __future__ import annotations
@@ -20,9 +28,10 @@ import uuid
 
 from fastapi import APIRouter, status
 
-from app.api.deps import SessionClock
-from app.api.schemas import ScheduledEventCreate
+from app.api.deps import SessionClock, WorldStateStore
+from app.api.schemas import ScheduledEventCreate, StateChangeRequest
 from app.application.persistence import ScheduledEventRecord
+from app.application.state_service import StateChangeResult, apply_state_change
 from app.application.time_service import advance_time, cancel_scheduled_event, schedule_event
 from app.domain.errors import NotFoundError
 from app.domain.world_time import TimeAdvanceRequest, TimeAdvanceResult
@@ -74,3 +83,23 @@ async def create_scheduled_event(
 async def cancel_event(event_id: uuid.UUID, clock: SessionClock) -> None:
     """Call off a pending event. Cancelling one that already fired is a 422."""
     await cancel_scheduled_event(clock, event_id=event_id)
+
+
+@router.post("/sessions/{session_id}/world-state/changes", response_model=StateChangeResult)
+async def apply_world_state_change(
+    session_id: uuid.UUID, payload: StateChangeRequest, store: WorldStateStore
+) -> StateChangeResult:
+    """Apply one batch of state mutations, atomically.
+
+    Straight through `apply_state_change`, which is the only door to the fact store
+    and stays the only one: this handler decides nothing. Refusals come back as they
+    are -- 422 for a policy or rules violation, 404 for a subject that does not exist,
+    409 when `expected_revision` no longer matches.
+
+    Sending `authority: "story_director"` here is allowed and behaves exactly as it
+    does in a turn: open properties only. The endpoint being development-only does not
+    lift the authority model, because the authority model is the feature.
+    """
+    return await apply_state_change(
+        store, session_id=session_id, batch=payload.batch, event=payload.event
+    )

@@ -191,6 +191,7 @@ It triggers on pushes to `master` and on pull requests. The push filter previous
 - [AI contract](docs/ai-contract.md) — `StoryContext`, `TurnGeneration`, semantics
 - [World rules](docs/world-rules.md) — how a universe is configured, and the presets
 - [Simulation time](docs/world-state-time.md) — the fictional clock, calendar, scheduling
+- [World facts](docs/world-state-facts.md) — objective truth, authority, state changes
 - [Development](docs/development.md) — workflows, migrations, testing, contract sync
 - [Mobile access](docs/mobile-access.md) — LAN, PWA, HTTPS, security
 - [Roadmap](docs/roadmap.md) — what comes next

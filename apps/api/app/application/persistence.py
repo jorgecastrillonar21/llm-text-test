@@ -23,6 +23,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import RelationshipVector
+from app.domain.world_facts import (
+    FactAuthority,
+    FactKind,
+    FactSubject,
+    FactValue,
+    Importance,
+    SetFact,
+    WorldFact,
+)
 from app.domain.world_rules import WorldRules
 from app.domain.world_time import FictionalDateTime, ScheduledEventStatus
 
@@ -74,6 +83,11 @@ class SessionSnapshot(BaseModel):
     elapsed_minutes: int
     """Where this session sits on its own simulation clock. Independent of
     `turn_index`: neither one can be computed from the other."""
+
+    state_revision: int
+    """How many batches of state mutations this session has committed. A third
+    independent counter: turns, minutes and changes each move for their own reasons,
+    and a turn of pure conversation moves only the first."""
 
 
 class CharacterRecord(BaseModel):
@@ -181,12 +195,56 @@ class ScheduledEventRecord(BaseModel):
     interrupt_player_action: bool
 
 
+class NewFact(BaseModel):
+    """A fact as the application has decided it, ready to be written.
+
+    Every field is already settled: the property is canonical, the value has been
+    narrowed, the authority was checked against the property's policy and the world's
+    rules were consulted. The adapter's only remaining decision is insert or update.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    session_id: uuid.UUID
+    kind: FactKind
+    subject: FactSubject
+    property: str
+    value: FactValue
+    importance: Importance
+    current_value_since: int
+    authority: FactAuthority
+    source_event_id: uuid.UUID | None = None
+    tags: tuple[str, ...] = ()
+
+
 # ---------------------------------------------------------------------------
 # Ports
 # ---------------------------------------------------------------------------
 
 
-class StoryContextReaderPort(Protocol):
+class FactReaderPort(Protocol):
+    """Reading current world state. Shared by context assembly and the state service,
+    which want the same query for different reasons."""
+
+    async def load_facts(
+        self,
+        session_id: uuid.UUID,
+        *,
+        subject: FactSubject | None = None,
+        kind: FactKind | None = None,
+        min_importance: int | None = None,
+        limit: int,
+    ) -> list[WorldFact]:
+        """Current facts, most important first, then most recently changed.
+
+        The final tiebreak must be the property name so the order is total: this feeds
+        a language model prompt, and a set of equally important facts that shuffles
+        between turns is a prompt that will not cache and a diff nobody can read.
+        """
+        ...
+
+
+class StoryContextReaderPort(FactReaderPort, Protocol):
     """Reads that feed context assembly.
 
     Limits are passed in by the caller because how much history is worth
@@ -235,13 +293,16 @@ class TurnPersistencePort(Protocol):
 
     async def add_memory(self, memory: NewMemory) -> None: ...
 
-    async def add_event(self, event: NewEvent) -> None:
-        """Record something that happened.
+    async def add_event(self, event: NewEvent) -> uuid.UUID:
+        """Record something that happened, and return its id.
 
         Implementations assign the per-session ordering key. Two events in the same
         fictional minute must come back in the order they were added, and choosing
         the number that guarantees that is a storage concern -- the same class of
         thing as a primary key, and not something a caller should have to pass.
+
+        The id comes back because facts point at the event that caused them. A caller
+        with nothing to attach may ignore it.
         """
         ...
 
@@ -290,7 +351,7 @@ class SessionClockPort(TurnUnitOfWorkPort, Protocol):
         which is also where the never-backward rule is enforced."""
         ...
 
-    async def add_event(self, event: NewEvent) -> None:
+    async def add_event(self, event: NewEvent) -> uuid.UUID:
         """Used for the audit trail: why the clock moved, and by how much."""
         ...
 
@@ -317,12 +378,91 @@ class SessionClockPort(TurnUnitOfWorkPort, Protocol):
         ...
 
 
-class TurnGatewayPort(StoryContextReaderPort, TurnPersistencePort, TurnUnitOfWorkPort, Protocol):
-    """The three ports as one object, because one transaction spans all of them.
+class WorldStatePort(FactReaderPort, TurnUnitOfWorkPort, Protocol):
+    """What changing the world's current truth needs, and nothing else.
+
+    Deliberately narrow in the same way `SessionClockPort` is. The state service can
+    read facts, write facts, record an event and move the revision counter. It cannot
+    touch the transcript, the relationships or the clock, and the signature is what
+    says so.
+    """
+
+    async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...
+
+    async def get_world(self, world_id: uuid.UUID) -> WorldSnapshot | None:
+        """The world, for its rules: what may become true here is a property of the
+        universe, not of the caller."""
+        ...
+
+    async def known_character_ids(self, world_id: uuid.UUID) -> set[uuid.UUID]:
+        """Ids a fact may be about. Entity resolution happens before persistence, so a
+        fact never points at a character that does not exist."""
+        ...
+
+    async def load_initial_facts(self, world_id: uuid.UUID) -> list[SetFact]:
+        """The world template's starting facts, parsed.
+
+        `SetFact` rather than a separate seed type: a template fact is a mutation
+        waiting for a session to apply it, and giving it its own model would mean two
+        shapes to validate and two ways for one of them to drift.
+
+        Implementations parse the stored documents and raise on a malformed one -- the
+        same contract as `WorldSnapshot.rules`.
+        """
+        ...
+
+    async def get_fact(
+        self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
+    ) -> WorldFact | None:
+        """The current value, or None when nothing is established.
+
+        None means *absent*, which is not the same as a fact whose value is null. The
+        caller has to keep those apart; see `world_facts.values`.
+        """
+        ...
+
+    async def set_fact(self, fact: NewFact) -> uuid.UUID:
+        """Insert or replace in place, returning the fact's id.
+
+        Replacement keeps the existing row: one current value per subject and
+        property is the invariant, and it is enforced by a unique index rather than by
+        this method remembering to delete first.
+        """
+        ...
+
+    async def remove_fact(
+        self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
+    ) -> bool:
+        """Delete the current value. True if a row went away."""
+        ...
+
+    async def add_event(self, event: NewEvent) -> uuid.UUID:
+        """The event that caused this change, written before the facts point at it."""
+        ...
+
+    async def bump_state_revision(self, session_id: uuid.UUID) -> int:
+        """Advance the session's state revision by one and return the new value.
+
+        Read-then-write inside the caller's transaction. Nothing here makes it safe
+        against a concurrent writer, and nothing needs to yet -- a single-player
+        application commits one request at a time. `expected_revision` is the hook for
+        when that stops being true.
+        """
+        ...
+
+
+class TurnGatewayPort(
+    StoryContextReaderPort, TurnPersistencePort, WorldStatePort, TurnUnitOfWorkPort, Protocol
+):
+    """The ports a turn needs, as one object, because one transaction spans them all.
 
     Functions still declare the narrowest port they need -- `build_story_context`
-    takes only a reader, and `advance_time` takes only `SessionClockPort`. This exists
-    so the turn use case, which genuinely needs all three against the same
-    transaction, takes one argument instead of three that would have to be the same
-    object anyway.
+    takes only a reader, `advance_time` takes only `SessionClockPort`, and
+    `stage_state_change` takes only `WorldStatePort`. This exists so the turn use case,
+    which genuinely needs all of them against the same transaction, takes one argument
+    instead of four that would have to be the same object anyway.
+
+    `WorldStatePort` joined when the Story Director gained the ability to propose
+    facts: a turn now reads current truth for its context, and writes the proposals
+    that survive review, inside the transaction that already covers the transcript.
     """

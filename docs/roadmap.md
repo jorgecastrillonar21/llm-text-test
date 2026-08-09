@@ -31,6 +31,20 @@ the clock. See [world-state-time.md](world-state-time.md).
 Deliberately absent: locations, NPC schedules, weather, travel, combat duration, the
 seeded RNG, and any form of real-time synchronisation.
 
+## Phase 1.7 — WorldState: facts and state changes ✅
+
+The second piece of `WorldState`: an authoritative record of what is objectively true in
+a session, with one current value per subject and property enforced by the database. A
+policy/authority model decides who may change what — the Story Director reaches
+narrative colour and nothing else, and never writes the store itself. Changes go through
+one service as atomic batches paired with a `GameEvent`, and move a per-session state
+revision. Worlds may declare starting facts that each session copies and then diverges
+from. See [world-state-facts.md](world-state-facts.md).
+
+Deliberately absent: inventory, hit points, skills, combat, magic, economy, autonomous
+offscreen simulation, `KnowledgeState`, `BeliefState`, `SceneState`, semantic
+contradiction detection, and any domain-specific state aggregate.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.

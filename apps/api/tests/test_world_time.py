@@ -308,6 +308,7 @@ class FakeSessionClock:
             summary="",
             turn_index=turn_index,
             elapsed_minutes=elapsed_minutes,
+            state_revision=0,
         )
         self.world = WorldSnapshot(
             id=WORLD_ID,
@@ -332,8 +333,9 @@ class FakeSessionClock:
     async def set_elapsed_minutes(self, session_id: uuid.UUID, elapsed_minutes: int) -> None:
         self.session = self.session.model_copy(update={"elapsed_minutes": elapsed_minutes})
 
-    async def add_event(self, event: NewEvent) -> None:
+    async def add_event(self, event: NewEvent) -> uuid.UUID:
         self.events.append(event)
+        return uuid.uuid4()
 
     async def add_scheduled_event(self, event: NewScheduledEvent) -> uuid.UUID:
         record = ScheduledEventRecord(

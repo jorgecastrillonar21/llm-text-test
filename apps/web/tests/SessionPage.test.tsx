@@ -15,6 +15,7 @@ const SESSION = {
   summary: '',
   turn_index: 0,
   elapsed_minutes: 29022,
+  state_revision: 0,
   created_at: '',
   updated_at: '',
   world: {

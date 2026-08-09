@@ -11,6 +11,7 @@ from app.api.schemas import ErrorResponse
 from app.domain.errors import (
     ImageGenerationError,
     NotFoundError,
+    StaleStateError,
     StoryGenerationError,
     ValidationError,
 )
@@ -31,6 +32,15 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content=ErrorResponse(error="invalid_request", detail=str(exc)).model_dump(),
+        )
+
+    @app.exception_handler(StaleStateError)
+    async def _stale(_: Request, exc: StaleStateError) -> JSONResponse:
+        # 409, not 422: the request was fine, the world simply moved underneath it.
+        # The useful next step is re-read and retry, which is what a conflict means.
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=ErrorResponse(error="stale_state", detail=str(exc)).model_dump(),
         )
 
     @app.exception_handler(StoryGenerationError)

@@ -9,7 +9,9 @@ that boundary earns its keep: external AI systems and the database.
 apps/api/app/
 ├── domain/           pure Python: enums, relationship rules, errors. No I/O, no ORM.
 │   ├── world_rules/      WorldRulesV1, its enums, presets, versioned parsing
-│   └── world_time/       the simulation clock, calendar projection, scheduling
+│   ├── world_time/       the simulation clock, calendar projection, scheduling
+│   └── world_facts/      what is objectively true: values, properties, policy,
+│                         authority, mutations, world-rules compatibility
 ├── application/      use cases, the AI contract, ports. Depends on domain only.
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
@@ -18,7 +20,9 @@ apps/api/app/
 │   ├── context_builder.py  all retrieval policy, in one place
 │   ├── rules_projection.py WorldRules → the compact AI-facing view
 │   ├── turn_service.py   the turn use case
-│   └── time_service.py   the only writer of the simulation clock
+│   ├── time_service.py   the only writer of the simulation clock
+│   ├── state_service.py  the only writer of world facts
+│   └── fact_proposals.py reviewing what the Story Director claims is true
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
 │   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
 ├── api/              HTTP adapter and composition: routers, DTOs, errors, DI
@@ -191,6 +195,19 @@ silently papered over.
   carry `occurred_at` alongside `turn_index` and an `event_sequence` that is unique per
   session, because everything in a turn usually shares a fictional minute and ordering
   needs a real tiebreak. See [world-state-time.md](world-state-time.md).
+- **`world_facts`** holds one current value per subject and property, enforced by *two*
+  partial unique indexes split on `subject_id IS NULL`. A single index would not
+  constrain world-scoped facts at all, because SQL treats two NULLs as distinct — the
+  invariant would hold for characters and silently fail for the world. `kind` is
+  deliberately outside the key: including it would let one subject and property exist
+  once as `world_truth` and once as `gameplay_flag` with opposite values.
+  `source_event_id` is `ON DELETE SET NULL`, because provenance can decay and truth
+  cannot. See [world-state-facts.md](world-state-facts.md).
+- **`game_sessions.state_revision`** is a third counter alongside `turn_index` and
+  `elapsed_minutes`, moving once per committed batch of state changes and never
+  backwards. None of the three can be computed from another.
+- **`worlds.initial_facts`** stores a world's starting facts as `SetFact` documents,
+  copied into each new session and never written back to during play.
 
 ## AI provider boundaries
 

@@ -7,6 +7,7 @@ statically and this file makes behaviourally.
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 
 import pytest
@@ -22,6 +23,7 @@ from app.application.persistence import (
     CharacterRecord,
     MemoryRecord,
     NewEvent,
+    NewFact,
     NewMemory,
     NewMessage,
     RelationshipRecord,
@@ -34,6 +36,7 @@ from app.application.turn_service import execute_turn
 from app.domain.enums import Language, MemoryKind
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector
+from app.domain.world_facts import FactKind, FactSubject, SetFact, WorldFact
 from app.domain.world_rules import default_world_rules
 from app.domain.world_time import DEFAULT_INITIAL_DATETIME
 
@@ -58,6 +61,7 @@ class FakeTurnGateway:
             summary="",
             turn_index=turn_index,
             elapsed_minutes=elapsed_minutes,
+            state_revision=0,
         )
         self.world = WorldSnapshot(
             id=WORLD_ID,
@@ -88,6 +92,12 @@ class FakeTurnGateway:
         self.relationships: dict[uuid.UUID, RelationshipVector] = {}
         self.turn_index_writes: list[int] = []
         self.commits = 0
+
+        # Keyed the way the unique index is keyed, so this fake cannot hold two
+        # current values for one subject and property either.
+        self.facts: dict[tuple[str, str], WorldFact] = {}
+        self.initial_facts: list[SetFact] = []
+        self.state_revision = 0
 
     # -- reads ------------------------------------------------------------------
 
@@ -132,7 +142,66 @@ class FakeTurnGateway:
     async def known_character_ids(self, world_id: uuid.UUID) -> set[uuid.UUID]:
         return {c.id for c in self.characters}
 
+    async def load_facts(
+        self,
+        session_id: uuid.UUID,
+        *,
+        subject: FactSubject | None = None,
+        kind: FactKind | None = None,
+        min_importance: int | None = None,
+        limit: int,
+    ) -> list[WorldFact]:
+        found = [
+            fact
+            for fact in self.facts.values()
+            if (subject is None or fact.subject == subject)
+            and (kind is None or fact.kind is kind)
+            and (min_importance is None or fact.importance >= min_importance)
+        ]
+        # The same total order the port's contract demands of a real adapter.
+        found.sort(key=lambda f: (-f.importance, -f.current_value_since, f.property))
+        return found[:limit]
+
+    async def load_initial_facts(self, world_id: uuid.UUID) -> list[SetFact]:
+        return list(self.initial_facts)
+
+    async def get_fact(
+        self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
+    ) -> WorldFact | None:
+        return self.facts.get((subject.key, canonical_property))
+
     # -- writes -----------------------------------------------------------------
+
+    async def set_fact(self, fact: NewFact) -> uuid.UUID:
+        key = (fact.subject.key, fact.property)
+        existing = self.facts.get(key)
+        now = dt.datetime.now(dt.UTC)
+        stored = WorldFact(
+            id=existing.id if existing is not None else uuid.uuid4(),
+            session_id=fact.session_id,
+            kind=fact.kind,
+            subject=fact.subject,
+            property=fact.property,
+            value=fact.value,
+            importance=fact.importance,
+            current_value_since=fact.current_value_since,
+            authority=fact.authority,
+            source_event_id=fact.source_event_id,
+            tags=fact.tags,
+            created_at=existing.created_at if existing is not None else now,
+            updated_at=now,
+        )
+        self.facts[key] = stored
+        return stored.id
+
+    async def remove_fact(
+        self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
+    ) -> bool:
+        return self.facts.pop((subject.key, canonical_property), None) is not None
+
+    async def bump_state_revision(self, session_id: uuid.UUID) -> int:
+        self.state_revision += 1
+        return self.state_revision
 
     async def add_message(self, message: NewMessage) -> uuid.UUID:
         self.messages.append(message)
@@ -141,8 +210,9 @@ class FakeTurnGateway:
     async def add_memory(self, memory: NewMemory) -> None:
         self.memories.append(memory)
 
-    async def add_event(self, event: NewEvent) -> None:
+    async def add_event(self, event: NewEvent) -> uuid.UUID:
         self.events.append(event)
+        return uuid.uuid4()
 
     async def get_relationship(
         self, session_id: uuid.UUID, character_id: uuid.UUID

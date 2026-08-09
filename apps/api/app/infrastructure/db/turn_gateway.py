@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.persistence import (
     CharacterRecord,
     MemoryRecord,
     NewEvent,
+    NewFact,
     NewMemory,
     NewMessage,
     NewScheduledEvent,
@@ -32,9 +33,48 @@ from app.application.persistence import (
     WorldSnapshot,
 )
 from app.domain.relationships import RelationshipVector
+from app.domain.world_facts import FactKind, FactSubject, SetFact, WorldFact
 from app.domain.world_rules import parse_world_rules
 from app.domain.world_time import FictionalDateTime, ScheduledEventStatus
 from app.infrastructure.db import models
+
+
+def _to_world_fact(row: models.WorldFact) -> WorldFact:
+    """A stored row, validated back into a domain fact.
+
+    Validated on the way out, every read, for the same reason `rules_json` is: a
+    hand-edited or half-migrated row raises here rather than reaching a language model
+    as a truth nobody wrote.
+    """
+    return WorldFact(
+        id=row.id,
+        session_id=row.session_id,
+        kind=row.kind,
+        subject=FactSubject(type=row.subject_type, id=row.subject_id),
+        property=row.property,
+        value=row.value,
+        importance=row.importance,
+        current_value_since=row.current_value_since,
+        authority=row.authority,
+        source_event_id=row.source_event_id,
+        tags=tuple(row.tags or ()),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _subject_criteria(subject: FactSubject) -> list[ColumnElement[bool]]:
+    """Match one subject, including the world's null id.
+
+    `.is_(None)` rather than `== None`: the equality form renders `= NULL`, which is
+    never true, and would silently return no rows for every world-scoped fact.
+    """
+    criteria: list[ColumnElement[bool]] = [models.WorldFact.subject_type == subject.type]
+    if subject.id is None:
+        criteria.append(models.WorldFact.subject_id.is_(None))
+    else:
+        criteria.append(models.WorldFact.subject_id == subject.id)
+    return criteria
 
 
 def _to_scheduled_event(row: models.ScheduledEvent) -> ScheduledEventRecord:
@@ -50,12 +90,13 @@ def _to_scheduled_event(row: models.ScheduledEvent) -> ScheduledEventRecord:
 
 
 class SqlAlchemyTurnGateway:
-    """Implements StoryContextReaderPort, TurnPersistencePort, TurnUnitOfWorkPort
-    and SessionClockPort.
+    """Implements StoryContextReaderPort, TurnPersistencePort, TurnUnitOfWorkPort,
+    SessionClockPort and WorldStatePort.
 
     Named for the turn because that is the transaction it was shaped around. The
-    session clock joined later and runs inside the same one, which is why it is here
-    rather than in a second adapter that would have to re-map the same rows.
+    session clock and the fact store joined later and run inside the same one, which
+    is why they are here rather than in adapters that would have to re-map the same
+    rows and could not see each other's uncommitted writes.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -165,6 +206,7 @@ class SqlAlchemyTurnGateway:
             summary=row.summary,
             turn_index=row.turn_index,
             elapsed_minutes=row.elapsed_minutes,
+            state_revision=row.state_revision,
         )
 
     async def get_world(self, world_id: uuid.UUID) -> WorldSnapshot | None:
@@ -216,21 +258,22 @@ class SqlAlchemyTurnGateway:
             )
         )
 
-    async def add_event(self, event: NewEvent) -> None:
-        self._db.add(
-            models.GameEvent(
-                session_id=event.session_id,
-                turn_index=event.turn_index,
-                occurred_at=event.occurred_at,
-                event_sequence=await self._next_event_sequence(event.session_id),
-                type=event.type,
-                description=event.description,
-            )
+    async def add_event(self, event: NewEvent) -> uuid.UUID:
+        row = models.GameEvent(
+            session_id=event.session_id,
+            turn_index=event.turn_index,
+            occurred_at=event.occurred_at,
+            event_sequence=await self._next_event_sequence(event.session_id),
+            type=event.type,
+            description=event.description,
         )
+        self._db.add(row)
         # Flushed immediately so the next event in this turn sees this one when it
         # asks for the next number. Without it a turn's events would all be handed
         # the same sequence and the unique constraint would fail the whole turn.
+        # The flush is also what makes the id below real rather than pending.
         await self._db.flush()
+        return row.id
 
     async def get_relationship(
         self, session_id: uuid.UUID, character_id: uuid.UUID
@@ -319,6 +362,93 @@ class SqlAlchemyTurnGateway:
         row.status = status
         await self._db.flush()
 
+    # -- WorldStatePort ---------------------------------------------------------
+
+    async def load_initial_facts(self, world_id: uuid.UUID) -> list[SetFact]:
+        row = await self._db.get(models.World, world_id)
+        if row is None:
+            return []
+        # Validated on the way out, like rules_json. A template written by hand or by
+        # an older build fails here rather than materialising a fact nobody wrote.
+        return [SetFact.model_validate(document) for document in row.initial_facts or []]
+
+    async def load_facts(
+        self,
+        session_id: uuid.UUID,
+        *,
+        subject: FactSubject | None = None,
+        kind: FactKind | None = None,
+        min_importance: int | None = None,
+        limit: int,
+    ) -> list[WorldFact]:
+        query = select(models.WorldFact).where(models.WorldFact.session_id == session_id)
+        if subject is not None:
+            query = query.where(*_subject_criteria(subject))
+        if kind is not None:
+            query = query.where(models.WorldFact.kind == kind)
+        if min_importance is not None:
+            query = query.where(models.WorldFact.importance >= min_importance)
+        rows = (
+            await self._db.execute(
+                query.order_by(
+                    models.WorldFact.importance.desc(),
+                    models.WorldFact.current_value_since.desc(),
+                    # Total order, so equally important facts do not shuffle between
+                    # two reads of an unchanged session. See the port's contract.
+                    models.WorldFact.property.asc(),
+                ).limit(limit)
+            )
+        ).scalars()
+        return [_to_world_fact(row) for row in rows]
+
+    async def get_fact(
+        self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
+    ) -> WorldFact | None:
+        row = await self._find_fact(session_id, subject, canonical_property)
+        return None if row is None else _to_world_fact(row)
+
+    async def set_fact(self, fact: NewFact) -> uuid.UUID:
+        row = await self._find_fact(fact.session_id, fact.subject, fact.property)
+        if row is None:
+            row = models.WorldFact(
+                session_id=fact.session_id,
+                subject_type=fact.subject.type,
+                subject_id=fact.subject.id,
+                property=fact.property,
+            )
+            self._db.add(row)
+        # Updated in place on the existing row: the fact's identity is its subject and
+        # property, so a new value is the same fact with a different value. Replacing
+        # the row would break every source_event_id pointing at it and would make
+        # created_at mean "since the last edit".
+        row.kind = fact.kind
+        row.value = fact.value
+        row.importance = fact.importance
+        row.current_value_since = fact.current_value_since
+        row.authority = fact.authority
+        row.source_event_id = fact.source_event_id
+        row.tags = list(fact.tags)
+        await self._db.flush()
+        return row.id
+
+    async def remove_fact(
+        self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
+    ) -> bool:
+        row = await self._find_fact(session_id, subject, canonical_property)
+        if row is None:
+            return False
+        await self._db.delete(row)
+        await self._db.flush()
+        return True
+
+    async def bump_state_revision(self, session_id: uuid.UUID) -> int:
+        row = await self._db.get(models.GameSession, session_id)
+        if row is None:  # pragma: no cover - the caller loaded it moments earlier
+            raise LookupError(f"GameSession {session_id} vanished mid-mutation")
+        row.state_revision += 1
+        await self._db.flush()
+        return row.state_revision
+
     # -- TurnUnitOfWorkPort -----------------------------------------------------
 
     async def commit(self) -> None:
@@ -342,6 +472,19 @@ class SqlAlchemyTurnGateway:
             )
         ).scalar()
         return (highest or 0) + 1
+
+    async def _find_fact(
+        self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
+    ) -> models.WorldFact | None:
+        return (
+            await self._db.execute(
+                select(models.WorldFact).where(
+                    models.WorldFact.session_id == session_id,
+                    models.WorldFact.property == canonical_property,
+                    *_subject_criteria(subject),
+                )
+            )
+        ).scalar_one_or_none()
 
     async def _find_relationship(
         self, session_id: uuid.UUID, character_id: uuid.UUID

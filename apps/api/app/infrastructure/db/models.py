@@ -17,12 +17,14 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import AXIS_MAX, AXIS_MIN
+from app.domain.world_facts import FactAuthority, FactKind, FactSubjectType
 from app.domain.world_rules import default_world_rules
 from app.domain.world_time import DEFAULT_INITIAL_DATETIME, ScheduledEventStatus
 from app.infrastructure.db.base import Base
@@ -70,6 +72,11 @@ class World(Base):
     initial_datetime: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=_default_initial_datetime, nullable=False
     )
+    # The world as a template: facts every new session of it starts with. Copied into
+    # per-session rows when a session begins and never read again, so a session that
+    # kills the king does not edit the world other sessions start from. Nothing writes
+    # this column after creation -- there is deliberately no update path.
+    initial_facts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
@@ -111,6 +118,7 @@ class GameSession(Base):
     __tablename__ = "game_sessions"
     __table_args__ = (
         CheckConstraint("elapsed_minutes >= 0", name="ck_game_sessions_elapsed_nonnegative"),
+        CheckConstraint("state_revision >= 0", name="ck_game_sessions_revision_nonnegative"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -129,6 +137,10 @@ class GameSession(Base):
     # and because a 32-bit column would quietly cap a world at roughly four thousand
     # fictional years. The hour, the date and the season are derived, never stored.
     elapsed_minutes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # Bumped once per committed batch of state mutations, never decreased. It is a
+    # change counter for this session's WorldState, not a version of the schema and
+    # not a count of turns: a turn that changes nothing leaves it alone.
+    state_revision: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
@@ -240,6 +252,100 @@ class GameEvent(Base):
     type: Mapped[str] = mapped_column(String(80), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+
+
+class WorldFact(Base):
+    """One current objective truth in one session. See app.domain.world_facts.
+
+    # The uniqueness constraint, and the trap in it
+
+    There must be exactly one current value per (session, subject, property). The
+    obvious constraint --
+
+        UNIQUE (session_id, subject_type, subject_id, property)
+
+    -- is wrong, and wrong in the quiet way. `subject_id` is NULL for facts about the
+    world itself, and SQL says NULL is not equal to NULL, so every world-scoped row
+    slips past a unique index that includes it. SQLite and PostgreSQL both behave this
+    way. The result would be a table that enforces uniqueness for characters and
+    silently permits `world.political_status = stable` next to
+    `world.political_status = collapsed` -- exactly the contradiction the constraint
+    exists to prevent, in the one place nobody would think to test.
+
+    So there are two partial unique indexes instead, splitting on the null:
+
+        subject_id IS NOT NULL  -> unique over (session, type, id, property)
+        subject_id IS NULL      -> unique over (session, type, property)
+
+    The alternative -- a sentinel UUID standing in for "the world" -- makes one index
+    do the job, at the cost of a magic value that every query and every reader has to
+    know about. A constraint the database understands is worth two lines of DDL.
+
+    # `kind` is deliberately not part of the key
+
+    A property is one logical thing. If `kind` were in the key, the same subject and
+    property could exist once as `world_truth` and once as `gameplay_flag`, holding
+    opposite values, both current. Kind classifies a fact; it does not identify one.
+    """
+
+    __tablename__ = "world_facts"
+    __table_args__ = (
+        Index(
+            "uq_world_facts_entity_property",
+            "session_id",
+            "subject_type",
+            "subject_id",
+            "property",
+            unique=True,
+            sqlite_where=text("subject_id IS NOT NULL"),
+            postgresql_where=text("subject_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_world_facts_world_property",
+            "session_id",
+            "subject_type",
+            "property",
+            unique=True,
+            sqlite_where=text("subject_id IS NULL"),
+            postgresql_where=text("subject_id IS NULL"),
+        ),
+        # "Everything currently true about this subject" is the read the context
+        # builder and the debug view both make.
+        Index("ix_world_facts_session_subject", "session_id", "subject_type", "subject_id"),
+        CheckConstraint("importance BETWEEN 1 AND 5", name="ck_world_facts_importance_range"),
+        CheckConstraint(
+            "current_value_since >= 0", name="ck_world_facts_current_value_since_nonnegative"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[FactKind] = mapped_column(String(20), nullable=False)
+    subject_type: Mapped[FactSubjectType] = mapped_column(String(20), nullable=False)
+    # NULL exactly when the subject is the world itself. See the class docstring.
+    subject_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    property: Mapped[str] = mapped_column(String(120), nullable=False)
+    # `none_as_null=False` so a Python None is stored as JSON null rather than SQL
+    # NULL. A fact whose value is nothing is still a fact, and the column staying NOT
+    # NULL keeps "this row has no value at all" from being representable.
+    value: Mapped[Any] = mapped_column(JSON(none_as_null=False), nullable=False)
+    importance: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    # Session elapsed minutes, from Time V1: when this value became authoritative in
+    # the fiction. Distinct from updated_at, which is when the row was written.
+    current_value_since: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    authority: Mapped[FactAuthority] = mapped_column(String(30), nullable=False)
+    # SET NULL rather than CASCADE: losing the event that explains a fact must not
+    # delete the fact. Provenance can decay; current truth cannot.
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("game_events.id", ondelete="SET NULL"), nullable=True
+    )
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
 
 
 class ScheduledEvent(Base):
