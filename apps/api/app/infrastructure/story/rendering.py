@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.application.story_context import (
     PlaceContext,
+    SituationsContext,
     SpatialContext,
     StoryContext,
     WorldRulesContext,
@@ -166,6 +167,50 @@ def _render_space(space: SpatialContext | None) -> list[str]:
     return lines
 
 
+def _momentum_word(momentum: int) -> str:
+    """`+40` -> `growing`. A number a model has to interpret is a number it will
+    interpret differently every turn; the word is what actually shapes a sentence.
+
+    Neutral vocabulary on purpose. "Growing" covers a fire spreading and a festival
+    filling the streets, and calling either one "worsening" would make every positive
+    process in the game read as a threat.
+    """
+    if momentum >= 40:
+        return "growing fast"
+    if momentum > 0:
+        return "growing"
+    if momentum == 0:
+        return "steady"
+    if momentum > -40:
+        return "winding down"
+    return "winding down fast"
+
+
+def _render_situations(situations: SituationsContext | None) -> list[str]:
+    """What is under way, one line each.
+
+    Omitted entirely when nothing relevant is happening, rather than printed empty --
+    the same rule the geography block follows, for the same reason.
+
+    The heading says the director may not change these. It is a reminder, not the
+    enforcement: the enforcement is that `TurnGeneration` has no field that reaches a
+    situation's numbers or its status. A model cannot resolve a siege here because
+    there is nowhere for it to say so.
+    """
+    if situations is None or not situations.ongoing:
+        return []
+
+    lines = ["\n# What is going on  (authoritative: you may narrate these, never change them)"]
+    for entry in situations.ongoing:
+        lines.append(
+            f"- {entry.title} ({entry.kind}, {_words(entry.scope)}) � "
+            f"{_words(entry.status)}, intensity {entry.intensity}/100, "
+            f"danger {entry.threat}/100, {_momentum_word(entry.momentum)}, "
+            f"running {entry.duration}"
+        )
+    return lines
+
+
 def render_context(context: StoryContext) -> str:
     lines: list[str] = []
 
@@ -206,6 +251,7 @@ def render_context(context: StoryContext) -> str:
         lines.append(f"Story so far: {context.session.summary}")
 
     lines.extend(_render_space(context.space))
+    lines.extend(_render_situations(context.situations))
 
     facts = context.world_facts
     if facts.critical or facts.relevant:

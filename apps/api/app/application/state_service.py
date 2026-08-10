@@ -45,8 +45,10 @@ from app.application.persistence import (
     LocationStateWrite,
     NewEvent,
     NewFact,
+    SituationUpdate,
     StateStorePort,
 )
+from app.application.situation_service import start_situation
 from app.domain.errors import (
     FactPolicyError,
     NotFoundError,
@@ -78,6 +80,14 @@ from app.domain.world_locations import (
     UpdateLocationState,
 )
 from app.domain.world_rules import WorldRules
+from app.domain.world_situations import (
+    ResolveSituation,
+    SituationDeltas,
+    StartSituation,
+    UpdateSituation,
+    apply_deltas,
+    require_transition,
+)
 
 INITIAL_FACTS_EVENT = "world_state.seeded"
 """GameEvent type for template materialisation. One event for the whole seed, not one
@@ -110,9 +120,25 @@ class AppliedMutation(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    op: Literal["set_fact", "remove_fact", "update_location_state", "update_connection_state"]
+    op: Literal[
+        "set_fact",
+        "remove_fact",
+        "update_location_state",
+        "update_connection_state",
+        "start_situation",
+        "update_situation",
+        "resolve_situation",
+    ]
     scope: str
     target: str
+
+    entity_id: uuid.UUID | None = None
+    """The id of something this mutation brought into existence, when it made one.
+
+    Only `start_situation` fills it, and only because the caller has no other way to
+    learn it: the batch it submitted had no id in it, by design. Everything else in a
+    batch names a thing that already existed.
+    """
 
 
 class StateChangeResult(BaseModel):
@@ -184,6 +210,7 @@ async def stage_state_change(
 
     applied: list[AppliedMutation] = []
     for mutation, _current in checked:
+        entity_id: uuid.UUID | None = None
         if isinstance(mutation, SetFact):
             await store.set_fact(
                 NewFact(
@@ -205,11 +232,27 @@ async def stage_state_change(
             await store.remove_fact(session_id, mutation.subject, mutation.property)
         elif isinstance(mutation, UpdateLocationState):
             await _apply_location_update(store, session_id=session_id, mutation=mutation)
-        else:
+        elif isinstance(mutation, UpdateConnectionState):
             await _apply_connection_update(store, session_id=session_id, mutation=mutation)
+        elif isinstance(mutation, StartSituation):
+            entity_id = await start_situation(
+                store,
+                session_id=session_id,
+                mutation=mutation,
+                # The fictional instant the process began, not the row's write time. A
+                # siege that starts during a turn starts at that turn's minute.
+                started_at=session.elapsed_minutes,
+                source_event_id=event_id,
+            )
+        else:
+            await _apply_situation_change(
+                store, session_id=session_id, mutation=mutation, at=session.elapsed_minutes
+            )
 
         scope, target = mutation.target()
-        applied.append(AppliedMutation(op=mutation.op, scope=scope, target=target))
+        applied.append(
+            AppliedMutation(op=mutation.op, scope=scope, target=target, entity_id=entity_id)
+        )
 
     revision = await store.bump_state_revision(session_id)
 
@@ -291,6 +334,19 @@ async def _validate(
             checked.append((mutation, None))
             continue
 
+        if isinstance(mutation, StartSituation):
+            # Nothing to pre-check: `start_situation` validates the parent, the
+            # location and the participants at the moment it writes, and it has to --
+            # a batch may start a war and then a siege inside it, and the parent does
+            # not exist until the first one lands.
+            checked.append((mutation, None))
+            continue
+
+        if isinstance(mutation, UpdateSituation | ResolveSituation):
+            await _validate_situation_change(store, session_id=session_id, mutation=mutation)
+            checked.append((mutation, None))
+            continue
+
         _require_resolvable_subject(mutation.subject, known_character_ids)
         require_permitted(
             batch.authority,
@@ -335,6 +391,105 @@ async def _validate_spatial(
         return
     if await store.get_connection(session_id, mutation.connection_id) is None:
         raise NotFoundError("LocationConnection", mutation.connection_id)
+
+
+async def _validate_situation_change(
+    store: StateStorePort,
+    *,
+    session_id: uuid.UUID,
+    mutation: UpdateSituation | ResolveSituation,
+) -> None:
+    """The situation must exist in this session, and the move must be a legal one.
+
+    Checked before anything is written, so a batch that tries to resolve a war that
+    ended last week is a refusal rather than a rollback. The transition rules live in
+    the domain; this reads the current status and asks.
+    """
+    situation = await store.get_situation(session_id, mutation.situation_id)
+    if situation is None:
+        raise NotFoundError("Situation", mutation.situation_id)
+
+    target = (
+        mutation.resolution_status
+        if isinstance(mutation, ResolveSituation)
+        else mutation.resulting_status
+    )
+    if target is not None:
+        require_transition(situation.status, target)
+    elif not situation.is_live:
+        # An update with no status change is still a change, and a concluded process
+        # does not take them. Caught here rather than by a transition check, which
+        # would have nothing to check.
+        raise ValidationError(
+            f"Situation {situation.title!r} is {situation.status.value} and cannot be "
+            "updated. A concluded process stays as it ended."
+        )
+
+
+async def _apply_situation_change(
+    store: StateStorePort,
+    *,
+    session_id: uuid.UUID,
+    mutation: UpdateSituation | ResolveSituation,
+    at: int,
+) -> None:
+    """Read the authoritative values, apply the deltas to *them*, clamp, write.
+
+    Read here rather than trusted from the caller, for the same reason facts have no
+    `previous_value` and spatial updates are partial: the freshest read is the one
+    inside this transaction, and the most likely caller is a resolver that ran against
+    state a player action has since changed.
+    """
+    situation = await store.get_situation(session_id, mutation.situation_id)
+    if situation is None:  # Validated above; the type checker does not know that.
+        raise NotFoundError("Situation", mutation.situation_id)
+
+    if isinstance(mutation, ResolveSituation):
+        await store.update_situation(
+            SituationUpdate(
+                situation_id=situation.id,
+                intensity=situation.intensity,
+                threat=situation.threat,
+                momentum=situation.momentum,
+                importance=situation.importance,
+                status=mutation.resolution_status,
+                last_progressed_at=max(situation.last_progressed_at, at),
+                # The fictional instant it ended. Never null for a terminal status --
+                # the domain model refuses that pairing, and this is where it is set.
+                resolved_at=at,
+                situation_metadata=dict(situation.situation_metadata),
+            )
+        )
+        return
+
+    intensity, threat, momentum = apply_deltas(
+        situation,
+        SituationDeltas(
+            intensity_delta=mutation.intensity_delta,
+            threat_delta=mutation.threat_delta,
+            momentum_delta=mutation.momentum_delta,
+        ),
+    )
+    await store.update_situation(
+        SituationUpdate(
+            situation_id=situation.id,
+            intensity=intensity,
+            threat=threat,
+            momentum=momentum,
+            importance=(
+                situation.importance if mutation.importance is None else mutation.importance
+            ),
+            status=mutation.resulting_status or situation.status,
+            last_progressed_at=max(situation.last_progressed_at, at),
+            # Still live: an update cannot end a process, so the ending stays absent.
+            resolved_at=None,
+            situation_metadata=(
+                dict(situation.situation_metadata)
+                if mutation.situation_metadata is None
+                else dict(mutation.situation_metadata)
+            ),
+        )
+    )
 
 
 async def _apply_location_update(

@@ -178,6 +178,69 @@ export interface AppliedRelationship {
   reason: string;
 }
 
+export type SituationStatus = 'planned' | 'active' | 'dormant' | 'resolved' | 'cancelled';
+export type SituationScope = 'local' | 'regional' | 'global' | 'entity_specific';
+export type SituationCategory =
+  | 'conflict'
+  | 'hazard'
+  | 'social'
+  | 'political'
+  | 'economic'
+  | 'environmental'
+  | 'investigation'
+  | 'project'
+  | 'event'
+  | 'other';
+
+/**
+ * A process the world is currently running: a siege, a fire, a festival, a strike.
+ *
+ * Read-only here, and read-only everywhere outside the game's own systems. The three
+ * numbers are independent and none of them is a severity: a festival is `intensity 90,
+ * threat 5`, a siege is `intensity 80, threat 90`. `momentum` is direction, not
+ * judgement — positive on a reconstruction means the work is speeding up.
+ *
+ * See docs/world-state-situations.md.
+ */
+export interface Situation {
+  id: string;
+  session_id: string;
+  category: SituationCategory;
+  subtype: string | null;
+  title: string;
+  description: string | null;
+  status: SituationStatus;
+  intensity: number;
+  threat: number;
+  momentum: number;
+  importance: number;
+  scope: SituationScope;
+  primary_location_id: string | null;
+  parent_situation_id: string | null;
+  /** Session elapsed minutes, like everything else fictional. Never a wall clock. */
+  started_at: number;
+  last_progressed_at: number;
+  resolved_at: number | null;
+  tags: string[];
+}
+
+export interface SituationParticipant {
+  id: string;
+  situation_id: string;
+  entity_type: 'character' | 'faction' | 'other';
+  entity_id: string;
+  role: string;
+}
+
+export interface SituationRead {
+  situation: Situation;
+  participants: SituationParticipant[];
+}
+
+export interface SituationListRead {
+  situations: SituationRead[];
+}
+
 export interface TurnResponse {
   session_id: string;
   turn_index: number;
@@ -193,6 +256,9 @@ export interface TurnResponse {
   /** New places this turn established as canon for this session. */
   locations_created: number;
   locations_rejected: number;
+  /** Ongoing processes this turn set in motion. Zero on almost every turn. */
+  situations_started: number;
+  situations_rejected: number;
   visual_cue_generated: boolean;
 }
 

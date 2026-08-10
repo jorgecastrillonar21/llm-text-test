@@ -115,13 +115,26 @@ POST   /api/v1/dev/sessions/{id}/advance-time
 POST   /api/v1/dev/sessions/{id}/scheduled-events
 DELETE /api/v1/dev/scheduled-events/{id}
 POST   /api/v1/dev/sessions/{id}/world-state/changes
+POST   /api/v1/dev/sessions/{id}/situations/{situation_id}/progress
 ```
 
-That last one carries spatial mutations too -- `update_location_state` and
-`update_connection_state` travel in the same batch as fact changes, so one event can
-collapse a bridge, block the crossing and raise the local danger together or not at all.
+The mutation endpoint carries spatial and situation mutations too -- `update_location_state`,
+`update_connection_state`, `start_situation`, `update_situation` and `resolve_situation`
+travel in the same batch as fact changes, so one event can raise a siege's intensity,
+collapse a gate, block the crossing and start a food crisis together or not at all.
 Authoring geography is a different act and lives on the ordinary API under `/worlds`; see
 [world-state-locations.md](world-state-locations.md#http-surface).
+
+The progression endpoint runs one situation from where it was last evaluated to where the
+session clock now is. The interval is not yours to choose, so advance the clock first:
+
+```bash
+curl -X POST .../dev/sessions/$S/advance-time -d '{"requested_minutes":360,"reason":"debug"}'
+curl -X POST .../dev/sessions/$S/situations/$I/progress -d '{}'
+```
+
+It is the only caller the progression boundary has until a SimulationEngine exists; see
+[world-state-situations.md](world-state-situations.md#progression).
 
 None of them is a shortcut. Each goes through the same application service a real caller
 will use, so a paused world still refuses to advance and a state change is still checked

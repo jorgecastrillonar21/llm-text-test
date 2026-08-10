@@ -8,6 +8,7 @@ import type {
   Message,
   SessionCreate,
   SessionDetail,
+  SituationListRead,
   TurnResponse,
   World,
   WorldCreate,
@@ -22,6 +23,7 @@ export const queryKeys = {
   sessions: (worldId?: string) => ['sessions', worldId ?? 'all'] as const,
   session: (id: string) => ['sessions', id] as const,
   messages: (id: string) => ['sessions', id, 'messages'] as const,
+  situations: (id: string) => ['sessions', id, 'situations'] as const,
   aiStatus: ['ai-status'] as const,
 };
 
@@ -101,6 +103,20 @@ export function useMessages(sessionId: string) {
   });
 }
 
+/**
+ * What the world currently has under way in this session.
+ *
+ * Live processes only. A session's concluded situations accumulate forever and are
+ * history rather than status; the backend's `live_only` default is what this relies on.
+ */
+export function useSituations(sessionId: string) {
+  return useQuery({
+    queryKey: queryKeys.situations(sessionId),
+    queryFn: () =>
+      api.get<SituationListRead>(`/api/v1/sessions/${sessionId}/situations`),
+  });
+}
+
 export function useSubmitTurn(sessionId: string) {
   const client = useQueryClient();
   return useMutation({
@@ -110,6 +126,8 @@ export function useSubmitTurn(sessionId: string) {
       // A failed turn is a no-op server-side, so only success invalidates.
       client.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
       client.invalidateQueries({ queryKey: queryKeys.session(sessionId) });
+      // A turn can start a process, and a turn's own state changes can move one.
+      client.invalidateQueries({ queryKey: queryKeys.situations(sessionId) });
     },
   });
 }

@@ -1,12 +1,20 @@
 import { useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { useI18n } from '@/i18n/useI18n';
-import { useAiStatus, useCharacters, useMessages, useSession, useSubmitTurn } from '@/api/hooks';
+import {
+  useAiStatus,
+  useCharacters,
+  useMessages,
+  useSession,
+  useSituations,
+  useSubmitTurn,
+} from '@/api/hooks';
 import { Button, Spinner } from '@/components/ui';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Timeline } from '@/features/sessions/Timeline';
 import { Composer } from '@/features/sessions/Composer';
 import { FictionalClock } from '@/features/sessions/FictionalClock';
+import { OngoingSituations } from '@/features/sessions/OngoingSituations';
 
 export function SessionPage() {
   const { sessionId = '' } = useParams();
@@ -15,6 +23,7 @@ export function SessionPage() {
   const session = useSession(sessionId);
   const messages = useMessages(sessionId);
   const characters = useCharacters(session.data?.world_id ?? '');
+  const situations = useSituations(sessionId);
   const aiStatus = useAiStatus();
   const submitTurn = useSubmitTurn(sessionId);
 
@@ -60,6 +69,12 @@ export function SessionPage() {
         {/* Next to the turn count, not instead of it: they measure different things. */}
         <FictionalClock time={session.data.time} />
       </header>
+
+      {/* Above the transcript, not inside it: the world is doing this regardless of
+          what was said last turn. */}
+      <OngoingSituations
+        situations={(situations.data?.situations ?? []).map((entry) => entry.situation)}
+      />
 
       <div className="flex-1">
         {messages.isPending ? (

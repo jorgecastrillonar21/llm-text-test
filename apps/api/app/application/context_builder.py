@@ -21,7 +21,8 @@ from app.application.persistence import (
     WorldSnapshot,
 )
 from app.application.rules_projection import project_world_rules
-from app.application.spatial_context import build_scene_spatial_context
+from app.application.situation_context import build_situations_context
+from app.application.spatial_context import assemble_scene_context, resolve_scene
 from app.application.story_context import (
     CharacterContext,
     FactContext,
@@ -68,14 +69,28 @@ async def build_story_context(
     relationships = await reader.load_relationships(session.id)
     facts = await reader.load_facts(session.id, limit=FACT_LIMIT)
 
-    # None when the world has no geography, or when the session's location string
-    # matches nothing in it -- which is most sessions today. See
-    # `spatial_context.resolve_scene_location` for why that string is the input.
-    space = await build_scene_spatial_context(
+    # Resolved once and used twice: the spatial block walks the graph, and situation
+    # relevance needs the current place and its containers to know what is happening
+    # *here*. See `spatial_context.resolve_scene_location` for why a location string is
+    # the input, and why that is temporary.
+    placement = await resolve_scene(
         reader,
         session_id=session.id,
         world_id=world.id,
         current_location=session.current_location,
+    )
+    # None when the world has no geography, or when the session's location string
+    # matches nothing in it -- which is most sessions today.
+    space = await assemble_scene_context(reader, placement)
+
+    # None when nothing relevant is under way, which is also most turns.
+    situations = await build_situations_context(
+        reader,
+        session_id=session.id,
+        elapsed_minutes=session.elapsed_minutes,
+        location_index=placement.graph.index,
+        current_location=placement.current,
+        present_character_ids=[character.id for character in characters],
     )
 
     # Derived here, every turn, from the one number that is stored. There is no
@@ -109,6 +124,7 @@ async def build_story_context(
             elapsed_since_start=now.elapsed_since_start,
         ),
         space=space,
+        situations=situations,
         world_facts=_to_facts_context(facts, names, world.name),
         relevant_characters=[_to_character_context(record) for record in characters],
         recent_messages=[_to_message_context(message, names) for message in messages],

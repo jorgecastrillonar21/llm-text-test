@@ -17,6 +17,7 @@ which is why speaker labels and relationship names are resolved in
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -46,6 +47,21 @@ from app.domain.world_locations import (
     PhysicalDistance,
 )
 from app.domain.world_rules import WorldRules
+from app.domain.world_situations import (
+    Importance as SituationImportance,
+)
+from app.domain.world_situations import (
+    Intensity,
+    Momentum,
+    ParticipantEntityType,
+    Situation,
+    SituationCategory,
+    SituationParticipant,
+    SituationScope,
+    SituationStatus,
+    StartSituation,
+    Threat,
+)
 from app.domain.world_time import FictionalDateTime, ScheduledEventStatus
 
 # ---------------------------------------------------------------------------
@@ -291,6 +307,77 @@ class ConnectionStateWrite(BaseModel):
     traversal_modifier: int
 
 
+class NewSituation(BaseModel):
+    """A process to be written, with the application having decided everything.
+
+    No id, for the reason `NewLocation` has none: the application mints it. There is
+    also no `resolved_at` -- a situation cannot be created already over, and leaving the
+    field out is a stronger statement of that than validating it away would be.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    session_id: uuid.UUID
+    """Always a session. Unlike geography there is no template tier: a world may seed a
+    starting process, but what gets written belongs to one save."""
+
+    category: SituationCategory
+    subtype: str | None = None
+    title: str
+    description: str | None = None
+
+    status: SituationStatus = SituationStatus.ACTIVE
+    intensity: Intensity = 30
+    threat: Threat = 0
+    momentum: Momentum = 0
+    importance: SituationImportance = 3
+
+    scope: SituationScope = SituationScope.LOCAL
+    primary_location_id: uuid.UUID | None = None
+    parent_situation_id: uuid.UUID | None = None
+
+    started_at: int = Field(ge=0)
+    """Session elapsed minutes. Fictional time, never a wall clock."""
+
+    source_event_id: uuid.UUID | None = None
+    situation_metadata: dict[str, Any] = Field(default_factory=dict)
+    tags: tuple[str, ...] = ()
+
+
+class SituationUpdate(BaseModel):
+    """A resolved situation update, ready to write.
+
+    Every value is already decided: the application read the current row inside the
+    transaction, applied the mutation's deltas to it, clamped the result and validated
+    the transition. Partial updates stop here, the same way they do for
+    `LocationStateWrite` -- the adapter never has to know what "leave this alone" means.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    situation_id: uuid.UUID
+
+    intensity: Intensity
+    threat: Threat
+    momentum: Momentum
+    importance: SituationImportance
+
+    status: SituationStatus
+    last_progressed_at: int = Field(ge=0)
+    resolved_at: int | None = Field(default=None, ge=0)
+
+    situation_metadata: dict[str, Any]
+
+
+class NewParticipant(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    situation_id: uuid.UUID
+    entity_type: ParticipantEntityType
+    entity_id: uuid.UUID
+    role: str
+
+
 class NewFact(BaseModel):
     """A fact as the application has decided it, ready to be written.
 
@@ -404,7 +491,74 @@ class SpatialReaderPort(Protocol):
     ) -> LocationConnection | None: ...
 
 
-class StoryContextReaderPort(FactReaderPort, SpatialReaderPort, Protocol):
+class SituationReaderPort(Protocol):
+    """Reading what is currently under way in a session.
+
+    Every method takes `session_id` and filters on it. There is no template tier and no
+    cross-session read: a situation belongs to one save, and the port has no signature
+    that could return another save's.
+    """
+
+    async def load_situations(
+        self,
+        session_id: uuid.UUID,
+        *,
+        statuses: frozenset[SituationStatus] | None = None,
+        category: SituationCategory | None = None,
+        scope: SituationScope | None = None,
+        primary_location_id: uuid.UUID | None = None,
+        limit: int,
+    ) -> list[Situation]:
+        """Situations in this session, most important first, then most recently
+        progressed, then by title.
+
+        The final tiebreak must be the title so the order is total: this feeds a prompt,
+        and a set of equally important situations that reshuffles between turns is a
+        prompt that will not cache and a diff nobody can read.
+
+        `statuses=None` means every status including the concluded ones -- history is
+        the reason they are still here. Callers wanting only live processes pass the set
+        they mean.
+        """
+        ...
+
+    async def get_situation(
+        self, session_id: uuid.UUID, situation_id: uuid.UUID
+    ) -> Situation | None:
+        """One situation, or None -- including when it exists in another session, which
+        from here is indistinguishable from not existing, and should be."""
+        ...
+
+    async def load_participants(
+        self, situation_ids: Sequence[uuid.UUID]
+    ) -> list[SituationParticipant]:
+        """Participants of several situations at once, ordered by situation then role.
+
+        Batched deliberately. The caller that needs this needs it for a list of
+        situations, and one query per situation is how an N+1 gets written into the
+        turn loop. An empty sequence returns an empty list without querying.
+        """
+        ...
+
+    async def load_situations_for_entity(
+        self,
+        session_id: uuid.UUID,
+        *,
+        entity_id: uuid.UUID,
+        entity_type: ParticipantEntityType | None = None,
+        statuses: frozenset[SituationStatus] | None = None,
+        limit: int,
+    ) -> list[Situation]:
+        """Everything this entity is taking part in. The reverse lookup
+        `situation_participants` exists for; same ordering as `load_situations`.
+
+        `entity_type=None` matches any, because ids are unique across types in practice
+        and a caller holding a character id should not have to say so twice.
+        """
+        ...
+
+
+class StoryContextReaderPort(FactReaderPort, SpatialReaderPort, SituationReaderPort, Protocol):
     """Reads that feed context assembly.
 
     Limits are passed in by the caller because how much history is worth
@@ -643,14 +797,90 @@ class SpatialPort(SpatialReaderPort, TurnUnitOfWorkPort, Protocol):
     async def set_connection_state(self, state: ConnectionStateWrite) -> uuid.UUID: ...
 
 
-class StateStorePort(WorldStatePort, SpatialPort, Protocol):
+class SituationPort(SpatialReaderPort, SituationReaderPort, TurnUnitOfWorkPort, Protocol):
+    """What changing ongoing processes needs, and nothing else.
+
+    Bases listed spatial-then-situation, matching `StoryContextReaderPort`, because
+    `TurnGatewayPort` inherits from both and Python cannot linearise two parents that
+    disagree about the order of a shared base. Cosmetic here; an unresolvable MRO there.
+
+    Narrow in the same way `SessionClockPort`, `WorldStatePort` and `SpatialPort` are.
+    This can read situations, start them, move them and attach participants. It cannot
+    touch the transcript, the relationships, the clock or the facts, and it cannot
+    *write* geography -- the signature is what says so.
+
+    It can *read* geography, via `SpatialReaderPort`, because a situation points at a
+    primary location and that pointer has to be checked against what this session can
+    actually see. A siege of a castle another save invented is not a situation with a
+    bad foreign key; it is a siege of nowhere.
+    """
+
+    async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...
+
+    async def get_world(self, world_id: uuid.UUID) -> WorldSnapshot | None:
+        """The world, for its rules: how autonomous the world is meant to be decides
+        what a progression pass is allowed to do without the player."""
+        ...
+
+    async def known_character_ids(self, world_id: uuid.UUID) -> set[uuid.UUID]:
+        """Ids a participant may be. Characters are the only entity type this
+        application can currently resolve; factions have no table yet."""
+        ...
+
+    async def load_initial_situations(self, world_id: uuid.UUID) -> list[StartSituation]:
+        """The world template's starting processes, parsed.
+
+        `StartSituation` rather than a separate seed type, for the reason
+        `load_initial_facts` returns `SetFact`: a template situation is a mutation
+        waiting for a session to apply it, and giving it its own model would mean two
+        shapes to validate and two ways for one of them to drift.
+
+        Implementations parse the stored documents and raise on a malformed one -- the
+        same contract as `WorldSnapshot.rules`.
+        """
+        ...
+
+    async def add_situation(self, situation: NewSituation) -> uuid.UUID:
+        """Write a situation and return the id the application minted for it."""
+        ...
+
+    async def update_situation(self, update: SituationUpdate) -> None:
+        """Store an already-resolved update. Deciding it -- reading the current value,
+        applying deltas, clamping, validating the transition -- belongs to the
+        application, and doing any of it here would put game rules in an adapter."""
+        ...
+
+    async def add_participant(self, participant: NewParticipant) -> uuid.UUID:
+        """Attach a participant, or return the existing row's id if it is already
+        attached. One entity in one role once; a caller re-stating a known participant
+        is not an error."""
+        ...
+
+
+class StateStorePort(WorldStatePort, SpatialPort, SituationPort, Protocol):
     """What `state_service` needs to apply one batch of changes.
 
-    Facts and space together, because a batch may contain both and a collapsing bridge
-    that changed the connection but not the fact would be exactly the half-applied
-    outcome the batch exists to prevent. Everything else -- the transcript, the
-    relationships, the clock -- is still out of reach.
+    Facts, space and situations together, because a batch may contain all three and a
+    siege progression that raised the intensity but left the gate standing would be
+    exactly the half-applied outcome the batch exists to prevent. Everything else -- the
+    transcript, the relationships, the clock -- is still out of reach.
     """
+
+
+class ProgressionPort(StateStorePort, Protocol):
+    """What applying a situation progression needs.
+
+    `StateStorePort` plus one method: a progression may decide when it is worth looking
+    at this process again, and writing that down is scheduling. Everything else it
+    does -- moving the situation, changing a location, establishing a fact, starting a
+    child process -- is an ordinary state mutation and needs nothing new.
+
+    Deliberately not all of `SessionClockPort`: a progression schedules, it does not
+    move the clock. Advancing time is what *causes* progressions, and a resolver that
+    could advance time could evaluate itself forever.
+    """
+
+    async def add_scheduled_event(self, event: NewScheduledEvent) -> uuid.UUID: ...
 
 
 class TurnGatewayPort(
@@ -676,4 +906,8 @@ class TurnGatewayPort(
     happening to build its context, and may write a location the story just
     established -- both inside that same transaction, so a failed turn takes the new
     bookshop with it rather than leaving geography nobody visited.
+
+    `SituationPort` joined next, and the pattern is now the pattern: a turn reads what
+    is under way to build its context, and may start a process the story just set in
+    motion. Same transaction, so a failed turn takes the riot with it.
     """

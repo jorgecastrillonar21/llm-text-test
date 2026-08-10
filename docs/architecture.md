@@ -14,7 +14,11 @@ apps/api/app/
 │   │                     authority, mutations, world-rules compatibility
 │   ├── world_locations/  where things are: definitions, containment, connections,
 │   │                     per-session state, creation policy
-│   └── state_mutations.py  the one batch that carries fact and spatial changes
+│   ├── world_situations/ what the world is doing: ongoing processes, their lifecycle,
+│   │                     participants, causal parentage, progression arithmetic
+│   ├── vocabulary.py     the shared shape rules for subtypes, tags and metadata bags
+│   ├── state_mutations.py  the one batch that carries fact, spatial and situation changes
+│   └── situation_progression.py  what one progression pass decided, before it is written
 ├── application/      use cases, the AI contract, ports. Depends on domain only.
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
@@ -27,8 +31,12 @@ apps/api/app/
 │   ├── state_service.py  the only writer of world facts and spatial state
 │   ├── spatial_service.py  the spatial graph, materialisation, place creation
 │   ├── spatial_context.py  deterministic, scene-sized geography for the prompt
+│   ├── situation_service.py  starting, reading and progressing ongoing processes
+│   ├── situation_context.py  deterministic, scene-sized relevance for the prompt
+│   ├── progression_service.py  turning a progression result into one atomic batch
 │   ├── fact_proposals.py reviewing what the Story Director claims is true
-│   └── location_proposals.py reviewing the places it says the story found
+│   ├── location_proposals.py reviewing the places it says the story found
+│   └── situation_proposals.py reviewing the processes it says began
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
 │   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
 ├── api/              HTTP adapter and composition: routers, DTOs, errors, DI
@@ -145,8 +153,12 @@ The turn use case reaches storage through three Protocols in
 | `TurnPersistencePort` | session/world lookups and every turn write |
 | `TurnUnitOfWorkPort` | `commit()` |
 | `SessionClockPort` | the simulation clock and its scheduled events |
+| `SpatialPort` | reading and growing the spatial graph, and per-session state |
+| `SituationPort` | reading and writing ongoing processes |
+| `StateStorePort` | facts, space and situations together — what one batch may touch |
+| `ProgressionPort` | `StateStorePort` plus scheduling the next evaluation |
 
-`TurnGatewayPort` composes the first three. `build_story_context` takes only the reader
+`TurnGatewayPort` composes the first three, plus `StateStorePort`. `build_story_context` takes only the reader
 — functions declare the narrowest port they need — while `execute_turn` takes the
 composite, because one transaction genuinely spans all three and splitting it into
 three arguments that must be the same object helps nobody.

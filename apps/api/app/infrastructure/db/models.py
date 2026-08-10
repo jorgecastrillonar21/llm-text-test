@@ -34,6 +34,12 @@ from app.domain.world_locations import (
     LocationScale,
 )
 from app.domain.world_rules import default_world_rules
+from app.domain.world_situations import (
+    ParticipantEntityType,
+    SituationCategory,
+    SituationScope,
+    SituationStatus,
+)
 from app.domain.world_time import DEFAULT_INITIAL_DATETIME, ScheduledEventStatus
 from app.infrastructure.db.base import Base
 from app.infrastructure.db.types import UtcDateTime, utcnow
@@ -85,6 +91,17 @@ class World(Base):
     # kills the king does not edit the world other sessions start from. Nothing writes
     # this column after creation -- there is deliberately no update path.
     initial_facts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    # The same idea for ongoing processes: what a world already has under way before
+    # anyone plays it. A besieged capital, a failing ward network, a contested throne.
+    #
+    # Stored as `StartSituation` documents rather than as situation rows, because a
+    # situation belongs to a session and this is a template -- there is no world-scoped
+    # situation to copy from. Each session materialises its own, gets its own ids, and
+    # diverges immediately; a session that lifts the siege does not lift it for anyone
+    # else. Nothing writes this column after creation.
+    initial_situations: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
@@ -649,3 +666,178 @@ class LocationConnectionState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
     )
+
+
+class Situation(Base):
+    """An ongoing process in one session. See app.domain.world_situations.
+
+    # Session-scoped, with no template tier
+
+    Unlike `location_definitions` there is no shared form of this row. Geography is a
+    property of the world and ten saves read the same places; a war is something that
+    happened in one of them. A world may *seed* a starting situation, but what gets
+    written is a row belonging to that session, and `ON DELETE CASCADE` means deleting
+    the save takes its history with it.
+
+    # Concluded rows stay
+
+    Nothing deletes a situation for reaching `resolved` or `cancelled`. That is why the
+    table is `situations` and not `active_situations`: "what is going on right now" is a
+    query with `status IN (...)`, and a table that held only live rows would have
+    nowhere to put the siege that ended last week -- which is most of what makes a
+    session worth reading afterwards.
+
+    # The check constraints, and the one that cannot be one
+
+    Bounds, temporal ordering and self-parentage are all expressible here and are
+    enforced here, so a hand-edited row cannot produce an intensity of 400 or a siege
+    that resolved before it started. Cycles in `parent_situation_id` are not expressible
+    in SQLite or PostgreSQL, so that rule lives in
+    `world_situations.hierarchy.check_parent_situation` and runs before every write that
+    sets the link.
+    """
+
+    __tablename__ = "situations"
+    __table_args__ = (
+        # "What is going on in this session" -- the read every context build makes.
+        Index("ix_situations_session_status", "session_id", "status"),
+        Index("ix_situations_session_category", "session_id", "category"),
+        # "What is happening at this place", for location-driven relevance.
+        Index("ix_situations_session_location", "session_id", "primary_location_id"),
+        Index("ix_situations_parent", "parent_situation_id"),
+        CheckConstraint("intensity BETWEEN 0 AND 100", name="ck_situations_intensity_range"),
+        CheckConstraint("threat BETWEEN 0 AND 100", name="ck_situations_threat_range"),
+        CheckConstraint("momentum BETWEEN -100 AND 100", name="ck_situations_momentum_range"),
+        CheckConstraint("importance BETWEEN 1 AND 5", name="ck_situations_importance_range"),
+        CheckConstraint("started_at >= 0", name="ck_situations_started_at_nonnegative"),
+        CheckConstraint(
+            "last_progressed_at >= started_at", name="ck_situations_progress_after_start"
+        ),
+        CheckConstraint(
+            "resolved_at IS NULL OR resolved_at >= started_at",
+            name="ck_situations_resolved_after_start",
+        ),
+        CheckConstraint(
+            "parent_situation_id IS NULL OR parent_situation_id <> id",
+            name="ck_situations_not_self_parent",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    category: Mapped[SituationCategory] = mapped_column(String(20), nullable=False)
+    # The open axis. `conflict/siege`, `project/bridge_reconstruction`. No enum could
+    # hold the second half of that across genres, so it is a normalised identifier.
+    subtype: Mapped[str | None] = mapped_column(String(60), nullable=True)
+
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    status: Mapped[SituationStatus] = mapped_column(
+        String(20), default=SituationStatus.ACTIVE, nullable=False
+    )
+
+    # Three independent measures. A festival is intensity 90 / threat 5; a siege is
+    # 80 / 90. Collapsing them into one `severity` column is what makes every positive
+    # process in the game look like a problem.
+    intensity: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+    threat: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    momentum: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # A fourth, and also independent: how much prompt budget and simulation attention
+    # this deserves. A vast distant storm can be intensity 100, importance 1.
+    importance: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+
+    scope: Mapped[SituationScope] = mapped_column(
+        String(20), default=SituationScope.LOCAL, nullable=False
+    )
+
+    # SET NULL rather than CASCADE: a location being deleted must not delete the war
+    # that was fought over it. Null is also the honest value for a manhunt, which
+    # follows a person rather than a place.
+    primary_location_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="SET NULL"), nullable=True
+    )
+    # Causal only. Resolving the parent does not resolve the child -- see
+    # `world_situations.hierarchy` for why that has to stay a separate decision.
+    parent_situation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("situations.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Session elapsed minutes throughout, from Time V1. `created_at` below is the row's
+    # birthday and carries no simulation meaning; nothing reads a wall clock to decide
+    # how long a siege has lasted.
+    started_at: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    last_progressed_at: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    resolved_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # SET NULL for the same reason facts use it: losing the event that explains a
+    # situation must not delete the situation. Provenance can decay; the process cannot.
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("game_events.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Small, flat and scalar-only, validated at the domain boundary. Never a place to
+    # keep state another domain owns: a bridge's condition lives in
+    # `location_connection_states`, not in a reconstruction project's metadata.
+    situation_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class SituationParticipant(Base):
+    """Who is taking part in a process, and in what capacity.
+
+    Normalised rather than a JSON array on `situations`, because the query that makes
+    this table worth having is the reverse one: "every situation involving this
+    character". An array would turn that into a table scan with a JSON predicate, and it
+    is the query StoryContext selection and future simulation prioritisation both need.
+
+    # A reference, never a copy
+
+    Nothing here describes what a participant *can do*. No soldiers, no money, no
+    influence, no health. Those belong to whatever domain owns the entity, and a copy
+    here would be a second answer that drifts from the first.
+
+    # No foreign key on `entity_id`
+
+    It may point at a character today and a faction when factions exist, and a column
+    that can address two tables cannot constrain either. `entity_type` says which, and
+    the application resolves characters against the world -- factions are accepted on
+    trust and that is recorded rather than quietly tolerated.
+    """
+
+    __tablename__ = "situation_participants"
+    __table_args__ = (
+        # One entity, one role, once. The same character may be both `investigator` and
+        # `target` -- that is a story -- so the key is the pair, not the entity.
+        UniqueConstraint(
+            "situation_id",
+            "entity_type",
+            "entity_id",
+            "role",
+            name="uq_situation_participants_entity_role",
+        ),
+        # The reverse lookup this table exists for.
+        Index("ix_situation_participants_entity", "entity_type", "entity_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    situation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("situations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    entity_type: Mapped[ParticipantEntityType] = mapped_column(String(20), nullable=False)
+    entity_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    # Open vocabulary, normalised like a subtype: `attacker`, `defender`, `investigator`,
+    # `target`, `organizer`, `beneficiary`. An enum here would be a list nobody could
+    # extend without a migration.
+    role: Mapped[str] = mapped_column(String(60), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)

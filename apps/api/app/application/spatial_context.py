@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import uuid
 
+from pydantic import BaseModel, ConfigDict
+
 from app.application.persistence import SpatialReaderPort
 from app.application.spatial_service import SpatialGraph, load_spatial_graph
 from app.application.story_context import (
@@ -87,6 +89,38 @@ def resolve_scene_location(graph: SpatialGraph, current_location: str) -> Locati
     return matches[0]
 
 
+class ScenePlacement(BaseModel):
+    """Where a turn is happening, and the graph it was resolved against.
+
+    Both, because two callers want different halves and neither should load the graph
+    twice: the spatial block needs the graph to walk, and situation relevance needs the
+    current place and its containers to decide what is happening *here*. Four queries
+    per turn, not eight.
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    graph: SpatialGraph
+    current: LocationDefinition | None
+
+
+async def resolve_scene(
+    reader: SpatialReaderPort,
+    *,
+    session_id: uuid.UUID,
+    world_id: uuid.UUID,
+    current_location: str,
+) -> ScenePlacement:
+    """Load the session's geography and work out which place the scene is in.
+
+    `current` is None when the world has no geography or the session's location string
+    matches nothing -- which is most sessions today. The graph is still returned: a
+    caller may have use for it even when the scene is nowhere in particular.
+    """
+    graph = await load_spatial_graph(reader, session_id=session_id, world_id=world_id)
+    return ScenePlacement(graph=graph, current=resolve_scene_location(graph, current_location))
+
+
 async def build_scene_spatial_context(
     reader: SpatialReaderPort,
     *,
@@ -101,11 +135,19 @@ async def build_scene_spatial_context(
     empty one. An empty heading tells a model the game tracks places and has none,
     which reads worse than silence.
     """
-    graph = await load_spatial_graph(reader, session_id=session_id, world_id=world_id)
-    current = resolve_scene_location(graph, current_location)
-    if current is None:
+    placement = await resolve_scene(
+        reader, session_id=session_id, world_id=world_id, current_location=current_location
+    )
+    return await assemble_scene_context(reader, placement)
+
+
+async def assemble_scene_context(
+    reader: SpatialReaderPort, placement: ScenePlacement
+) -> SpatialContext | None:
+    """The spatial block for an already-resolved placement, or None if it is nowhere."""
+    if placement.current is None:
         return None
-    return await _assemble(reader, graph, current)
+    return await _assemble(reader, placement.graph, placement.current)
 
 
 async def get_spatial_context(

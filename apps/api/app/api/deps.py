@@ -13,7 +13,9 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.persistence import (
+    ProgressionPort,
     SessionClockPort,
+    SituationPort,
     SpatialPort,
     StateStorePort,
     TurnGatewayPort,
@@ -84,6 +86,27 @@ def get_spatial_store(session: Annotated[AsyncSession, Depends(get_db)]) -> Spat
     return SqlAlchemyTurnGateway(session)
 
 
+def get_situation_store(session: Annotated[AsyncSession, Depends(get_db)]) -> SituationPort:
+    """The narrowest situation view, for handlers that only read what is under way.
+
+    Separate from `WorldStateStore` for the reason `SpatialStore` is: reading what the
+    world is currently doing and rewriting what is true are different powers, and a
+    read endpoint should not hold the second one.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
+def get_progression_store(session: Annotated[AsyncSession, Depends(get_db)]) -> ProgressionPort:
+    """Everything a progression needs: the full state store, plus scheduling.
+
+    Wider than the others on purpose, and used by exactly one endpoint -- the developer
+    tool that drives a progression by hand. A progression legitimately changes
+    situations, geography and facts together, so the port that carries it out has to be
+    able to.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
 def get_settings_dep(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
@@ -104,6 +127,8 @@ TurnGateway = Annotated[TurnGatewayPort, Depends(get_turn_gateway)]
 SessionClock = Annotated[SessionClockPort, Depends(get_session_clock)]
 WorldStateStore = Annotated[StateStorePort, Depends(get_world_state_store)]
 SpatialStore = Annotated[SpatialPort, Depends(get_spatial_store)]
+SituationStore = Annotated[SituationPort, Depends(get_situation_store)]
+ProgressionStore = Annotated[ProgressionPort, Depends(get_progression_store)]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 StoryGen = Annotated[StoryGeneratorPort, Depends(get_story_generator)]
 ImageGen = Annotated[ImageGeneratorPort, Depends(get_image_generator)]

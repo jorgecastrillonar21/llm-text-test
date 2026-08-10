@@ -20,6 +20,7 @@ from app.api.schemas import (
     WorldFactRead,
     WorldStateRead,
 )
+from app.application.situation_service import materialize_initial_situations
 from app.application.spatial_service import materialize_initial_spatial_state
 from app.application.state_service import materialize_initial_facts
 from app.application.turn_service import execute_turn
@@ -58,9 +59,13 @@ async def create_session(
     declared, or without a state row for the places in it, would be a world the player
     is playing a different version of, and there is no retry that fixes it afterwards.
 
-    Facts and spatial state are seeded by different services because they are different
-    kinds of thing -- one is a batch of mutations that moves the state revision, the
-    other is materialising defaults that no event caused.
+    Facts, spatial state and situations are seeded by different services because they
+    are different kinds of thing: one is a batch of mutations that moves the state
+    revision, one is materialising defaults that no event caused, and one is starting
+    the processes a world was already running before anyone played it.
+
+    Geography before situations, because a seeded situation may be centred on a place
+    and the location has to be visible before the siege of it can be written.
     """
     world = await db.get(models.World, payload.world_id)
     if world is None:
@@ -72,6 +77,7 @@ async def create_session(
     # Same AsyncSession behind the port, so it sees the row above without committing.
     await materialize_initial_facts(store, session_id=session.id)
     await materialize_initial_spatial_state(store, session_id=session.id)
+    await materialize_initial_situations(store, session_id=session.id)
 
     await db.commit()
     return session

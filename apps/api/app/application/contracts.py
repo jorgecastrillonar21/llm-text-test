@@ -17,6 +17,7 @@ from app.domain.enums import MemoryKind
 from app.domain.relationships import DELTA_MAX, DELTA_MIN
 from app.domain.world_facts import FactSubjectType
 from app.domain.world_locations import LocationCategory, LocationScale
+from app.domain.world_situations import SituationCategory, SituationScope
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,12 @@ MAX_FACT_PROPOSALS = 5
 MAX_LOCATION_PROPOSALS = 3
 """Lower than the fact cap. A turn that invents three new places has stopped
 narrating a scene and started drawing a map."""
+
+MAX_SITUATION_PROPOSALS = 2
+"""Lower still. A turn that starts three ongoing processes is not narrating a scene,
+it is writing a season finale, and the cost of a wrong one is far higher than a
+spurious bookshop: a situation persists, reaches future prompts and asks to be
+simulated."""
 
 
 class DialogueLine(BaseModel):
@@ -137,6 +144,48 @@ class LocationProposal(BaseModel):
     reason: str = Field(default="", max_length=300)
 
 
+class SituationProposal(BaseModel):
+    """A process the story just set in motion.
+
+    A *proposal*, and a more tightly constrained one than `FactProposal` or
+    `LocationProposal`. Notice what is missing: `intensity`, `threat`, `momentum`,
+    `importance`, `status`, and any way to name an existing situation. All of them are
+    absent on purpose.
+
+    A location the story mentions is a noun. A situation is a process with three bounded
+    numbers, a lifecycle and a claim on future simulation -- and a model that could set
+    those could declare a war at intensity 100 by writing an atmospheric sentence, or
+    end a siege because the scene felt like it should be over. So the model says *what
+    kind of thing began*, and the application decides every number, exactly as it
+    decides a proposed location's importance.
+
+    Existing situations are read-only to the director in the strongest available sense:
+    there is no field here that could address one, so "the siege is now resolved" is a
+    sentence it can write in narration and nothing more. Moving a situation is
+    `UpdateSituation`, which requires mechanical authority the model does not have.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    category: SituationCategory
+    subtype: str | None = Field(default=None, max_length=60)
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=1000)
+
+    scope: SituationScope = SituationScope.LOCAL
+    """How far it reaches. The one shaping value the model does supply, because it is a
+    description of what happened rather than a measure of it -- a tavern brawl is local
+    and a succession crisis is not, and neither claim moves a number."""
+
+    primary_location_id: uuid.UUID | None = Field(
+        default=None, description="Where it is centred, from the context."
+    )
+    """An id the context *gave* the model, like `LocationProposal.parent_location_id`.
+    Anything it invents here fails to resolve and the proposal is refused."""
+
+    reason: str = Field(default="", max_length=300)
+
+
 class VisualCue(BaseModel):
     """Signals a visually significant moment, not every turn."""
 
@@ -193,6 +242,11 @@ class TurnGeneration(BaseModel):
     # already exists; a model required to name a new place every turn would produce a
     # world of bookshops nobody entered.
     location_proposals: list[LocationProposal] = Field(default_factory=list)
+
+    # Rarest of the three. A turn that starts a war is a turn where a war started; most
+    # turns start nothing, and a required field here would produce a world permanently
+    # at war with itself.
+    situation_proposals: list[SituationProposal] = Field(default_factory=list)
 
     visual_cue: VisualCue = Field(default_factory=VisualCue)
 
@@ -289,3 +343,37 @@ class TurnGeneration(BaseModel):
     @classmethod
     def _cap_locations(cls, value: list[LocationProposal]) -> list[LocationProposal]:
         return value[:MAX_LOCATION_PROPOSALS]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_unusable_situation_proposals(cls, data: object) -> object:
+        """Same judgement as the two validators above, same reasoning.
+
+        A model that sends `category: "riot"` has got one enum wrong in an optional
+        field. Failing the turn over it would roll back real narration and show the
+        player a 502 for a process nobody asked to start.
+        """
+        if not isinstance(data, dict) or "situation_proposals" not in data:
+            return data
+
+        raw = data["situation_proposals"]
+        if not isinstance(raw, list):
+            logger.warning(
+                "Story provider sent situation_proposals as %s; ignored.", type(raw).__name__
+            )
+            return {**data, "situation_proposals": []}
+
+        kept: list[SituationProposal] = []
+        for item in raw:
+            try:
+                kept.append(SituationProposal.model_validate(item))
+            except PydanticValidationError as exc:
+                logger.warning(
+                    "Story provider sent an unusable situation proposal; dropped. %s", exc
+                )
+        return {**data, "situation_proposals": kept}
+
+    @field_validator("situation_proposals")
+    @classmethod
+    def _cap_situations(cls, value: list[SituationProposal]) -> list[SituationProposal]:
+        return value[:MAX_SITUATION_PROPOSALS]

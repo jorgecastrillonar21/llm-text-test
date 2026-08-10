@@ -29,6 +29,7 @@ from app.domain.world_rules.enums import (
     SubstanceUsePolicy,
     TimeProgression,
 )
+from app.domain.world_situations import SituationScope, SituationStatus
 from app.domain.world_time import TimeOfDay
 
 
@@ -179,6 +180,55 @@ class SpatialContext(BaseModel):
     within: list[PlaceContext] = Field(default_factory=list)
     """Containers, nearest first. `District, City, Region` -- enough for a scene to
     know where in the world it is."""
+
+
+class SituationContext(BaseModel):
+    """One ongoing process, phrased for a reader.
+
+    No id, like `PlaceContext` and `FactContext`. The director narrates what is going
+    on; it does not address it, and cannot -- there is no field in its response that
+    names a situation, which is what stops a model from resolving a war by mentioning
+    one.
+
+    The numbers are sent, unlike a location's default condition. There is no
+    uninteresting value for intensity: a director that knows the siege is at 78 writes
+    a different scene from one that knows it is at 20, and "78" is shorter than any
+    sentence that would convey it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str
+    kind: str
+    """The subtype if the world gave one, otherwise the category: `siege`, `conflict`."""
+
+    status: SituationStatus
+    intensity: int
+    threat: int
+    momentum: int
+    """Negative is winding down, positive is growing. Growing is not the same as
+    worsening -- a festival at +50 is getting livelier."""
+
+    scope: SituationScope
+    duration: str
+    """Rendered: "3 days", "40 min". The authoritative minute counts stay in the
+    database, because a prompt has no use for 4320 and would only do arithmetic on it."""
+
+
+class SituationsContext(BaseModel):
+    """What is currently under way that this scene should know about.
+
+    A bounded selection, never everything. Which ones, and why, is deterministic and
+    lives in `situation_context.py` with the reasoning about priority bands.
+
+    Absent on purpose: anything a world has tagged secret. There is no KnowledgeState
+    yet, so the alternative to that convention was narrating every conspiracy the turn
+    it began. See `situation_context` for how limited a protection that is.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    ongoing: list[SituationContext] = Field(default_factory=list)
 
 
 class CharacterContext(BaseModel):
@@ -332,6 +382,10 @@ class StoryContext(BaseModel):
     """None when the world has no geography, or when the session is not in a place the
     graph knows. Optional rather than empty: an empty spatial block tells a model the
     game tracks places and has none, which reads worse than saying nothing."""
+
+    situations: SituationsContext | None = None
+    """None when nothing relevant is under way, which is most turns. Optional for the
+    same reason `space` is."""
 
     world_facts: WorldFactsContext = Field(default_factory=WorldFactsContext)
     relevant_characters: list[CharacterContext] = Field(default_factory=list)

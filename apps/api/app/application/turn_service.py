@@ -39,6 +39,7 @@ from app.application.persistence import (
     WorldSnapshot,
 )
 from app.application.ports import StoryGeneratorPort
+from app.application.situation_proposals import review_situation_proposals
 from app.application.state_service import stage_state_change
 from app.domain.enums import MessageRole
 from app.domain.errors import NotFoundError, ValidationError
@@ -85,6 +86,10 @@ class TurnResult(BaseModel):
     """New places the turn established. Usually zero -- most scenes happen somewhere
     that already exists."""
     locations_rejected: int
+    situations_started: int
+    """Ongoing processes the turn set in motion. Zero on almost every turn, and a turn
+    where it is not is one worth being able to see without reading the log."""
+    situations_rejected: int
     visual_cue_generated: bool
 
 
@@ -203,14 +208,22 @@ async def execute_turn(
     relationships = await _apply_relationships(gateway, session, generation, known_character_ids)
     events_created = await _persist_events(gateway, session, generation, turn_index)
 
-    # Places first, then facts. A proposal may be about somewhere this turn just
-    # established, and the fact reviewer resolves location ids against what exists --
-    # so the geography has to be there before the truths about it are judged.
+    # Places, then situations, then facts. Each stage may name something the previous
+    # one established: a situation can be centred on a location this turn created, and
+    # a fact can be about either. Reversing the order would make a correct proposal fail
+    # for referring to something that does not exist yet.
     places = await review_location_proposals(
         gateway,
         session_id=session.id,
         world_id=world.id,
         proposals=generation.location_proposals,
+    )
+    situations = await review_situation_proposals(
+        gateway,
+        session_id=session.id,
+        proposals=generation.situation_proposals,
+        # A turn does not move the clock, so anything it starts starts now.
+        started_at=session.elapsed_minutes,
     )
     review = await _establish_proposed_facts(
         gateway, session, world, generation, known_character_ids
@@ -235,6 +248,8 @@ async def execute_turn(
         facts_rejected=len(review.reviewed) - len(review.accepted),
         locations_created=len(places.created),
         locations_rejected=len(places.reviewed) - len(places.created),
+        situations_started=len(situations.created),
+        situations_rejected=len(situations.reviewed) - len(situations.created),
         visual_cue_generated=generation.visual_cue.generate,
     )
 

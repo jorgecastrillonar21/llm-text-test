@@ -28,13 +28,22 @@ async def create_world(payload: WorldCreate, db: DbSession) -> models.World:
     # with the same resolved rules are the same world as far as the engine cares.
     world = models.World(
         **payload.model_dump(
-            exclude={"rules_preset", "rules", "initial_datetime", "initial_facts"}
+            exclude={
+                "rules_preset",
+                "rules",
+                "initial_datetime",
+                "initial_facts",
+                "initial_situations",
+            }
         ),
         rules_json=payload.resolved_rules().model_dump(mode="json"),
         initial_datetime=payload.resolved_initial_datetime().model_dump(mode="json"),
         # Stored as the mutation documents they already are, canonicalised by having
         # been parsed: what goes in the column is what a session will replay.
         initial_facts=[fact.model_dump(mode="json") for fact in payload.initial_facts],
+        initial_situations=[
+            situation.model_dump(mode="json") for situation in payload.initial_situations
+        ],
     )
     db.add(world)
     await db.commit()

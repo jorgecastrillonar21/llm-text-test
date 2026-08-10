@@ -42,6 +42,13 @@ from app.domain.world_rules import (
     build_preset,
     default_world_rules,
 )
+from app.domain.world_situations import (
+    ProgressionTrigger,
+    Situation,
+    SituationParticipant,
+    SituationStatus,
+    StartSituation,
+)
 from app.domain.world_time import (
     DEFAULT_INITIAL_DATETIME,
     STANDARD_CALENDAR,
@@ -79,6 +86,19 @@ class WorldCreate(BaseModel):
     A *template*: every session copies these into its own rows and diverges from there.
     Validated here as the mutations they are, so a malformed property name is a 422 at
     world creation rather than a surprise when the first session starts.
+    """
+
+    initial_situations: list[StartSituation] = Field(default_factory=list)
+    """What this world already has under way before anyone plays it.
+
+    A template in the same sense, and validated the same way: `StartSituation` rather
+    than a bespoke seed shape, so a siege that could not be started during play cannot
+    be authored into a world either. Every session materialises its own copies with
+    their own ids and diverges immediately.
+
+    A situation whose `primary_location_id` names a place is only checked when a session
+    materialises it -- the location has to exist by then, and at world creation the
+    geography may not have been authored yet.
     """
 
     @model_validator(mode="after")
@@ -283,6 +303,9 @@ class TurnResponse(BaseModel):
     locations_created: int
     """New places this turn established as canon for this session."""
     locations_rejected: int
+    situations_started: int
+    """Ongoing processes this turn set in motion. Zero on almost every turn."""
+    situations_rejected: int
     visual_cue_generated: bool
 
 
@@ -436,6 +459,58 @@ class LocationDetailRead(LocationRead):
     zones: list[LocationZone] = Field(default_factory=list)
     children: list[LocationRead] = Field(default_factory=list)
     connections: list[ConnectionRead] = Field(default_factory=list)
+
+
+class SituationRead(BaseModel):
+    """One ongoing process, whole.
+
+    The domain model straight through, unlike `LocationRead`, because a situation has
+    no definition/state split to preserve: it is one row with one lifetime, and the
+    numbers *are* the thing rather than a per-session overlay on it.
+    """
+
+    situation: Situation
+    participants: list[SituationParticipant] = Field(default_factory=list)
+
+
+class SituationListRead(BaseModel):
+    situations: list[SituationRead] = Field(default_factory=list)
+
+
+class SituationProgressRequest(BaseModel):
+    """Body for the development-only progression endpoint.
+
+    Deliberately carries no interval. A progression runs from where the situation was
+    last evaluated to *where the session clock actually is* -- both read by the handler,
+    neither the caller's to choose.
+
+    Letting a caller pass "six hours" would let it evaluate fictional time the session
+    has not lived through, which is how `last_progressed_at` ends up ahead of
+    `elapsed_minutes` and a siege reports three days of progress on a session that has
+    been running for twenty minutes. To exercise a long interval, advance the clock
+    first: `POST /dev/sessions/{id}/advance-time`, then progress. The two tools compose,
+    and fictional time stays the only authority on how much time has passed.
+    """
+
+    trigger: ProgressionTrigger = ProgressionTrigger.EXPLICIT
+
+
+class SituationProgressResponse(BaseModel):
+    situation_id: uuid.UUID
+    changed: bool
+    """False when the pass decided nothing happened, which is a frequent and legitimate
+    outcome. Nothing is written in that case and `state_revision` does not move."""
+
+    intensity_delta: int
+    threat_delta: int
+    momentum_delta: int
+    status_change: SituationStatus | None = None
+    state_revision: int | None = None
+    event_id: uuid.UUID | None = None
+    created_situation_ids: list[uuid.UUID] = Field(default_factory=list)
+    scheduled_event_id: uuid.UUID | None = None
+    next_progression_at: int | None = None
+    notes: str = ""
 
 
 class StateChangeRequest(BaseModel):

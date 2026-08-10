@@ -25,6 +25,12 @@ from app.domain.world_locations import (
     LocationScale,
 )
 from app.domain.world_rules import WorldRulesPreset, build_preset
+from app.domain.world_situations import (
+    SituationCategory,
+    SituationScope,
+    SituationStatus,
+    StartSituation,
+)
 from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
 from app.infrastructure.db.engine import create_engine, create_session_factory, session_scope
@@ -138,7 +144,7 @@ is how the scene finds its place until CharacterPosition exists -- see
 `app.application.spatial_context.resolve_scene_location`."""
 
 
-async def _seed_geography(db: AsyncSession, world_id: uuid.UUID) -> list[str]:
+async def _seed_geography(db: AsyncSession, world_id: uuid.UUID) -> tuple[list[str], uuid.UUID]:
     """A small template graph: a district, three places in it, and the ways between.
 
     Deliberately shallow and deliberately incomplete. It exists to exercise the model
@@ -146,6 +152,9 @@ async def _seed_geography(db: AsyncSession, world_id: uuid.UUID) -> list[str]:
     tavern with zones -- not to be a map of a city. Lazy granularity is the rule: the
     cellar is a location because it can be entered and can hold state; the fireplace is
     a zone because it is somewhere to stand.
+
+    Returns the names for the console summary, and the district's id, which the seeded
+    situations need: a hazard centred on the Lantern Quarter has to name it.
 
     Written directly rather than through the API for the same reason the facts are:
     world, characters and geography go in as one transaction, and the authoring
@@ -256,7 +265,90 @@ async def _seed_geography(db: AsyncSession, world_id: uuid.UUID) -> list[str]:
         ]
     )
     await db.flush()
-    return [quarter.name, street.name, tavern.name, cellar.name]
+    return [quarter.name, street.name, tavern.name, cellar.name], quarter.id
+
+
+def _initial_situations(quarter_id: uuid.UUID) -> list[StartSituation]:
+    """What this world already has under way before anyone plays it.
+
+    Three, chosen to exercise the parts of the model that are easy to get wrong rather
+    than to be a plot:
+
+    * **The failing wards** are a hazard with real danger and rising momentum, centred
+      on a place -- the ordinary case, and the one the spatial relevance band selects.
+    * **The contested succession** is political, regional and going nowhere: `dormant`
+      with zero momentum, which is a different thing from resolved and reaches context
+      anyway. It is the case a status column collapses if `dormant` does not exist.
+    * **The lamplighters' strike** is `planned` and tagged `secret`: it objectively
+      exists, and the player-facing context will not mention it. That tag is the whole
+      of the current hidden-situation story, and it is a convention rather than a
+      knowledge model -- see docs/world-state-situations.md.
+
+    A template, like `initial_facts`: each session materialises its own copies with its
+    own ids and diverges immediately. None carries a `source_event_id`, which is the
+    documented seed exception -- nothing happened to start these, the world began this
+    way.
+    """
+    return [
+        StartSituation(
+            category=SituationCategory.HAZARD,
+            subtype="ward_failure",
+            title="The failing wards",
+            description=(
+                "The wardlight over the Lantern Quarter has been thinning for a season. "
+                "Nobody official will say why, and the people who would know have stopped "
+                "being seen."
+            ),
+            status=SituationStatus.ACTIVE,
+            intensity=45,
+            threat=55,
+            momentum=15,
+            importance=4,
+            scope=SituationScope.LOCAL,
+            primary_location_id=quarter_id,
+            tags=("magic", "public"),
+            reason="The world begins with the wards already failing.",
+        ),
+        StartSituation(
+            category=SituationCategory.POLITICAL,
+            subtype="succession_crisis",
+            title="The contested succession",
+            description=(
+                "Two claims, both plausible, neither pressed. Everyone in the capital has "
+                "decided which side they were always on and nobody has moved."
+            ),
+            # Real, and going nowhere. Momentum zero and `dormant` are saying different
+            # things: the first is that nothing is currently driving it, the second that
+            # it is not the kind of process that drifts.
+            status=SituationStatus.DORMANT,
+            intensity=30,
+            threat=40,
+            momentum=0,
+            importance=4,
+            scope=SituationScope.REGIONAL,
+            tags=("political",),
+            reason="The world begins with the throne already contested.",
+        ),
+        StartSituation(
+            category=SituationCategory.SOCIAL,
+            subtype="strike",
+            title="The lamplighters' quiet refusal",
+            description=(
+                "The guild has stopped replacing the dead lamps in the Quarter. They have "
+                "not announced it and will not, and the dark is spreading a street at a time."
+            ),
+            status=SituationStatus.PLANNED,
+            intensity=10,
+            threat=15,
+            momentum=10,
+            importance=3,
+            scope=SituationScope.LOCAL,
+            primary_location_id=quarter_id,
+            # Objectively real; deliberately not narrated. See the docstring.
+            tags=("secret", "public"),
+            reason="The world begins with the strike already being organised.",
+        ),
+    ]
 
 
 async def seed() -> None:
@@ -309,13 +401,21 @@ async def seed() -> None:
             ]
             await db.flush()
 
-            places = await _seed_geography(db, world.id)
+            places, quarter_id = await _seed_geography(db, world.id)
+
+            # After the geography, because a seeded situation names a location and the
+            # place has to have an id before the hazard centred on it can point at it.
+            world.initial_situations = [
+                situation.model_dump(mode="json") for situation in _initial_situations(quarter_id)
+            ]
+            await db.flush()
 
             print(f"Created demo world: {world.id}")
             print(f"Rules: {DEMO_WORLD_PRESET.value}")
             print(f"Characters: {', '.join(c['name'] for c in CHARACTERS)}")
             print(f"Initial facts: {len(world.initial_facts)}")
             print(f"Locations: {', '.join(places)}")
+            print(f"Initial situations: {len(world.initial_situations)}")
     finally:
         await engine.dispose()
 

@@ -58,6 +58,26 @@ for that session and are invisible to every other. See
 Deliberately absent: `CharacterState` and canonical position, travel, scenes, tactical
 space, perception, interaction range, weather, and any interactive map.
 
+## Phase 1.9 — WorldState: situations ✅
+
+The fourth piece of `WorldState`: what the world is currently *doing*. A siege, a fire, a
+festival, an investigation, a reconstruction — a persistent process with a lifecycle,
+participants, a place and a direction. `Situation` is kept distinct from `WorldFact`,
+`GameEvent` and `ScheduledEvent`: the siege is not the breach, the breach is not the
+ruined gate, and the ruined gate is not the next evaluation.
+
+Three independent measures rather than one severity, because a festival at intensity 90
+is not a threat and a model with one number makes every positive process look like a
+problem. Progression is interval-driven with no universal tick — fires in minutes, sieges
+in hours, construction in weeks — behind a generic resolver boundary that specialised
+resolvers will register into. The Story Director may propose that a process began; it
+supplies no numbers and cannot touch one that exists. See
+[world-state-situations.md](world-state-situations.md).
+
+Deliberately absent: the world simulation engine itself, fire/warfare/epidemic/economic
+simulation, `FactionState`, NPC autonomy, a game RNG, a situation relation graph,
+`KnowledgeState`, and any background processing.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.

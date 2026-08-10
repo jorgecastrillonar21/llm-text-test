@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Sequence
 
 import pytest
 
@@ -26,8 +27,11 @@ from app.application.persistence import (
     NewFact,
     NewMemory,
     NewMessage,
+    NewParticipant,
+    NewSituation,
     RelationshipRecord,
     SessionSnapshot,
+    SituationUpdate,
     TranscriptMessage,
     WorldSnapshot,
 )
@@ -45,6 +49,14 @@ from app.domain.world_locations import (
     LocationZone,
 )
 from app.domain.world_rules import default_world_rules
+from app.domain.world_situations import (
+    ParticipantEntityType,
+    Situation,
+    SituationCategory,
+    SituationParticipant,
+    SituationScope,
+    SituationStatus,
+)
 from app.domain.world_time import DEFAULT_INITIAL_DATETIME
 
 SESSION_ID = uuid.uuid4()
@@ -105,6 +117,8 @@ class FakeTurnGateway:
         self.facts: dict[tuple[str, str], WorldFact] = {}
         self.initial_facts: list[SetFact] = []
         self.locations: list[LocationDefinition] = []
+        self.situations: list[Situation] = []
+        self.participants: list[NewParticipant] = []
         self.state_revision = 0
 
     # -- reads ------------------------------------------------------------------
@@ -218,6 +232,56 @@ class FakeTurnGateway:
     ) -> LocationConnectionState | None:
         return None
 
+    # -- situation reads --------------------------------------------------------
+    #
+    # A session with nothing under way, which is the ordinary case and the one this
+    # file exists to prove still works.
+
+    async def load_situations(
+        self,
+        session_id: uuid.UUID,
+        *,
+        statuses: frozenset[SituationStatus] | None = None,
+        category: SituationCategory | None = None,
+        scope: SituationScope | None = None,
+        primary_location_id: uuid.UUID | None = None,
+        limit: int,
+    ) -> list[Situation]:
+        found = [
+            situation
+            for situation in self.situations
+            if (statuses is None or situation.status in statuses)
+            and (category is None or situation.category is category)
+            and (scope is None or situation.scope is scope)
+            and (
+                primary_location_id is None or situation.primary_location_id == primary_location_id
+            )
+        ]
+        # The same total order the port's contract demands of a real adapter.
+        found.sort(key=lambda s: (-s.importance, -s.last_progressed_at, s.title.casefold()))
+        return found[:limit]
+
+    async def get_situation(
+        self, session_id: uuid.UUID, situation_id: uuid.UUID
+    ) -> Situation | None:
+        return next((s for s in self.situations if s.id == situation_id), None)
+
+    async def load_participants(
+        self, situation_ids: Sequence[uuid.UUID]
+    ) -> list[SituationParticipant]:
+        return []
+
+    async def load_situations_for_entity(
+        self,
+        session_id: uuid.UUID,
+        *,
+        entity_id: uuid.UUID,
+        entity_type: ParticipantEntityType | None = None,
+        statuses: frozenset[SituationStatus] | None = None,
+        limit: int,
+    ) -> list[Situation]:
+        return []
+
     async def get_fact(
         self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
     ) -> WorldFact | None:
@@ -288,6 +352,56 @@ class FakeTurnGateway:
 
     async def set_turn_index(self, session_id: uuid.UUID, turn_index: int) -> None:
         self.turn_index_writes.append(turn_index)
+
+    async def add_situation(self, situation: NewSituation) -> uuid.UUID:
+        now = dt.datetime.now(dt.UTC)
+        stored = Situation(
+            id=uuid.uuid4(),
+            session_id=situation.session_id,
+            category=situation.category,
+            subtype=situation.subtype,
+            title=situation.title,
+            description=situation.description,
+            status=situation.status,
+            intensity=situation.intensity,
+            threat=situation.threat,
+            momentum=situation.momentum,
+            importance=situation.importance,
+            scope=situation.scope,
+            primary_location_id=situation.primary_location_id,
+            parent_situation_id=situation.parent_situation_id,
+            started_at=situation.started_at,
+            last_progressed_at=situation.started_at,
+            source_event_id=situation.source_event_id,
+            situation_metadata=situation.situation_metadata,
+            tags=situation.tags,
+            created_at=now,
+            updated_at=now,
+        )
+        self.situations.append(stored)
+        return stored.id
+
+    async def update_situation(self, update: SituationUpdate) -> None:
+        for index, current in enumerate(self.situations):
+            if current.id != update.situation_id:
+                continue
+            self.situations[index] = current.model_copy(
+                update={
+                    "intensity": update.intensity,
+                    "threat": update.threat,
+                    "momentum": update.momentum,
+                    "importance": update.importance,
+                    "status": update.status,
+                    "last_progressed_at": update.last_progressed_at,
+                    "resolved_at": update.resolved_at,
+                    "situation_metadata": update.situation_metadata,
+                }
+            )
+            return
+
+    async def add_participant(self, participant: NewParticipant) -> uuid.UUID:
+        self.participants.append(participant)
+        return uuid.uuid4()
 
     async def commit(self) -> None:
         self.commits += 1

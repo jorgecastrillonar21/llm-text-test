@@ -28,106 +28,53 @@ from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.domain.errors import ValidationError
+from app.domain.vocabulary import (
+    MAX_METADATA_KEY_LENGTH,
+    MAX_METADATA_KEYS,
+    MAX_METADATA_VALUE_LENGTH,
+    MAX_SUBTYPE_LENGTH,
+    MAX_TAG_LENGTH,
+    MAX_TAGS,
+    MetadataValue,
+    check_flat_metadata,
+    clean_tags,
+    parse_subtype,
+)
 from app.domain.world_locations.enums import LocationCategory, LocationScale
+
+__all__ = [
+    "MAX_DESCRIPTION_LENGTH",
+    "MAX_METADATA_KEYS",
+    "MAX_METADATA_KEY_LENGTH",
+    "MAX_METADATA_VALUE_LENGTH",
+    "MAX_NAME_LENGTH",
+    "MAX_SUBTYPE_LENGTH",
+    "MAX_TAGS",
+    "MAX_TAG_LENGTH",
+    "Importance",
+    "LocationDefinition",
+    "LocationZone",
+    "check_spatial_metadata",
+    "clean_tags",
+    "parse_subtype",
+]
 
 Importance = Annotated[int, Field(ge=1, le=5)]
 """How much a place matters when the prompt has room for only some of them. As with
 facts, never a permission."""
 
 MAX_NAME_LENGTH = 200
-MAX_SUBTYPE_LENGTH = 60
 MAX_DESCRIPTION_LENGTH = 4000
-MAX_TAGS = 8
-MAX_TAG_LENGTH = 40
-MAX_METADATA_KEYS = 12
-MAX_METADATA_KEY_LENGTH = 60
-MAX_METADATA_VALUE_LENGTH = 200
-
-_SUBTYPE_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789_")
 
 
-def parse_subtype(raw: str | None) -> str | None:
-    """Normalise a free-form subtype, or raise.
+def check_spatial_metadata(value: object) -> dict[str, MetadataValue]:
+    """The shared flat-metadata rule, named for the field it guards.
 
-    Deliberately permissive about *which* words are allowed -- `orbital_station` and
-    `enchanted_forest` are equally valid and no enum could hold both genres -- and
-    deliberately strict about their *shape*. A subtype is an identifier the engine
-    groups and filters by, so `Tavern`, `tavern ` and `tavern` must not be three
-    things.
+    A thin call rather than a copy: locations and situations both carry an optional
+    scalar bag, and the day one of them grows a length check the other does not is the
+    day the two stop agreeing about what `40` means. See `app.domain.vocabulary`.
     """
-    if raw is None:
-        return None
-    text = raw.strip().casefold().replace(" ", "_").replace("-", "_")
-    if not text:
-        return None
-    if len(text) > MAX_SUBTYPE_LENGTH:
-        raise ValidationError(
-            f"A subtype may be at most {MAX_SUBTYPE_LENGTH} characters; got {len(text)}."
-        )
-    if not set(text) <= _SUBTYPE_ALLOWED:
-        raise ValidationError(
-            f"{raw!r} is not a usable subtype. Use lowercase words joined by underscores, "
-            "for example 'tavern', 'orbital_station' or 'enchanted_forest'."
-        )
-    return text
-
-
-def check_spatial_metadata(value: object) -> dict[str, str | int | float | bool]:
-    """A small flat bag for whatever a world genuinely measures.
-
-    Optional in the strongest sense: nothing in the engine reads it, and nothing may
-    come to require it. It exists so a world that really does care that a corridor is
-    forty metres long has somewhere to say so, without every other world inventing
-    dimensions to fill a column.
-
-    Flat and bounded for the same reason fact values are: a nested document here is
-    the beginning of a second, unvalidated spatial model living inside a JSON blob.
-    """
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValidationError(
-            f"spatial_metadata must be an object of simple values; got {type(value).__name__}."
-        )
-    if len(value) > MAX_METADATA_KEYS:
-        raise ValidationError(
-            f"spatial_metadata may hold at most {MAX_METADATA_KEYS} keys; got {len(value)}."
-        )
-    cleaned: dict[str, str | int | float | bool] = {}
-    for key, item in value.items():
-        if not isinstance(key, str) or not key.strip():
-            raise ValidationError("spatial_metadata keys must be non-empty strings.")
-        if len(key) > MAX_METADATA_KEY_LENGTH:
-            raise ValidationError(
-                f"spatial_metadata key {key!r} is longer than {MAX_METADATA_KEY_LENGTH} characters."
-            )
-        if not isinstance(item, str | int | float | bool):
-            raise ValidationError(
-                f"spatial_metadata[{key!r}] must be a string, number or boolean; "
-                f"got {type(item).__name__}. Nested structures belong in their own model."
-            )
-        if isinstance(item, str) and len(item) > MAX_METADATA_VALUE_LENGTH:
-            raise ValidationError(
-                f"spatial_metadata[{key!r}] is longer than {MAX_METADATA_VALUE_LENGTH} characters."
-            )
-        cleaned[key.strip()] = item
-    return cleaned
-
-
-def clean_tags(value: tuple[str, ...]) -> tuple[str, ...]:
-    if len(value) > MAX_TAGS:
-        raise ValueError(f"At most {MAX_TAGS} tags are allowed; got {len(value)}.")
-    cleaned: list[str] = []
-    for tag in value:
-        text = tag.strip().casefold()
-        if not text:
-            continue
-        if len(text) > MAX_TAG_LENGTH:
-            raise ValueError(f"Tag {tag!r} is longer than {MAX_TAG_LENGTH} characters.")
-        if text not in cleaned:
-            cleaned.append(text)
-    return tuple(cleaned)
+    return check_flat_metadata(value, field="spatial_metadata")
 
 
 class LocationDefinition(BaseModel):

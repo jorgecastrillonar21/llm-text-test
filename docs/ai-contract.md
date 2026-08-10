@@ -126,6 +126,34 @@ nothing the model returns can open a gate, repair a ruin or change who holds a f
 Selection is deterministic and tier-capped; see
 [world-state-locations.md](world-state-locations.md#spatial-context).
 
+### situations
+
+`situations` is a `SituationsContext` — the ongoing processes this scene should know
+about — or `None` when nothing relevant is under way, which is most turns. It renders as:
+
+```text
+# What is going on  (authoritative: you may narrate these, never change them)
+- The failing wards (ward failure, local) — active, intensity 60/100, danger 55/100, growing, running 6 hours
+- The contested succession (succession crisis, regional) — dormant, intensity 30/100, danger 40/100, steady, running 6 hours
+```
+
+No ids, again. The numbers *are* sent, unlike a location's default condition: there is no
+uninteresting value for intensity, and a director that knows the siege is at 78 writes a
+different scene from one that knows it is at 20. Direction is a word rather than a signed
+integer, and a deliberately neutral one — "growing" covers a fire spreading and a festival
+filling the streets.
+
+**The model cannot change any of them, and this is enforced rather than asked.**
+`TurnGeneration` has no field that could address an existing situation, and
+`StateMutationBatch` refuses to be constructed with a situation mutation under
+`story_director` authority. "Word arrives that the siege has broken" is a sentence it can
+write and nothing more.
+
+Selection is deterministic, banded and capped at six; see
+[world-state-situations.md](world-state-situations.md#storycontext). Situations a world
+tags `secret` are withheld — a stopgap for the absent `KnowledgeState`, and documented
+there as the convention it is.
+
 ## TurnGeneration — what the model returns
 
 ```text
@@ -138,6 +166,7 @@ TurnGeneration
 ├── world_events         : WorldEvent[]
 ├── fact_proposals       : FactProposal[]      (optional, capped at 5)
 ├── location_proposals   : LocationProposal[]  (optional, capped at 3)
+├── situation_proposals  : SituationProposal[] (optional, capped at 2)
 └── visual_cue           : VisualCue
 ```
 
@@ -235,6 +264,35 @@ arrives in every later prompt as established geography, and is never re-imagined
 also invisible to every other save of the same world.
 
 Full semantics: [world-state-locations.md](world-state-locations.md).
+
+### Situation proposals
+
+```text
+category, subtype, title, description
+scope
+primary_location_id : an existing place, from the context
+```
+
+A process the story just set in motion. Look at what is **not** there: no `intensity`, no
+`threat`, no `momentum`, no `importance`, no `status`, and no way to name an existing
+situation.
+
+A location the story mentions is a noun. A situation is a process with three bounded
+numbers, a lifecycle and a claim on future simulation — and a model that could set those
+could declare a war at intensity 100 by writing an atmospheric sentence, or end a siege
+because the scene felt like it should be over. So the model says *what kind of thing
+began* and the application decides every number. A narrated process starts small
+(intensity 20, threat 0, momentum 20, importance 2) because it has just begun; if
+something deserves to start large, a game system starts it large.
+
+The rejected alternative was to let the model propose numbers and clamp them. Clamping
+`intensity: 100` to 40 still lets a sentence decide that a fire is severe.
+
+Capped at two per turn, and the right answer is almost always zero — a scuffle in a
+tavern is a scene, not a situation. `TurnResponse` reports `situations_started` and
+`situations_rejected`.
+
+Full semantics: [world-state-situations.md](world-state-situations.md#story-director-authority).
 
 ### Relationship deltas
 
