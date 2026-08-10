@@ -13,7 +13,8 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.persistence import (
-    ProgressionPort,
+    NarrationStorePort,
+    ResolutionStorePort,
     SessionClockPort,
     SituationPort,
     SpatialPort,
@@ -96,13 +97,29 @@ def get_situation_store(session: Annotated[AsyncSession, Depends(get_db)]) -> Si
     return SqlAlchemyTurnGateway(session)
 
 
-def get_progression_store(session: Annotated[AsyncSession, Depends(get_db)]) -> ProgressionPort:
-    """Everything a progression needs: the full state store, plus scheduling.
+def get_resolution_store(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> ResolutionStorePort:
+    """Everything one resolution can touch, behind this request's transaction.
 
-    Wider than the others on purpose, and used by exactly one endpoint -- the developer
-    tool that drives a progression by hand. A progression legitimately changes
-    situations, geography and facts together, so the port that carries it out has to be
-    able to.
+    The widest of these dependencies, and it has to be: a resolution commits its record,
+    the events it caused, the mutations it caused and the clock it moved as one unit.
+    Splitting it would leave a world that changed with nothing recording why.
+
+    Handed to `resolve()`, never to a resolver. Resolvers receive a `ResolutionContext`
+    and return an outcome; they have no port and cannot acquire one.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
+def get_narration_store(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> NarrationStorePort:
+    """The narrowest of them all: reads, plus one message.
+
+    Deliberately not `ResolutionStore`. Narration runs after the outcome is committed
+    and describes it; a port that could also write a fact or move the clock would let a
+    provider's paragraph change the thing it was supposed to be describing.
     """
     return SqlAlchemyTurnGateway(session)
 
@@ -128,7 +145,8 @@ SessionClock = Annotated[SessionClockPort, Depends(get_session_clock)]
 WorldStateStore = Annotated[StateStorePort, Depends(get_world_state_store)]
 SpatialStore = Annotated[SpatialPort, Depends(get_spatial_store)]
 SituationStore = Annotated[SituationPort, Depends(get_situation_store)]
-ProgressionStore = Annotated[ProgressionPort, Depends(get_progression_store)]
+ResolutionStore = Annotated[ResolutionStorePort, Depends(get_resolution_store)]
+NarrationStore = Annotated[NarrationStorePort, Depends(get_narration_store)]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 StoryGen = Annotated[StoryGeneratorPort, Depends(get_story_generator)]
 ImageGen = Annotated[ImageGeneratorPort, Depends(get_image_generator)]

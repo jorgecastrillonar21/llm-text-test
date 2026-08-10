@@ -18,13 +18,13 @@ from typing import Any
 import httpx
 from pydantic import ValidationError as PydanticValidationError
 
-from app.application.contracts import TurnGeneration
+from app.application.contracts import OutcomeNarration, TurnGeneration
 from app.application.ports import ProviderStatus
-from app.application.story_context import StoryContext
+from app.application.story_context import OutcomeContext, StoryContext
 from app.config import Settings
 from app.domain.errors import StoryGenerationError
 from app.infrastructure.prompts import load_prompt
-from app.infrastructure.story.rendering import render_context
+from app.infrastructure.story.rendering import render_context, render_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +46,45 @@ class OllamaStoryGenerator:
         self._client = client
 
     async def generate_turn(self, context: StoryContext) -> TurnGeneration:
-        prompt = load_prompt("story_director")
-        rendered = render_context(context)
+        parsed = await self._chat(
+            prompt_name="story_director",
+            rendered=render_context(context),
+            schema=TurnGeneration.model_json_schema(),
+        )
+        try:
+            return TurnGeneration.model_validate(parsed)
+        except PydanticValidationError as exc:
+            raise self._contract_error("TurnGeneration", exc) from exc
+
+    async def narrate_outcome(self, context: OutcomeContext) -> OutcomeNarration:
+        """Describe an already-committed outcome.
+
+        Same transport, different prompt and a far narrower schema. The narrowness is
+        the safety property: `OutcomeNarration` has one string field, so a model that
+        wanted to revise the outcome has nowhere to write it.
+        """
+        parsed = await self._chat(
+            prompt_name="outcome_narrator",
+            rendered=render_outcome(context),
+            schema=OutcomeNarration.model_json_schema(),
+        )
+        try:
+            return OutcomeNarration.model_validate(parsed)
+        except PydanticValidationError as exc:
+            raise self._contract_error("OutcomeNarration", exc) from exc
+
+    async def _chat(self, *, prompt_name: str, rendered: str, schema: dict[str, Any]) -> object:
+        """One schema-constrained chat request, decoded to plain JSON.
+
+        Validation against the contract stays with the caller: only it knows which
+        contract the reply was supposed to satisfy, and an error message that cannot
+        name it is one nobody can act on.
+        """
+        prompt = load_prompt(prompt_name)
         payload = {
             "model": self._model,
             "stream": False,
-            "format": TurnGeneration.model_json_schema(),
+            "format": schema,
             # num_ctx is not optional: Ollama's 4096 default truncates the head of the
             # prompt -- system rules, world, characters -- and says nothing.
             "options": {"temperature": self._temperature, "num_ctx": self._num_ctx},
@@ -73,7 +106,7 @@ class OllamaStoryGenerator:
             )
 
         try:
-            parsed = json.loads(content)
+            return json.loads(content)
         except json.JSONDecodeError as exc:
             raise StoryGenerationError(
                 f"Ollama returned content that is not valid JSON: {exc}. "
@@ -82,15 +115,13 @@ class OllamaStoryGenerator:
                 retryable=True,
             ) from exc
 
-        try:
-            return TurnGeneration.model_validate(parsed)
-        except PydanticValidationError as exc:
-            raise StoryGenerationError(
-                f"Ollama response did not match the TurnGeneration contract: "
-                f"{exc.error_count()} validation error(s). First: {exc.errors()[0]['msg']}",
-                provider=self.name,
-                retryable=True,
-            ) from exc
+    def _contract_error(self, contract: str, exc: PydanticValidationError) -> StoryGenerationError:
+        return StoryGenerationError(
+            f"Ollama response did not match the {contract} contract: "
+            f"{exc.error_count()} validation error(s). First: {exc.errors()[0]['msg']}",
+            provider=self.name,
+            retryable=True,
+        )
 
     def _warn_if_prompt_was_truncated(self, prompt_chars: int, data: dict[str, Any]) -> None:
         """Surface the silent context loss that num_ctx exists to prevent.

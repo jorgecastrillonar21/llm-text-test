@@ -147,6 +147,9 @@ class FailingStoryGenerator:
     async def generate_turn(self, context: object) -> object:
         raise self._error
 
+    async def narrate_outcome(self, context: object) -> object:
+        raise self._error
+
     async def status(self) -> object:  # pragma: no cover - not exercised
         raise NotImplementedError
 

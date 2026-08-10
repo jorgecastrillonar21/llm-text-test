@@ -15,6 +15,22 @@ The commit happens here, before the result is returned, rather than in a
 framework teardown hook that would run after the response was already sent. A
 client that re-reads the transcript on success always sees its own write.
 
+Idempotency: a turn carrying a `client_action_id` records a `ResolutionRecord` under
+that key, and `(session_id, idempotency_key)` is unique in the database. A retry of the
+same submission finds that record and returns the turn's stored transcript -- the
+provider is not called again, no second event is written, no second fact is
+established. That is the whole reason the record exists here; see
+`app.application.resolution_service` for the same mechanism around Commands.
+
+# The turn is not a Command, and its record says so
+
+There is no Intent Interpreter in this build, so a free-text action is not parsed into
+a `Command` and no mechanical resolver runs. What happens instead is that the Story
+Director *proposes* -- facts, places, situations, events -- and the application reviews
+each proposal against policy. The `ResolutionRecord` a turn writes describes that
+review, under `resolver_name="turn"`. It is deliberately not a claim that the prose
+resolved anything mechanically: the model narrates, and the reviewers decide.
+
 This module knows nothing about SQLAlchemy or the database schema: it depends on
 app.application.persistence, which app.infrastructure implements.
 """
@@ -26,30 +42,56 @@ import uuid
 
 from pydantic import BaseModel
 
-from app.application.context_builder import build_story_context
+from app.application.context_builder import CHARACTER_LIMIT, build_story_context
 from app.application.contracts import DialogueLine, TurnGeneration
+from app.application.event_service import ReviewedEvent, select_events, write_events
 from app.application.fact_proposals import ProposalReview, review_fact_proposals
 from app.application.location_proposals import review_location_proposals
 from app.application.persistence import (
-    NewEvent,
     NewMemory,
     NewMessage,
+    NewResolution,
     SessionSnapshot,
     TurnGatewayPort,
     WorldSnapshot,
 )
 from app.application.ports import StoryGeneratorPort
 from app.application.situation_proposals import review_situation_proposals
-from app.application.state_service import stage_state_change
+from app.application.state_service import ChangeCause, stage_state_change
 from app.domain.enums import MessageRole
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector, clamp_delta
+from app.domain.resolution import (
+    MAX_IDEMPOTENCY_KEY_LENGTH,
+    EventCandidate,
+    Resolution,
+    ResolutionDisposition,
+    ResolutionSourceType,
+)
 from app.domain.state_mutations import StateMutationBatch
 from app.domain.world_facts import FactAuthority
 
 logger = logging.getLogger(__name__)
 
 MAX_ACTION_LENGTH = 2000
+
+MAX_CLIENT_ACTION_ID_LENGTH = MAX_IDEMPOTENCY_KEY_LENGTH - len("turn:")
+
+TURN_RESOLVER_NAME = "turn"
+TURN_RESOLVER_VERSION = "1"
+"""What the `ResolutionRecord` of a turn is attributed to.
+
+Not the model, and not the prompt version. What decided the mechanical outcome of a
+turn is the proposal review pipeline -- `fact_proposals`, `location_proposals`,
+`situation_proposals` and the event policy -- and that is the thing whose behaviour a
+future reader would need to know the version of. The prose is narration; it is recorded
+as messages, which is where prose belongs.
+"""
+
+UNKNOWN_SPEAKER = "Unknown"
+"""Used only when replaying a character line whose character has since been deleted.
+The speaker label a model chose is not stored -- the character id is -- so a replayed
+line is labelled from the character record, and a missing record has no name to give."""
 
 
 class TurnMessage(BaseModel):
@@ -92,6 +134,24 @@ class TurnResult(BaseModel):
     situations_rejected: int
     visual_cue_generated: bool
 
+    resolution_id: uuid.UUID
+    """The record of what this turn's proposals established.
+
+    Always present. A turn submitted without a `client_action_id` is recorded too, under
+    a key derived from its turn index -- it is simply not *replayable*, which is a
+    different thing from unrecorded. See `_record_turn_resolution`."""
+
+    replayed: bool = False
+    """True when this response is a previously played turn, returned because the same
+    `client_action_id` arrived twice. The transcript is the original one, re-read.
+
+    Suggestions and the per-stage counts come back empty on a replay, because they are
+    not stored: a suggestion is an affordance the player can ignore, and persisting
+    model output that nothing else reads in order to make a retry byte-identical would
+    be storing it for the benefit of the retry alone. `events_created` and
+    `facts_established` survive, because the `ResolutionRecord` counted them.
+    """
+
 
 async def execute_turn(
     gateway: TurnGatewayPort,
@@ -99,12 +159,26 @@ async def execute_turn(
     session_id: uuid.UUID,
     action: str,
     generator: StoryGeneratorPort,
+    client_action_id: str | None = None,
 ) -> TurnResult:
+    """Play one turn, or return the one this submission already played.
+
+    `client_action_id` is the client's stable name for *this submission* -- not for the
+    request that carries it. A transport retry must send the same id, and a genuinely
+    new action must send a new one; the server has no way to tell those apart and must
+    not guess. Omitting it is allowed and means the turn is not replayable: the record
+    is still written, under a key derived from the turn index, but a retry with no id
+    plays a second turn.
+    """
     cleaned = action.strip()
     if not cleaned:
         raise ValidationError("Action must not be empty.")
     if len(cleaned) > MAX_ACTION_LENGTH:
         raise ValidationError(f"Action must be at most {MAX_ACTION_LENGTH} characters.")
+    if client_action_id is not None and len(client_action_id) > MAX_CLIENT_ACTION_ID_LENGTH:
+        raise ValidationError(
+            f"client_action_id must be at most {MAX_CLIENT_ACTION_ID_LENGTH} characters."
+        )
 
     session = await gateway.get_session(session_id)
     if session is None:
@@ -113,6 +187,21 @@ async def execute_turn(
     world = await gateway.get_world(session.world_id)
     if world is None:  # FK guarantees this, but the type checker does not.
         raise NotFoundError("World", session.world_id)
+
+    if client_action_id:
+        # Before anything: before the player's message is staged, and long before the
+        # provider is called. A replay that got as far as generating would have paid for
+        # the model run it exists to avoid.
+        played = await gateway.find_resolution_by_key(session_id, _turn_key(client_action_id))
+        if played is not None:
+            logger.info(
+                "Turn for client_action_id %r on session %s was already played "
+                "(resolution %s); returning it.",
+                client_action_id,
+                session_id,
+                played.id,
+            )
+            return await _replay_turn(gateway, session=session, world=world, resolution=played)
 
     turn_index = session.turn_index + 1
 
@@ -206,7 +295,21 @@ async def execute_turn(
 
     memories_created = await _persist_memories(gateway, session, generation, known_character_ids)
     relationships = await _apply_relationships(gateway, session, generation, known_character_ids)
-    events_created = await _persist_events(gateway, session, generation, turn_index)
+
+    # Reviewed here, written after the resolution row exists: events carry its foreign
+    # key, and the row has to state how many events it produced. Deciding first and
+    # writing second is what lets `event_count` be the truth rather than a count of what
+    # was offered before policy dropped half of it.
+    selected_events = await select_events(
+        gateway,
+        session_id=session.id,
+        # A turn does not move the clock, so everything it records happens at the
+        # session's current fictional minute. Turn index and fictional time are stamped
+        # separately because they answer different questions -- and because a later
+        # action that costs eight hours will make them diverge sharply.
+        occurred_at=session.elapsed_minutes,
+        candidates=_event_candidates(generation),
+    )
 
     # Places, then situations, then facts. Each stage may name something the previous
     # one established: a situation can be centred on a location this turn created, and
@@ -225,8 +328,37 @@ async def execute_turn(
         # A turn does not move the clock, so anything it starts starts now.
         started_at=session.elapsed_minutes,
     )
-    review = await _establish_proposed_facts(
-        gateway, session, world, generation, known_character_ids
+    review = await review_fact_proposals(
+        gateway,
+        session_id=session.id,
+        world=world,
+        proposals=generation.fact_proposals,
+        known_character_ids=known_character_ids,
+    )
+
+    resolution_id = await _record_turn_resolution(
+        gateway,
+        session=session,
+        turn_index=turn_index,
+        client_action_id=client_action_id,
+        events=selected_events,
+        mutation_count=len(review.accepted),
+    )
+    event_ids = await write_events(
+        gateway,
+        session_id=session.id,
+        turn_index=turn_index,
+        occurred_at=session.elapsed_minutes,
+        reviewed=selected_events,
+        resolution_id=resolution_id,
+    )
+    await _establish_proposed_facts(
+        gateway,
+        session=session,
+        review=review,
+        cause=ChangeCause(
+            resolution_id=resolution_id, event_id=event_ids[0] if event_ids else None
+        ),
     )
 
     await gateway.set_turn_index(session.id, turn_index)
@@ -243,7 +375,7 @@ async def execute_turn(
         suggested_actions=generation.suggested_actions,
         relationships=relationships,
         memories_created=memories_created,
-        events_created=events_created,
+        events_created=len(event_ids),
         facts_established=len(review.accepted),
         facts_rejected=len(review.reviewed) - len(review.accepted),
         locations_created=len(places.created),
@@ -251,40 +383,186 @@ async def execute_turn(
         situations_started=len(situations.created),
         situations_rejected=len(situations.reviewed) - len(situations.created),
         visual_cue_generated=generation.visual_cue.generate,
+        resolution_id=resolution_id,
+    )
+
+
+def _turn_key(client_action_id: str) -> str:
+    """The idempotency key a turn is recorded under.
+
+    Namespaced, so a client cannot pick a string that collides with a key the engine
+    mints for something else -- `dev:progress:...`, and whatever a future command
+    scheduler uses.
+    """
+    return f"turn:{client_action_id}"
+
+
+def _event_candidates(generation: TurnGeneration) -> list[EventCandidate]:
+    """The model's proposed events, in the vocabulary the policy speaks.
+
+    A straight translation, deliberately. Nothing here decides whether an event is worth
+    keeping or what it is worth -- `select_events` does both, against a registry the
+    model cannot see. See `app.application.event_service`.
+    """
+    return [
+        EventCandidate(
+            category=proposed.category,
+            subtype=proposed.subtype,
+            summary=proposed.summary,
+            importance=proposed.importance,
+        )
+        for proposed in generation.world_events
+    ]
+
+
+async def _record_turn_resolution(
+    gateway: TurnGatewayPort,
+    *,
+    session: SessionSnapshot,
+    turn_index: int,
+    client_action_id: str | None,
+    events: list[ReviewedEvent],
+    mutation_count: int,
+) -> uuid.UUID:
+    """Write the one record that says what this turn's proposals established.
+
+    `applied` when something survived review, `no_effect` when nothing did -- which is
+    most turns, and is the honest answer for an exchange that was entirely conversation.
+    Not `rejected`: nothing about the turn was refused by the world's rules. A refused
+    individual proposal is a review outcome, not a resolution disposition, and inflating
+    one into the other would fill the mechanical trail with rows claiming the world said
+    no to things nobody attempted.
+
+    The revision is projected rather than read back. `stage_state_change` bumps it
+    exactly once per batch and a turn stages at most one, so `+1` when facts survived is
+    knowable here -- and the record has to exist before the events that point at it.
+    """
+    changed = bool(events) or bool(mutation_count)
+    revision_before = session.state_revision
+    return await gateway.add_resolution(
+        NewResolution(
+            session_id=session.id,
+            source_type=ResolutionSourceType.PLAYER_ACTION,
+            # A turn without a client id is still recorded, under a key that is unique
+            # per session because turn indexes are. It is simply not replayable: a retry
+            # arrives with no id, matches nothing, and plays a second turn.
+            idempotency_key=(
+                _turn_key(client_action_id) if client_action_id else f"turn-index:{turn_index}"
+            ),
+            disposition=(
+                ResolutionDisposition.APPLIED if changed else ResolutionDisposition.NO_EFFECT
+            ),
+            resolver_name=TURN_RESOLVER_NAME,
+            resolver_version=TURN_RESOLVER_VERSION,
+            state_revision_before=revision_before,
+            state_revision_after=revision_before + 1 if mutation_count else revision_before,
+            occurred_at=session.elapsed_minutes,
+            turn_index=turn_index,
+            event_count=len(events),
+            mutation_count=mutation_count,
+        )
     )
 
 
 async def _establish_proposed_facts(
     gateway: TurnGatewayPort,
+    *,
     session: SessionSnapshot,
-    world: WorldSnapshot,
-    generation: TurnGeneration,
-    known_character_ids: set[uuid.UUID],
-) -> ProposalReview:
-    """Review what the model claims the turn established, and store what survives.
+    review: ProposalReview,
+    cause: ChangeCause,
+) -> None:
+    """Store the fact proposals that survived review.
 
     Staged, not committed: these facts are part of the turn, and a turn is atomic. No
     GameEvent is minted for them either -- the turn is already the event that produced
     them, and a `FACT_CREATED` row for "Elena dislikes olives" would bury the history
     that matters under the history that does not. `story_director` is exempt from the
     source-event requirement for exactly this case; see `world_facts.authority`.
+
+    The cause is still recorded: the turn's own resolution, and the first event it wrote
+    when it wrote one. That is what makes "why is this true?" answerable without a
+    GameEvent per fact.
     """
-    review = await review_fact_proposals(
+    if not review.accepted:
+        return
+    await stage_state_change(
         gateway,
         session_id=session.id,
-        world=world,
-        proposals=generation.fact_proposals,
-        known_character_ids=known_character_ids,
+        batch=StateMutationBatch(
+            authority=FactAuthority.STORY_DIRECTOR, mutations=list(review.accepted)
+        ),
+        cause=cause,
     )
-    if review.accepted:
-        await stage_state_change(
-            gateway,
-            session_id=session.id,
-            batch=StateMutationBatch(
-                authority=FactAuthority.STORY_DIRECTOR, mutations=list(review.accepted)
-            ),
-        )
-    return review
+
+
+async def _replay_turn(
+    gateway: TurnGatewayPort,
+    *,
+    session: SessionSnapshot,
+    world: WorldSnapshot,
+    resolution: Resolution,
+) -> TurnResult:
+    """Rebuild an already-played turn from what was stored, without re-running anything.
+
+    The transcript is real -- these are the rows the original turn wrote. What is not
+    reconstructed is anything that was never persisted: suggestions, and the per-stage
+    review counts. Those come back empty rather than being guessed at, because a
+    plausible-looking count is worse than an obviously absent one.
+
+    Character lines are labelled from the character record rather than from the label
+    the model used, which is not stored. For the overwhelmingly common case those are
+    the same string.
+    """
+    turn_index = resolution.turn_index if resolution.turn_index is not None else session.turn_index
+    stored = await gateway.load_turn_messages(session.id, turn_index)
+    names = {
+        character.id: character.name
+        for character in await gateway.load_characters(world.id, limit=CHARACTER_LIMIT)
+    }
+
+    return TurnResult(
+        session_id=session.id,
+        turn_index=turn_index,
+        messages=[
+            TurnMessage(
+                id=message.id,
+                turn_index=message.turn_index,
+                role=message.role,
+                speaker=_replayed_speaker(
+                    message.role, message.speaker_character_id, names, session
+                ),
+                speaker_character_id=message.speaker_character_id,
+                content=message.content,
+            )
+            for message in stored
+        ],
+        suggested_actions=[],
+        relationships=[],
+        memories_created=0,
+        events_created=resolution.event_count,
+        facts_established=resolution.mutation_count,
+        facts_rejected=0,
+        locations_created=0,
+        locations_rejected=0,
+        situations_started=0,
+        situations_rejected=0,
+        visual_cue_generated=False,
+        resolution_id=resolution.id,
+        replayed=True,
+    )
+
+
+def _replayed_speaker(
+    role: MessageRole,
+    character_id: uuid.UUID | None,
+    names: dict[uuid.UUID, str],
+    session: SessionSnapshot,
+) -> str:
+    if role is MessageRole.PLAYER:
+        return session.player_name
+    if role is MessageRole.NARRATOR or character_id is None:
+        return "Narrator" if role is MessageRole.NARRATOR else UNKNOWN_SPEAKER
+    return names.get(character_id, UNKNOWN_SPEAKER)
 
 
 def _is_the_player_speaking(line: DialogueLine, session: SessionSnapshot) -> bool:
@@ -371,27 +649,3 @@ async def _apply_relationships(
         )
 
     return applied
-
-
-async def _persist_events(
-    gateway: TurnGatewayPort,
-    session: SessionSnapshot,
-    generation: TurnGeneration,
-    turn_index: int,
-) -> int:
-    for event in generation.world_events:
-        await gateway.add_event(
-            NewEvent(
-                session_id=session.id,
-                turn_index=turn_index,
-                # A turn does not move the clock, so everything it records happens at
-                # the session's current fictional minute. Turn index and fictional
-                # time are stamped separately because they answer different
-                # questions -- and because a later action that costs eight hours will
-                # make them diverge sharply.
-                occurred_at=session.elapsed_minutes,
-                type=event.type,
-                description=event.description,
-            )
-        )
-    return len(generation.world_events)

@@ -1,8 +1,13 @@
-"""The structured contract every story provider must satisfy.
+"""The structured contracts every story provider must satisfy.
 
-`TurnGeneration` is the single source of truth for what a model may return. It is
-validated on the way in from any provider, and its JSON Schema is what Ollama is
+`TurnGeneration` is the single source of truth for what a model may return for a turn.
+It is validated on the way in from any provider, and its JSON Schema is what Ollama is
 constrained to. The model proposes; the application layer decides what to persist.
+
+`OutcomeNarration` is the other direction of the same rule. Where a turn's prose comes
+first and the application reviews what it proposed, a resolution's mechanics are already
+committed and the prose only describes them. That contract is one field wide, because
+there is nothing left for the model to decide.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.domain.enums import MemoryKind
 from app.domain.relationships import DELTA_MAX, DELTA_MIN
+from app.domain.resolution import EventCategory
 from app.domain.world_facts import FactSubjectType
 from app.domain.world_locations import LocationCategory, LocationScale
 from app.domain.world_situations import SituationCategory, SituationScope
@@ -23,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 MAX_SUGGESTED_ACTIONS = 4
 MAX_FACT_PROPOSALS = 5
+
+MAX_WORLD_EVENTS = 5
+"""A turn where five separate things became world history is already a busy turn.
+The cap is on the contract rather than on the reviewer, so a model that decides every
+sentence was historic costs one truncation instead of fifty policy lookups."""
+
 MAX_LOCATION_PROPOSALS = 3
 """Lower than the fact cap. A turn that invents three new places has stopped
 narrating a scene and started drawing a map."""
@@ -32,6 +44,12 @@ MAX_SITUATION_PROPOSALS = 2
 it is writing a season finale, and the cost of a wrong one is far higher than a
 spurious bookshop: a situation persists, reaches future prompts and asks to be
 simulated."""
+
+MAX_NARRATION_LENGTH = 4000
+"""Ceiling for one paragraph of outcome narration. A cap rather than a target: an
+outcome is a moment, and a model that produced four thousand characters about one has
+started inventing what happened next. Only the outcome narrator is bounded this way --
+a turn's narration is the story itself and is left alone."""
 
 
 class DialogueLine(BaseModel):
@@ -73,10 +91,34 @@ class RelationshipChange(BaseModel):
 
 
 class WorldEvent(BaseModel):
+    """Something the model believes just happened and is worth remembering.
+
+    A *proposal*, like `FactProposal`. Whether history keeps it, and at what importance,
+    is decided by `app.application.event_service` against a policy the model cannot see.
+    That split is not politeness: a model asked to rate what it has just written rates
+    all of it highly, so a spilled drink and a coronation both arrive at importance 5.
+
+    `subtype` is an open string rather than a menu, because the alternative is an enum
+    of several hundred event names that is wrong the first time anyone adds a system.
+    Unregistered subtypes get the conservative default policy -- remembered, but not
+    permitted to declare themselves landmarks.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
-    type: str = Field(min_length=1, max_length=80)
-    description: str = Field(min_length=1, max_length=500)
+    category: EventCategory = EventCategory.OTHER
+    """The coarse kind. Defaults to `other` rather than to a guess: a model that did not
+    pick a category has not told us anything, and `other` says so."""
+
+    subtype: str = Field(min_length=1, max_length=80)
+    """A short snake_case name for what happened: `bridge_collapsed`, not a sentence."""
+
+    summary: str = Field(min_length=1, max_length=500)
+    """One line, for people and models to read. Never parsed for mechanics."""
+
+    importance: int | None = Field(default=None, ge=1, le=5)
+    """A suggestion. Policy clamps it into the band its subtype allows, and `None`
+    means "no opinion", which is the honest answer most of the time."""
 
 
 class FactProposal(BaseModel):
@@ -303,6 +345,36 @@ class TurnGeneration(BaseModel):
         cleaned = [item.strip() for item in value if item.strip()]
         return cleaned[:MAX_SUGGESTED_ACTIONS]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_unusable_world_events(cls, data: object) -> object:
+        """Same judgement as `_drop_unusable_fact_proposals`, same reasoning.
+
+        A model that sends `category: "epic"` has got one enum wrong. Failing the turn
+        over it would roll back real narration and show the player a 502 because a
+        history entry was mislabelled.
+        """
+        if not isinstance(data, dict) or "world_events" not in data:
+            return data
+
+        raw = data["world_events"]
+        if not isinstance(raw, list):
+            logger.warning("Story provider sent world_events as %s; ignored.", type(raw).__name__)
+            return {**data, "world_events": []}
+
+        kept: list[WorldEvent] = []
+        for item in raw:
+            try:
+                kept.append(WorldEvent.model_validate(item))
+            except PydanticValidationError as exc:
+                logger.warning("Story provider sent an unusable world event; dropped. %s", exc)
+        return {**data, "world_events": kept}
+
+    @field_validator("world_events")
+    @classmethod
+    def _cap_world_events(cls, value: list[WorldEvent]) -> list[WorldEvent]:
+        return value[:MAX_WORLD_EVENTS]
+
     @field_validator("fact_proposals")
     @classmethod
     def _cap_proposals(cls, value: list[FactProposal]) -> list[FactProposal]:
@@ -377,3 +449,23 @@ class TurnGeneration(BaseModel):
     @classmethod
     def _cap_situations(cls, value: list[SituationProposal]) -> list[SituationProposal]:
         return value[:MAX_SITUATION_PROPOSALS]
+
+
+class OutcomeNarration(BaseModel):
+    """Prose describing an outcome the game has already committed.
+
+    One field, and that is the whole point. A turn's contract is wide because the model
+    is proposing things the application will review; this one is narrow because there is
+    nothing left to propose. The mechanics happened, the events are written, the state
+    revision has moved -- what remains is a paragraph, and a schema with anywhere for the
+    model to write a number would be an invitation to disagree with the outcome it was
+    given.
+
+    Deliberately absent: events, facts, suggestions, relationship changes, and anything
+    resembling a disposition. A narrator that could emit those would be resolving the
+    action a second time, in prose, after the first resolution was already permanent.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    narration: str = Field(min_length=1, max_length=MAX_NARRATION_LENGTH)

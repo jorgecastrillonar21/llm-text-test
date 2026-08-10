@@ -12,11 +12,15 @@ import uuid
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.persistence import NewLocation
-from app.application.progression_service import (
+from app.application.persistence import NewLocation, ResolutionStorePort
+from app.application.resolution_service import (
+    ResolutionRequest,
+    ResolutionResult,
+    resolve,
+)
+from app.application.resolvers import (
     SITUATION_PROGRESS_DUE_EVENT,
     SITUATION_PROGRESSED_EVENT,
-    evaluate_and_apply,
 )
 from app.application.situation_context import (
     MAX_SITUATIONS_IN_CONTEXT,
@@ -33,8 +37,13 @@ from app.application.situation_service import (
     start_situation,
 )
 from app.application.spatial_service import create_location
-from app.application.state_service import StateChangeEvent, apply_state_change
+from app.application.state_service import apply_state_change
 from app.domain.errors import NotFoundError, StaleStateError, ValidationError
+from app.domain.resolution import (
+    ProgressSituationCommand,
+    ResolutionDisposition,
+    ResolutionSourceType,
+)
 from app.domain.situation_progression import GeneratedEvent, SituationProgressionResult
 from app.domain.state_mutations import StateMutationBatch
 from app.domain.world_facts import FactAuthority
@@ -62,6 +71,7 @@ from app.domain.world_situations import (
 )
 from app.infrastructure.db import models
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
+from tests.support import cause_from_event, cause_from_resolution
 
 from .test_world_situations import make_situation
 
@@ -82,6 +92,35 @@ async def _world_and_session(
     await db_session.commit()
     # Captured before the commit expires the instances.
     return world.id, session.id
+
+
+async def _progress(
+    store: ResolutionStorePort,
+    session_id: uuid.UUID,
+    situation_id: uuid.UUID,
+    *,
+    trigger: ProgressionTrigger = ProgressionTrigger.SCHEDULED,
+    key: str | None = None,
+) -> ResolutionResult:
+    """Run one situation forward through the real pipeline.
+
+    The interval is not passed: the resolver derives it from the situation's own
+    `last_progressed_at` and the session clock, which is the property that stops a
+    caller evaluating the same six hours twice. Tests set the clock and then ask.
+
+    A fresh idempotency key by default, because most of these tests want a resolution
+    rather than a replay. The ones testing replay pass their own.
+    """
+    return await resolve(
+        store,
+        request=ResolutionRequest(
+            session_id=session_id,
+            command=ProgressSituationCommand(situation_id=situation_id, trigger=trigger),
+            idempotency_key=key or f"test:{uuid.uuid4()}",
+            source_type=ResolutionSourceType.SITUATION_PROGRESSION,
+            source_id=situation_id,
+        ),
+    )
 
 
 def _siege(**overrides: object) -> StartSituation:
@@ -168,7 +207,7 @@ async def test_a_situation_cannot_be_mutated_from_another_session(
                 authority=FactAuthority.ENGINE,
                 mutations=[UpdateSituation(situation_id=situation_id, intensity_delta=50)],
             ),
-            event=StateChangeEvent(type="test", description="reaching across saves"),
+            cause=cause_from_resolution(),
         )
 
 
@@ -467,7 +506,7 @@ async def test_deltas_are_applied_to_the_stored_value_and_clamped(
                 UpdateSituation(situation_id=situation_id, intensity_delta=40, threat_delta=-100)
             ],
         ),
-        event=StateChangeEvent(type="SIEGE_TIGHTENS", description="They took the outer wall."),
+        cause=cause_from_resolution(),
     )
 
     stored = await store.get_situation(session_id, situation_id)
@@ -519,7 +558,7 @@ async def test_resolving_records_when_it_ended_and_keeps_the_row(
                 )
             ],
         ),
-        event=StateChangeEvent(type="SIEGE_LIFTED", description="The siege lifted."),
+        cause=cause_from_resolution(),
     )
 
     stored = await store.get_situation(session_id, situation_id)
@@ -548,7 +587,7 @@ async def test_a_concluded_situation_cannot_be_updated(
             authority=FactAuthority.ENGINE,
             mutations=[ResolveSituation(situation_id=situation_id, reason="It ended.")],
         ),
-        event=StateChangeEvent(type="SIEGE_LIFTED", description="Over."),
+        cause=cause_from_resolution(),
     )
 
     with pytest.raises(ValidationError, match="cannot be updated"):
@@ -559,7 +598,7 @@ async def test_a_concluded_situation_cannot_be_updated(
                 authority=FactAuthority.ENGINE,
                 mutations=[UpdateSituation(situation_id=situation_id, intensity_delta=10)],
             ),
-            event=StateChangeEvent(type="test", description="reanimating a siege"),
+            cause=cause_from_resolution(),
         )
 
 
@@ -587,7 +626,7 @@ async def test_an_invalid_transition_is_refused_before_anything_is_written(
                     )
                 ],
             ),
-            event=StateChangeEvent(type="test", description="un-starting a siege"),
+            cause=cause_from_resolution(),
         )
 
     after = await store.get_session(session_id)
@@ -622,6 +661,7 @@ async def test_one_batch_changes_a_situation_a_place_and_starts_a_child(
     before = await store.get_session(session_id)
     assert before is not None
 
+    cause = await cause_from_event(store, session_id, subtype="east_gate_fell")
     result = await apply_state_change(
         store,
         session_id=session_id,
@@ -642,12 +682,13 @@ async def test_one_batch_changes_a_situation_a_place_and_starts_a_child(
                 ),
             ],
         ),
-        event=StateChangeEvent(type="EAST_GATE_BREACHED", description="The eastern gate fell."),
+        cause=cause,
     )
 
-    # One event, one revision bump, for five things happening.
+    # One revision bump for three things happening, all attributed to the one event
+    # that caused them.
     assert result.revision == before.state_revision + 1
-    assert result.event_id is not None
+    assert result.event_id == cause.event_id
     assert len(result.applied) == 3
 
     started = [entry for entry in result.applied if entry.op == "start_situation"]
@@ -699,7 +740,7 @@ async def test_a_batch_that_fails_partway_leaves_nothing_behind(
                     UpdateSituation(situation_id=uuid.uuid4(), intensity_delta=10),
                 ],
             ),
-            event=StateChangeEvent(type="EAST_GATE_BREACHED", description="It fell."),
+            cause=cause_from_resolution(),
         )
     await db_session.rollback()
 
@@ -730,7 +771,7 @@ async def test_a_stale_revision_refuses_the_batch(db_session: AsyncSession, make
                 expected_revision=99,
                 mutations=[UpdateSituation(situation_id=situation_id, intensity_delta=1)],
             ),
-            event=StateChangeEvent(type="test", description="stale"),
+            cause=cause_from_resolution(),
         )
 
 
@@ -753,18 +794,13 @@ async def test_progression_moves_intensity_by_momentum_and_decays_momentum(
     await store.set_elapsed_minutes(session_id, 360)
     await db_session.commit()
 
-    outcome = await evaluate_and_apply(
-        store,
-        session_id=session_id,
-        request=SituationProgressionRequest(
-            situation_id=siege, from_time=0, to_time=360, trigger=ProgressionTrigger.SCHEDULED
-        ),
-    )
+    result = await _progress(store, session_id, siege)
 
-    assert outcome.applied is not None
-    assert outcome.result.deltas.intensity_delta > 0
+    assert result.disposition is ResolutionDisposition.APPLIED
+    assert result.outcome is not None
+    assert result.outcome.narrative_context["intensity_delta"] > 0
     # Towards zero, never past it.
-    assert -60 < outcome.result.deltas.momentum_delta < 0
+    assert -60 < result.outcome.narrative_context["momentum_delta"] < 0
 
     stored = await store.get_situation(session_id, siege)
     assert stored is not None
@@ -793,14 +829,9 @@ async def test_a_negative_momentum_process_shrinks(db_session: AsyncSession, mak
     await store.set_elapsed_minutes(session_id, 360)
     await db_session.commit()
 
-    outcome = await evaluate_and_apply(
-        store,
-        session_id=session_id,
-        request=SituationProgressionRequest(
-            situation_id=fire, from_time=0, to_time=360, trigger=ProgressionTrigger.SCHEDULED
-        ),
-    )
-    assert outcome.result.deltas.intensity_delta < 0
+    result = await _progress(store, session_id, fire)
+    assert result.outcome is not None
+    assert result.outcome.narrative_context["intensity_delta"] < 0
     stored = await store.get_situation(session_id, fire)
     assert stored is not None and stored.intensity < 60
 
@@ -839,15 +870,14 @@ async def test_a_world_that_does_not_move_without_the_player_does_not_move(
     before = await store.get_session(session_id)
     assert before is not None
 
-    outcome = await evaluate_and_apply(
-        store,
-        session_id=session_id,
-        request=SituationProgressionRequest(
-            situation_id=siege, from_time=0, to_time=4320, trigger=ProgressionTrigger.SIMULATION
-        ),
-    )
-    assert outcome.applied is None
-    assert "world waits" in outcome.result.notes
+    result = await _progress(store, session_id, siege, trigger=ProgressionTrigger.SIMULATION)
+
+    # `no_effect`, not `rejected`. The pass ran and the world's rules had nothing to
+    # refuse -- a world that waits for the player simply produced no change, which is a
+    # different thing from an action the rules forbade.
+    assert result.disposition is ResolutionDisposition.NO_EFFECT
+    assert result.resolution.reason_code == "no_change"
+    assert result.events == []
     after = await store.get_session(session_id)
     assert after is not None and after.state_revision == before.state_revision
 
@@ -888,18 +918,11 @@ async def test_a_dormant_process_does_not_drift(db_session: AsyncSession, make_w
     await store.set_elapsed_minutes(session_id, 10_000)
     await db_session.commit()
 
-    outcome = await evaluate_and_apply(
-        store,
-        session_id=session_id,
-        request=SituationProgressionRequest(
-            situation_id=conspiracy,
-            from_time=0,
-            to_time=10_000,
-            trigger=ProgressionTrigger.SIMULATION,
-        ),
-    )
-    assert outcome.applied is None
-    assert outcome.result.is_noop()
+    result = await _progress(store, session_id, conspiracy, trigger=ProgressionTrigger.SIMULATION)
+    assert result.disposition is ResolutionDisposition.NO_EFFECT
+    assert result.changed_state is False
+    stored = await store.get_situation(session_id, conspiracy)
+    assert stored is not None and stored.momentum == 50
 
 
 async def test_a_concluded_situation_cannot_progress(db_session: AsyncSession, make_world) -> None:
@@ -913,7 +936,7 @@ async def test_a_concluded_situation_cannot_progress(db_session: AsyncSession, m
             authority=FactAuthority.ENGINE,
             mutations=[ResolveSituation(situation_id=siege, reason="It ended.")],
         ),
-        event=StateChangeEvent(type="SIEGE_LIFTED", description="Over."),
+        cause=cause_from_resolution(),
     )
 
     with pytest.raises(ValidationError, match="cannot progress"):
@@ -964,15 +987,9 @@ async def test_a_progression_schedules_its_next_evaluation_in_absolute_time(
     await store.set_elapsed_minutes(session_id, 60)
     await db_session.commit()
 
-    outcome = await evaluate_and_apply(
-        store,
-        session_id=session_id,
-        request=SituationProgressionRequest(
-            situation_id=fire, from_time=0, to_time=60, trigger=ProgressionTrigger.SCHEDULED
-        ),
-    )
-    assert outcome.scheduled_event_id is not None
-    stored = await store.get_scheduled_event(outcome.scheduled_event_id)
+    result = await _progress(store, session_id, fire)
+    assert len(result.scheduled_event_ids) == 1
+    stored = await store.get_scheduled_event(result.scheduled_event_ids[0])
     assert stored is not None
     assert stored.type == SITUATION_PROGRESS_DUE_EVENT
     # Absolute, not a delay, and a hazard is looked at again soon.
@@ -981,13 +998,20 @@ async def test_a_progression_schedules_its_next_evaluation_in_absolute_time(
     assert stored.interrupt_player_action is False
 
 
-async def test_a_resolver_event_becomes_the_batch_event(
+async def test_a_resolver_event_becomes_the_events_history_keeps(
     db_session: AsyncSession, make_world
 ) -> None:
-    """`EAST_GATE_BREACHED` is a better history entry than "the siege progressed"."""
+    """`east_gate_breached` is a better history entry than "the siege progressed".
+
+    And the generic one is not written alongside it -- not because it was suppressed
+    here, but because a resolver that named what happened is not also asked for a
+    fallback. The fallback's own policy is `NONE`, so even when it is the only thing
+    on offer history keeps nothing.
+    """
     _, session_id = await _world_and_session(db_session, make_world)
     store = SqlAlchemyTurnGateway(db_session)
     siege = await start_situation(store, session_id=session_id, mutation=_siege(), started_at=0)
+    await store.set_elapsed_minutes(session_id, 60)
     await db_session.commit()
 
     class BreachResolver:
@@ -996,7 +1020,7 @@ async def test_a_resolver_event_becomes_the_batch_event(
                 situation_id=context.situation.id,
                 deltas=SituationDeltas(intensity_delta=12),
                 generated_events=(
-                    GeneratedEvent(type="EAST_GATE_BREACHED", description="The gate fell."),
+                    GeneratedEvent(type="east_gate_breached", description="The gate fell."),
                 ),
             )
 
@@ -1004,21 +1028,43 @@ async def test_a_resolver_event_becomes_the_batch_event(
 
     situation_service._RESOLVERS[(SituationCategory.CONFLICT, "siege")] = BreachResolver()
     try:
-        outcome = await evaluate_and_apply(
-            store,
-            session_id=session_id,
-            request=SituationProgressionRequest(
-                situation_id=siege, from_time=0, to_time=60, trigger=ProgressionTrigger.SCHEDULED
-            ),
-        )
+        result = await _progress(store, session_id, siege)
     finally:
         del situation_service._RESOLVERS[(SituationCategory.CONFLICT, "siege")]
 
-    assert outcome.applied is not None and outcome.applied.event_id is not None
-    rows = (await db_session.execute(models.GameEvent.__table__.select())).all()
-    types = {row.type for row in rows}
-    assert "EAST_GATE_BREACHED" in types
-    assert SITUATION_PROGRESSED_EVENT not in types
+    assert result.disposition is ResolutionDisposition.APPLIED
+    subtypes = {event.subtype for event in result.events}
+    assert "east_gate_breached" in subtypes
+    assert SITUATION_PROGRESSED_EVENT not in subtypes
+    # And the event points back at the verdict that produced it.
+    assert all(event.resolution_id == result.resolution.id for event in result.events)
+
+
+async def test_a_progression_with_nothing_to_say_writes_no_history(
+    db_session: AsyncSession, make_world
+) -> None:
+    """The generic subtype is registered `NONE`, so the world moved and history did not.
+
+    This is the case the event policy exists for. The intensity really did change and
+    the revision really did move -- the `ResolutionRecord` says so -- but "the siege
+    progressed" is the engine narrating its own bookkeeping, and a year of it would
+    bury everything worth reading.
+    """
+    _, session_id = await _world_and_session(db_session, make_world)
+    store = SqlAlchemyTurnGateway(db_session)
+    siege = await start_situation(
+        store, session_id=session_id, mutation=_siege(momentum=60), started_at=0
+    )
+    await store.set_elapsed_minutes(session_id, 360)
+    await db_session.commit()
+
+    result = await _progress(store, session_id, siege)
+
+    assert result.disposition is ResolutionDisposition.APPLIED
+    assert result.events == []
+    assert result.resolution.event_count == 0
+    assert result.resolution.mutation_count >= 1
+    assert result.changed_state is True
 
 
 # ---------------------------------------------------------------------------

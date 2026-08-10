@@ -25,6 +25,11 @@ from sqlalchemy.types import JSON
 
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import AXIS_MAX, AXIS_MIN
+from app.domain.resolution import (
+    EventCategory,
+    ResolutionDisposition,
+    ResolutionSourceType,
+)
 from app.domain.world_facts import FactAuthority, FactKind, FactSubjectType
 from app.domain.world_locations import (
     ConnectionCategory,
@@ -190,6 +195,13 @@ class Message(Base):
     speaker_character_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("characters.id", ondelete="SET NULL"), nullable=True
     )
+    # The mechanical outcome this prose describes, when it describes one. Points this
+    # way rather than the other so narration can be traced back to its cause without
+    # the resolution carrying a copy of the sentence -- two homes for one paragraph is
+    # two paragraphs, eventually.
+    resolution_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("resolutions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
 
@@ -248,23 +260,128 @@ class Relationship(Base):
     )
 
 
-class GameEvent(Base):
-    """Something that happened, stamped with both of the times that matter."""
+class Resolution(Base):
+    """One verdict from the resolution boundary. See app.domain.resolution.
 
-    __tablename__ = "game_events"
+    The mechanical audit trail, and the reason `game_events` does not have to be one.
+    Every attempt that reached a verdict lands here -- applied, rejected or no-effect --
+    with the revision either side of it, so "why is the world like this?" is answerable
+    without a history table full of the engine talking to itself.
+
+    # The unique constraint is the idempotency guarantee
+
+    `(session_id, idempotency_key)`. A retried request finds its own earlier row and
+    gets that result back rather than resolving again. The constraint is what makes it
+    a guarantee instead of a race: two concurrent submissions of one player action do
+    not both get past a `SELECT`, because the second `INSERT` fails.
+    """
+
+    __tablename__ = "resolutions"
     __table_args__ = (
-        Index("ix_game_events_session_turn", "session_id", "turn_index"),
-        Index("ix_game_events_session_time", "session_id", "occurred_at", "event_sequence"),
-        # A per-session counter has to actually be unique to be an ordering. Two
-        # writers racing for the same number is a loud integrity error here rather
-        # than two events that silently swap places on the next read.
-        UniqueConstraint("session_id", "event_sequence", name="uq_game_events_session_sequence"),
-        CheckConstraint("occurred_at >= 0", name="ck_game_events_occurred_at_nonnegative"),
+        UniqueConstraint(
+            "session_id", "idempotency_key", name="uq_resolutions_session_idempotency"
+        ),
+        # "What happened in this session, most recent first" -- the diagnostics query.
+        Index("ix_resolutions_session_time", "session_id", "occurred_at", "created_at"),
+        Index("ix_resolutions_session_source", "session_id", "source_type"),
+        CheckConstraint("occurred_at >= 0", name="ck_resolutions_occurred_at_nonnegative"),
+        CheckConstraint(
+            "state_revision_before >= 0 AND state_revision_after >= state_revision_before",
+            name="ck_resolutions_revision_monotonic",
+        ),
+        CheckConstraint(
+            "event_count >= 0 AND mutation_count >= 0",
+            name="ck_resolutions_counts_nonnegative",
+        ),
+        # A refusal that moved the world is the one corruption this table cannot be
+        # allowed to record, because the table is the evidence.
+        CheckConstraint(
+            "disposition = 'applied' OR ("
+            "state_revision_after = state_revision_before "
+            "AND event_count = 0 AND mutation_count = 0)",
+            name="ck_resolutions_only_applied_changes_anything",
+        ),
+        CheckConstraint(
+            "disposition <> 'rejected' OR reason_code IS NOT NULL",
+            name="ck_resolutions_rejection_has_a_reason",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     session_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    source_type: Mapped[ResolutionSourceType] = mapped_column(String(30), nullable=False)
+    # Points into whichever table `source_type` names -- a scheduled event, a situation,
+    # a character. Deliberately not a foreign key: a column constrained to one of those
+    # would be wrong for all the others.
+    source_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+
+    parent_resolution_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("resolutions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+
+    disposition: Mapped[ResolutionDisposition] = mapped_column(String(20), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+
+    resolver_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    resolver_version: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    state_revision_before: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state_revision_after: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # Fictional session time. `created_at` below is the wall clock; they answer
+    # different questions and a save restored elsewhere keeps only the first one honest.
+    occurred_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    turn_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    event_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    mutation_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+
+
+class GameEvent(Base):
+    """Something that objectively happened. See app.domain.resolution.history.
+
+    Significant world history, not a log. What separates the two is `EventPolicy`,
+    which decides before anything reaches this table whether the thing is worth
+    remembering at all -- so a session that ran for a year has a history somebody could
+    read, rather than a million rows with the coronation somewhere inside them.
+
+    Immutable during normal gameplay. A repaired bridge is a second row, never an edit
+    to the first.
+    """
+
+    __tablename__ = "game_events"
+    __table_args__ = (
+        Index("ix_game_events_session_turn", "session_id", "turn_index"),
+        Index("ix_game_events_session_time", "session_id", "occurred_at", "event_sequence"),
+        # Retrieval is "what matters, most recent first", so importance leads.
+        Index("ix_game_events_session_importance", "session_id", "importance", "occurred_at"),
+        Index("ix_game_events_session_category", "session_id", "category", "subtype"),
+        # A per-session counter has to actually be unique to be an ordering. Two
+        # writers racing for the same number is a loud integrity error here rather
+        # than two events that silently swap places on the next read.
+        UniqueConstraint("session_id", "event_sequence", name="uq_game_events_session_sequence"),
+        CheckConstraint("occurred_at >= 0", name="ck_game_events_occurred_at_nonnegative"),
+        CheckConstraint("importance BETWEEN 1 AND 5", name="ck_game_events_importance_range"),
+        CheckConstraint("id <> caused_by_event_id", name="ck_game_events_not_self_caused"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # The resolution that produced this, grouping everything one outcome caused.
+    # Nullable: history predates this boundary, and seeding a session is not a
+    # resolution. SET NULL rather than CASCADE -- deleting the mechanical trail must
+    # never delete the story.
+    resolution_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("resolutions.id", ondelete="SET NULL"), nullable=True, index=True
     )
     turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
     # When it happened in the fiction. Independent of turn_index: a whole turn may
@@ -274,8 +391,25 @@ class GameEvent(Base):
     # shares a minute -- so ordering needs a second key. A monotonic per-session
     # counter, rather than inventing seconds the game clock does not have.
     event_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
-    type: Mapped[str] = mapped_column(String(80), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
+    # Coarse and closed, so retrieval can filter; the noun is the open `subtype`.
+    category: Mapped[EventCategory] = mapped_column(String(20), nullable=False)
+    subtype: Mapped[str] = mapped_column(String(80), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    # Already clamped by policy when the row was written. Whatever the proposer wanted,
+    # this is what the application decided, and it is the only number retrieval sees.
+    importance: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    primary_location_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="SET NULL"), nullable=True
+    )
+    # Causal history across resolutions: FIRE_STARTED -> FIRE_SPREAD -> COLLAPSE. One
+    # link, not a graph. SET NULL for the same reason as above: losing the cause must
+    # not lose the consequence.
+    caused_by_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("game_events.id", ondelete="SET NULL"), nullable=True
+    )
+    # Compact structured detail a machine may act on. The summary above is for readers
+    # and is never parsed -- see app.domain.resolution.history.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
 
 

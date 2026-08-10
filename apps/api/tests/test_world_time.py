@@ -20,7 +20,6 @@ from app.application.persistence import (
     WorldSnapshot,
 )
 from app.application.time_service import (
-    TIME_ADVANCED_EVENT,
     advance_time,
     cancel_scheduled_event,
     schedule_event,
@@ -464,22 +463,26 @@ async def test_an_unknown_session_is_reported_rather_than_created() -> None:
     assert clock.commits == 0
 
 
-async def test_the_advance_is_recorded_for_audit() -> None:
+async def test_an_advance_writes_no_history_of_its_own() -> None:
+    """ "The clock moved" is bookkeeping, not something that happened in the story.
+
+    It used to be a GameEvent, back when history was the only audit trail there was.
+    A session's history then read as the engine narrating itself -- twelve rows saying
+    time passed for every one saying anything did. `time_advanced` is registered
+    `EventPersistence.NONE`, and "why did the clock jump?" is answered by the
+    `ResolutionRecord` of whatever asked.
+    """
     clock = FakeSessionClock(elapsed_minutes=840, turn_index=412)
 
-    await advance_time(
+    result = await advance_time(
         clock,
         session_id=SESSION_ID,
         request=_request(265, reason=TimeAdvanceReason.TRAVEL, detail="Riverwood to the Capital"),
     )
 
-    (recorded,) = clock.events
-    assert recorded.type == TIME_ADVANCED_EVENT
-    assert recorded.occurred_at == 1105
-    assert recorded.turn_index == 412
-    assert "travel" in recorded.description
-    assert "840 -> 1105" in recorded.description
-    assert "Riverwood to the Capital" in recorded.description
+    assert result.started_at == 840
+    assert result.ended_at == 1105
+    assert clock.events == []
 
 
 async def test_events_due_inside_the_span_are_processed_in_chronological_order() -> None:
@@ -550,8 +553,9 @@ async def test_an_event_already_behind_the_clock_resolves_now_rather_than_rewind
     assert result.interruption.at == 1000
     assert result.ended_at == 1000
     assert result.advanced_minutes == 0
-    # An interruption that costs no time still gets recorded: something happened.
-    assert clock.events[0].type == TIME_ADVANCED_EVENT
+    # The event that interrupted is consumed either way -- a late event is late, not
+    # lost, and firing it once is the point.
+    assert clock.status_of(result.processed_event_ids[0]) is ScheduledEventStatus.PROCESSED
 
 
 async def test_scheduling_converts_a_delay_into_an_absolute_due_time() -> None:

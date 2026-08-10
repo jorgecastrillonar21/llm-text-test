@@ -9,10 +9,20 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.application.ports import ProviderState
-from app.application.state_service import StateChangeEvent
-from app.application.turn_service import AppliedRelationship, TurnMessage
+from app.application.turn_service import (
+    MAX_ACTION_LENGTH,
+    MAX_CLIENT_ACTION_ID_LENGTH,
+    AppliedRelationship,
+    TurnMessage,
+)
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.errors import ValidationError as DomainValidationError
+from app.domain.resolution import (
+    EventCategory,
+    GameEvent,
+    Resolution,
+    ResolutionDisposition,
+)
 from app.domain.state_mutations import StateMutationBatch
 from app.domain.world_facts import (
     FactAuthority,
@@ -46,7 +56,6 @@ from app.domain.world_situations import (
     ProgressionTrigger,
     Situation,
     SituationParticipant,
-    SituationStatus,
     StartSituation,
 )
 from app.domain.world_time import (
@@ -285,7 +294,22 @@ class RelationshipRead(BaseModel):
 
 
 class TurnRequest(BaseModel):
-    action: str = Field(min_length=1, max_length=2000)
+    action: str = Field(min_length=1, max_length=MAX_ACTION_LENGTH)
+
+    client_action_id: str | None = Field(
+        default=None, min_length=1, max_length=MAX_CLIENT_ACTION_ID_LENGTH
+    )
+    """The client's stable name for *this submission*, not for this HTTP request.
+
+    Send the same id when retrying a request that may already have been received --
+    a timeout, a dropped connection, a second tap on the button -- and the server
+    returns the turn that was played rather than playing another one. Send a new id
+    only when the player has genuinely acted again.
+
+    Optional so existing clients keep working, but a client that omits it has no
+    protection: two identical submissions are two turns, and the server has no way to
+    tell that apart from a player who meant it.
+    """
 
 
 class TurnResponse(BaseModel):
@@ -307,6 +331,40 @@ class TurnResponse(BaseModel):
     """Ongoing processes this turn set in motion. Zero on almost every turn."""
     situations_rejected: int
     visual_cue_generated: bool
+
+    resolution_id: uuid.UUID
+    """The mechanical record of what this turn established.
+
+    Always present, and the handle the narration endpoint takes. A turn sent without a
+    `client_action_id` is recorded like any other; what it lacks is the key that would
+    let a retry find it again."""
+
+    replayed: bool = False
+    """True when this body is a turn that had already been played, returned because the
+    same `client_action_id` arrived twice. The messages are the original ones; the
+    suggestions and most counts come back empty, because they were never stored."""
+
+
+class NarrationRequest(BaseModel):
+    """Body for asking for prose about a resolution that already happened."""
+
+    regenerate: bool = False
+    """Ask for a *new* paragraph, replacing the stored one.
+
+    Off by default, which makes the endpoint a safe retry: without it, a resolution
+    that already has narration returns what is stored and no model runs. Turning it on
+    never re-runs the resolution -- the outcome is settled and this is a description
+    of it.
+    """
+
+
+class NarrationResponse(BaseModel):
+    resolution_id: uuid.UUID
+    message_id: uuid.UUID
+    narration: str
+    generated: bool
+    """False when stored prose came back untouched; true when the provider ran."""
+    provider: str
 
 
 class WorldFactRead(BaseModel):
@@ -495,22 +553,50 @@ class SituationProgressRequest(BaseModel):
     trigger: ProgressionTrigger = ProgressionTrigger.EXPLICIT
 
 
-class SituationProgressResponse(BaseModel):
-    situation_id: uuid.UUID
-    changed: bool
-    """False when the pass decided nothing happened, which is a frequent and legitimate
-    outcome. Nothing is written in that case and `state_revision` does not move."""
+class ResolutionResponse(BaseModel):
+    """What one resolution did. The shape every command endpoint returns.
 
-    intensity_delta: int
-    threat_delta: int
-    momentum_delta: int
-    status_change: SituationStatus | None = None
-    state_revision: int | None = None
-    event_id: uuid.UUID | None = None
+    One response type rather than one per command, because the interesting part is
+    never command-specific: which disposition, whether the revision moved, what
+    history it wrote. A caller that needs the mechanical detail of a particular
+    resolver reads `narrative_context`, which is the resolver's own summary of its
+    outcome and is never parsed for mechanics.
+    """
+
+    resolution: Resolution
+    events: list[GameEvent] = Field(default_factory=list)
+    """What history kept. Frequently empty, and an empty list is not a failure -- most
+    outcomes change the world without being worth remembering."""
+
+    replayed: bool = False
+    """True when this idempotency key had already been resolved. The body is the
+    original record, re-read; nothing ran a second time."""
+
     created_situation_ids: list[uuid.UUID] = Field(default_factory=list)
-    scheduled_event_id: uuid.UUID | None = None
-    next_progression_at: int | None = None
-    notes: str = ""
+    scheduled_event_ids: list[uuid.UUID] = Field(default_factory=list)
+    narrative_context: dict[str, Any] = Field(default_factory=dict)
+    """Structured, flat, and for the Story Director to narrate. Absent on a replay,
+    because the outcome object is not reconstructed from the record."""
+
+    @property
+    def disposition(self) -> ResolutionDisposition:
+        return self.resolution.disposition
+
+
+class ResolutionListRead(BaseModel):
+    resolutions: list[Resolution] = Field(default_factory=list)
+
+
+class EventListRead(BaseModel):
+    events: list[GameEvent] = Field(default_factory=list)
+
+
+class EventQuery(BaseModel):
+    """Query parameters for the read-only history endpoint."""
+
+    category: EventCategory | None = None
+    min_importance: int = Field(default=1, ge=1, le=5)
+    limit: int = Field(default=50, ge=1, le=200)
 
 
 class StateChangeRequest(BaseModel):
@@ -520,10 +606,14 @@ class StateChangeRequest(BaseModel):
     endpoint cannot accept something the state service would not: the batch size cap,
     the discriminated union of operations and the "no two mutations touch one fact"
     rule are all already on it.
+
+    No cause field. A change made by hand was caused by a person at a terminal, and
+    inventing a resolution id for it would put a lie in the audit trail. `admin` is
+    the one authority that does not have to name what caused it, for exactly this
+    reason -- see `app.application.state_service.ChangeCause`.
     """
 
     batch: StateMutationBatch
-    event: StateChangeEvent | None = None
 
 
 class ScheduledEventCreate(BaseModel):

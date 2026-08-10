@@ -10,6 +10,7 @@ import type {
   SessionDetail,
   SituationListRead,
   TurnResponse,
+  TurnSubmission,
   World,
   WorldCreate,
   WorldRules,
@@ -117,11 +118,32 @@ export function useSituations(sessionId: string) {
   });
 }
 
+/**
+ * A fresh name for a fresh submission.
+ *
+ * Called once, where the player acts — never inside the request. A new id per attempt
+ * would make every retry a new turn on the server, which is exactly the duplicate the
+ * id exists to prevent.
+ *
+ * `randomUUID` needs a secure context; the fallback keeps a plain-HTTP LAN session (a
+ * phone pointed at a laptop, which is how this application is meant to be played)
+ * idempotent rather than silently unprotected.
+ */
+export function newClientActionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `a-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 export function useSubmitTurn(sessionId: string) {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (action: string) =>
-      api.post<TurnResponse>(`/api/v1/sessions/${sessionId}/turns`, { action }),
+    mutationFn: ({ action, clientActionId }: TurnSubmission) =>
+      api.post<TurnResponse>(`/api/v1/sessions/${sessionId}/turns`, {
+        action,
+        client_action_id: clientActionId,
+      }),
     onSuccess: () => {
       // A failed turn is a no-op server-side, so only success invalidates.
       client.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });

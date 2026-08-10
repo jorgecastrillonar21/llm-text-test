@@ -195,7 +195,10 @@ async def test_live_only_is_the_default_and_can_be_turned_off(
         f"/api/v1/dev/sessions/{session['id']}/world-state/changes",
         json={
             "batch": {
-                "authority": "engine",
+                # `admin`, because a person at a terminal is what caused this. The
+                # accountable authorities have to name a resolution or an event, and
+                # this endpoint deliberately produces neither.
+                "authority": "admin",
                 "mutations": [
                     {
                         "op": "resolve_situation",
@@ -205,7 +208,6 @@ async def test_live_only_is_the_default_and_can_be_turned_off(
                     }
                 ],
             },
-            "event": {"type": "SIEGE_LIFTED", "description": "The siege lifted."},
         },
     )
     assert resolved.status_code == 200, resolved.text
@@ -250,7 +252,12 @@ async def test_progression_needs_the_clock_to_have_moved(app_client: AsyncClient
         f"/api/v1/dev/sessions/{session['id']}/situations/{situation_id}/progress", json={}
     )
     assert first.status_code == 200
-    assert first.json()["changed"] is False
+    # A resolution, and a real one -- `no_effect` is a verdict about a zero-length
+    # interval, not an error, and it is recorded like any other.
+    body = first.json()
+    assert body["resolution"]["disposition"] == "no_effect"
+    assert body["resolution"]["reason_code"] == "already_progressed"
+    assert body["resolution"]["state_revision_after"] == body["resolution"]["state_revision_before"]
 
     advanced = await app_client.post(
         f"/api/v1/dev/sessions/{session['id']}/advance-time",
@@ -263,22 +270,29 @@ async def test_progression_needs_the_clock_to_have_moved(app_client: AsyncClient
             f"/api/v1/dev/sessions/{session['id']}/situations/{situation_id}/progress", json={}
         )
     ).json()
-    assert second["changed"] is True
-    assert second["intensity_delta"] > 0
-    assert second["state_revision"] is not None
-    assert second["event_id"] is not None
-    # Absolute session time, never a delay.
-    assert second["next_progression_at"] is not None
-    assert second["scheduled_event_id"] is not None
+    assert second["resolution"]["disposition"] == "applied"
+    assert (
+        second["resolution"]["state_revision_after"] > second["resolution"]["state_revision_before"]
+    )
+    assert second["narrative_context"]["intensity_delta"] > 0
+    # Absolute session time, never a delay -- the next evaluation is a scheduled event.
+    assert len(second["scheduled_event_ids"]) == 1
 
     after = (await app_client.get(f"{base}/{situation_id}")).json()["situation"]
     assert after["last_progressed_at"] == 360
     assert after["intensity"] > 50
 
 
-async def test_progressing_twice_without_moving_the_clock_changes_nothing(
+async def test_progressing_twice_without_moving_the_clock_replays_the_first(
     app_client: AsyncClient,
 ) -> None:
+    """The idempotency key pins the request to a situation at a fictional minute.
+
+    So the second call is not a second evaluation of the same six hours -- it is the
+    first one, read back. That is the honest answer: the interval it is asking about
+    has already been resolved, and resolving it again would move the world twice for
+    one passage of time.
+    """
     world = await _world(app_client, initial_situations=[_siege()])
     session = await _session(app_client, world["id"])
     base = f"/api/v1/sessions/{session['id']}/situations"
@@ -299,13 +313,18 @@ async def test_progressing_twice_without_moving_the_clock_changes_nothing(
         )
     ).json()
 
-    assert first["changed"] is True
-    assert second["changed"] is False
-    # A pass that decided nothing does not move the revision.
-    assert second["state_revision"] is None
+    assert first["replayed"] is False
+    assert first["resolution"]["disposition"] == "applied"
+
+    assert second["replayed"] is True
+    assert second["resolution"]["id"] == first["resolution"]["id"]
+    # Nothing ran again, so nothing moved again.
+    assert second["narrative_context"] == {}
 
     detail = (await app_client.get(f"/api/v1/sessions/{session['id']}")).json()
-    assert detail["state_revision"] == first["state_revision"]
+    assert detail["state_revision"] == first["resolution"]["state_revision_after"]
+    after = (await app_client.get(f"{base}/{situation_id}")).json()["situation"]
+    assert after["last_progressed_at"] == 120
 
 
 async def test_progressing_an_unknown_situation_is_a_404(app_client: AsyncClient) -> None:
@@ -422,7 +441,7 @@ async def test_a_batch_that_moves_a_situation_and_a_place_lands_as_one_revision(
         f"/api/v1/dev/sessions/{session['id']}/world-state/changes",
         json={
             "batch": {
-                "authority": "simulation",
+                "authority": "admin",
                 "mutations": [
                     {"op": "update_situation", "situation_id": situation_id, "intensity_delta": 12},
                     {
@@ -440,7 +459,6 @@ async def test_a_batch_that_moves_a_situation_and_a_place_lands_as_one_revision(
                     },
                 ],
             },
-            "event": {"type": "EAST_GATE_BREACHED", "description": "The eastern gate fell."},
         },
     )
     assert response.status_code == 200, response.text

@@ -6,11 +6,15 @@ from fastapi import APIRouter, Query, status
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 
-from app.api.deps import DbSession, StoryGen, TurnGateway, WorldStateStore
+from app.api.deps import DbSession, NarrationStore, StoryGen, TurnGateway, WorldStateStore
 from app.api.schemas import (
+    EventListRead,
     MemoryRead,
     MessageRead,
+    NarrationRequest,
+    NarrationResponse,
     RelationshipRead,
+    ResolutionListRead,
     SessionCreate,
     SessionDetail,
     SessionRead,
@@ -20,11 +24,13 @@ from app.api.schemas import (
     WorldFactRead,
     WorldStateRead,
 )
+from app.application.narration_service import narrate_resolution
 from app.application.situation_service import materialize_initial_situations
 from app.application.spatial_service import materialize_initial_spatial_state
 from app.application.state_service import materialize_initial_facts
 from app.application.turn_service import execute_turn
 from app.domain.errors import NotFoundError, ValidationError
+from app.domain.resolution import EventCategory, ResolutionSourceType
 from app.domain.world_facts import FactKind, FactSubject, FactSubjectType
 from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
@@ -35,6 +41,12 @@ FACT_PAGE_LIMIT = 200
 """Ceiling for one read of a session's facts. High enough that no real session hits
 it today, present so that a session which one day does cannot return an unbounded
 response. `WorldStateRead.truncated` is how a caller finds out it did."""
+
+RESOLUTION_PAGE_LIMIT = 100
+EVENT_PAGE_LIMIT = 200
+"""Ceilings for the two history reads, for the reason `FACT_PAGE_LIMIT` exists. Both
+are audit views: a client showing "what has happened" wants the last screenful, and
+nothing in this application has a reason to pull a whole session's history at once."""
 
 
 @router.get("/sessions", response_model=list[SessionRead])
@@ -200,8 +212,100 @@ def _requested_subject(
 async def submit_turn(
     session_id: uuid.UUID, payload: TurnRequest, gateway: TurnGateway, generator: StoryGen
 ) -> TurnResponse:
-    """Run one turn. Atomic: a provider failure rolls the whole turn back."""
+    """Run one turn. Atomic: a provider failure rolls the whole turn back.
+
+    Idempotent when the client sends a `client_action_id`: the same id twice returns the
+    turn that was played, with no second model run, no duplicate messages and no second
+    set of events. The id is the client's to mint and must survive its own retries --
+    see `TurnRequest.client_action_id`.
+    """
     result = await execute_turn(
-        gateway, session_id=session_id, action=payload.action, generator=generator
+        gateway,
+        session_id=session_id,
+        action=payload.action,
+        generator=generator,
+        client_action_id=payload.client_action_id,
     )
     return TurnResponse.model_validate(result.model_dump())
+
+
+@router.get("/sessions/{session_id}/resolutions", response_model=ResolutionListRead)
+async def list_resolutions(
+    session_id: uuid.UUID,
+    store: NarrationStore,
+    source_type: ResolutionSourceType | None = Query(default=None),
+    limit: int = Query(default=RESOLUTION_PAGE_LIMIT, ge=1, le=RESOLUTION_PAGE_LIMIT),
+) -> ResolutionListRead:
+    """The mechanical trail: what was resolved in this session, most recent first.
+
+    Read-only, and there is deliberately no write counterpart. A resolution is created
+    by resolving something; an endpoint that could post one would let a client assert
+    that the world changed without anything having decided that it did.
+    """
+    session = await store.get_session(session_id)
+    if session is None:
+        raise NotFoundError("GameSession", session_id)
+    return ResolutionListRead(
+        resolutions=await store.load_resolutions(session_id, source_type=source_type, limit=limit)
+    )
+
+
+@router.get("/sessions/{session_id}/events", response_model=EventListRead)
+async def list_events(
+    session_id: uuid.UUID,
+    store: NarrationStore,
+    category: EventCategory | None = Query(default=None),
+    min_importance: int = Query(default=1, ge=1, le=5),
+    limit: int = Query(default=EVENT_PAGE_LIMIT, ge=1, le=EVENT_PAGE_LIMIT),
+) -> EventListRead:
+    """What has happened in this session, most recent in fictional time first.
+
+    Read-only, and bounded by `limit` rather than pageable: this is a history view, not
+    an export, and an endpoint that could stream every event of a long session is the
+    one a client would use to build a prompt out of all of them.
+
+    History is append-only. There is no edit and no delete -- a correction is a new
+    event that a game system decides to write.
+    """
+    session = await store.get_session(session_id)
+    if session is None:
+        raise NotFoundError("GameSession", session_id)
+    return EventListRead(
+        events=await store.load_events(
+            session_id,
+            min_importance=min_importance,
+            categories=frozenset({category}) if category is not None else None,
+            limit=limit,
+        )
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/resolutions/{resolution_id}/narration",
+    response_model=NarrationResponse,
+)
+async def narrate_resolution_endpoint(
+    session_id: uuid.UUID,
+    resolution_id: uuid.UUID,
+    payload: NarrationRequest,
+    store: NarrationStore,
+    generator: StoryGen,
+) -> NarrationResponse:
+    """Get -- or retry, or regenerate -- the prose describing a committed resolution.
+
+    A POST rather than a GET because it can call a language model and write a message.
+    Safe to retry regardless: without `regenerate` an outcome that already has narration
+    returns it unchanged and no provider runs.
+
+    Nothing here can re-resolve anything. If the provider fails, the failure is reported
+    as a provider failure and the outcome it was going to describe is exactly as
+    committed as it was before the call.
+    """
+    result = await narrate_resolution(
+        store,
+        generator,
+        session_id=session_id,
+        resolution_id=resolution_id,
+        regenerate=payload.regenerate,
+    )
+    return NarrationResponse.model_validate(result.model_dump())

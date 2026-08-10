@@ -362,6 +362,43 @@ async def test_a_debug_mutation_goes_through_the_state_service(app_client: Async
         f"/api/v1/dev/sessions/{session['id']}/world-state/changes",
         json={
             "batch": {
+                "authority": "admin",
+                "mutations": [
+                    {
+                        "op": "set_fact",
+                        "subject": {"type": "character", "id": character["id"]},
+                        "property": "system.alive",
+                        "value": False,
+                        "importance": 5,
+                    }
+                ],
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["revision"] == 1
+    # No cause, and that is the honest record: a person at a terminal edited the
+    # world. Minting a resolution or an event for it would put a fiction in the trail.
+    assert body["event_id"] is None
+
+    state = (await app_client.get(f"/api/v1/sessions/{session['id']}/world-state/facts")).json()
+    assert state["facts"][0]["value"] is False
+    assert state["facts"][0]["source_event_id"] is None
+
+
+async def test_a_mechanical_authority_cannot_change_the_world_by_hand(
+    app_client: AsyncClient,
+) -> None:
+    """`admin` is the only authority this endpoint can carry, because it is the only
+    one that does not have to name what caused it. Asking as `engine` is asking the
+    world to record a mechanical change that nothing decided."""
+    session, character = await _session_with_character(app_client)
+
+    response = await app_client.post(
+        f"/api/v1/dev/sessions/{session['id']}/world-state/changes",
+        json={
+            "batch": {
                 "authority": "engine",
                 "mutations": [
                     {
@@ -373,17 +410,14 @@ async def test_a_debug_mutation_goes_through_the_state_service(app_client: Async
                     }
                 ],
             },
-            "event": {"type": "death", "description": "Elena did not make it."},
         },
     )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["revision"] == 1
-    assert body["event_id"] is not None
+
+    assert response.status_code == 422, response.text
+    assert "caused" in response.json()["detail"]
 
     state = (await app_client.get(f"/api/v1/sessions/{session['id']}/world-state/facts")).json()
-    assert state["facts"][0]["value"] is False
-    assert state["facts"][0]["source_event_id"] == body["event_id"]
+    assert state["facts"] == []
 
 
 async def test_the_debug_endpoint_still_refuses_what_the_story_director_may_not_write(

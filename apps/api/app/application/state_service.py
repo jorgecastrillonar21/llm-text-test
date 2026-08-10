@@ -38,12 +38,12 @@ import datetime as dt
 import uuid
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
+from app.application.event_service import record_events
 from app.application.persistence import (
     ConnectionStateWrite,
     LocationStateWrite,
-    NewEvent,
     NewFact,
     SituationUpdate,
     StateStorePort,
@@ -55,6 +55,7 @@ from app.domain.errors import (
     StaleStateError,
     ValidationError,
 )
+from app.domain.resolution import EventCandidate, EventCategory
 from app.domain.state_mutations import (
     StateMutation,
     StateMutationBatch,
@@ -89,24 +90,39 @@ from app.domain.world_situations import (
     require_transition,
 )
 
-INITIAL_FACTS_EVENT = "world_state.seeded"
-"""GameEvent type for template materialisation. One event for the whole seed, not one
-per fact: the thing that happened is "this session began", and a row per starting
+INITIAL_FACTS_EVENT = "world_state_seeded"
+"""GameEvent subtype for template materialisation. One event for the whole seed, not
+one per fact: the thing that happened is "this session began", and a row per starting
 truth would bury the first real event in the history."""
 
 
-class StateChangeEvent(BaseModel):
-    """The GameEvent a batch of mutations is the consequence of.
+class ChangeCause(BaseModel):
+    """Why a batch is being applied, as things that already exist.
 
-    Type and description only. The session, the turn and the fictional timestamp are
-    not the caller's to supply -- they come from the session being changed, and a
-    caller that could set them could write an event into a turn that never happened.
+    Both halves are optional and they answer different questions:
+
+        resolution_id   which mechanical verdict decided this
+        event_id        which world-significant happening this followed from
+
+    A siege progression that quietly raised an intensity has the first and not the
+    second, because nothing happened that history should record. A collapsing bridge
+    has both. Seeding a session has only the event, because nothing resolved anything.
+
+    Neither is minted here. `stage_state_change` used to accept an event description
+    and write the row itself, which meant the one place that could write history was
+    also the place that applied mutations -- and every caller wanting an event had to
+    make a state change to get one. Events are `event_service`'s now; this takes the id.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    type: str = Field(min_length=1, max_length=80)
-    description: str = Field(min_length=1, max_length=500)
+    resolution_id: uuid.UUID | None = None
+    event_id: uuid.UUID | None = None
+
+    @property
+    def is_accounted_for(self) -> bool:
+        """Whether this batch can answer "why did this happen?" at all."""
+        return self.resolution_id is not None or self.event_id is not None
 
 
 class AppliedMutation(BaseModel):
@@ -158,7 +174,7 @@ async def stage_state_change(
     *,
     session_id: uuid.UUID,
     batch: StateMutationBatch,
-    event: StateChangeEvent | None = None,
+    cause: ChangeCause | None = None,
 ) -> StateChangeResult:
     """Validate and apply a batch inside the caller's transaction, without committing.
 
@@ -177,11 +193,12 @@ async def stage_state_change(
     if batch.expected_revision is not None and batch.expected_revision != session.state_revision:
         raise StaleStateError(expected=batch.expected_revision, actual=session.state_revision)
 
-    if event is None and requires_source_event(batch.authority):
+    cause = cause or ChangeCause()
+    if not cause.is_accounted_for and requires_source_event(batch.authority):
         raise ValidationError(
-            f"Authority {batch.authority.value!r} must name the event that caused this "
-            "change. A mechanical mutation with no event is a world that cannot answer "
-            "why something is true."
+            f"Authority {batch.authority.value!r} must name what caused this change -- "
+            "the resolution that decided it, or the event it followed from. A mechanical "
+            "mutation with neither is a world that cannot answer why something is true."
         )
 
     known_character_ids = await store.known_character_ids(world.id)
@@ -195,19 +212,7 @@ async def stage_state_change(
 
     # -- past this line the batch is going to happen ---------------------------
 
-    event_id: uuid.UUID | None = None
-    if event is not None:
-        # Written first so the facts below can point at it.
-        event_id = await store.add_event(
-            NewEvent(
-                session_id=session_id,
-                turn_index=session.turn_index,
-                occurred_at=session.elapsed_minutes,
-                type=event.type,
-                description=event.description,
-            )
-        )
-
+    event_id = cause.event_id
     applied: list[AppliedMutation] = []
     for mutation, _current in checked:
         entity_id: uuid.UUID | None = None
@@ -266,7 +271,7 @@ async def apply_state_change(
     *,
     session_id: uuid.UUID,
     batch: StateMutationBatch,
-    event: StateChangeEvent | None = None,
+    cause: ChangeCause | None = None,
 ) -> StateChangeResult:
     """`stage_state_change`, then commit.
 
@@ -274,7 +279,7 @@ async def apply_state_change(
     not one of them, and a service that always committed would make a turn's atomicity
     depend on nothing else failing after the facts were written.
     """
-    result = await stage_state_change(store, session_id=session_id, batch=batch, event=event)
+    result = await stage_state_change(store, session_id=session_id, batch=batch, cause=cause)
     await store.commit()
     return result
 
@@ -299,14 +304,29 @@ async def materialize_initial_facts(
     if not seeds:
         return None
 
+    # Written first, so the facts below can point at it as their cause. Its policy caps
+    # it at importance 1: it explains why these things were already true, and nothing
+    # else, so it must never compete for space in a narration prompt.
+    written = await record_events(
+        store,
+        session_id=session_id,
+        turn_index=session.turn_index,
+        occurred_at=session.elapsed_minutes,
+        candidates=[
+            EventCandidate(
+                category=EventCategory.SYSTEM,
+                subtype=INITIAL_FACTS_EVENT,
+                summary=(f"Session began with {len(seeds)} established fact(s) from the world."),
+                payload={"fact_count": len(seeds)},
+            )
+        ],
+    )
+
     return await stage_state_change(
         store,
         session_id=session_id,
         batch=StateMutationBatch(authority=FactAuthority.SEED, mutations=list(seeds)),
-        event=StateChangeEvent(
-            type=INITIAL_FACTS_EVENT,
-            description=f"Session began with {len(seeds)} established fact(s) from the world.",
-        ),
+        cause=ChangeCause(event_id=written[0] if written else None),
     )
 
 

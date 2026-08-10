@@ -61,9 +61,12 @@ right response to that is a loud failure rather than a large commit.
 class GeneratedEvent(BaseModel):
     """A GameEvent a progression pass produced.
 
-    Type and description only, the same shape `StateChangeEvent` uses: the session, the
-    turn and the fictional timestamp come from the session being changed, and a
-    resolver that could set them could write an event into a turn that never happened.
+    A name and a sentence, and nothing else. The category is always `situation`; the
+    session, the turn, the sequence and the fictional timestamp come from the resolution
+    that commits it, and a resolver that could set them could write an event into a turn
+    that never happened. Importance is absent for the same reason it is a suggestion
+    everywhere else: policy decides, per subtype. `app.application.resolvers` maps these
+    onto `EventCandidate`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

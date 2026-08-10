@@ -10,8 +10,8 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from app.application.contracts import TurnGeneration
-from app.application.story_context import StoryContext
+from app.application.contracts import OutcomeNarration, TurnGeneration
+from app.application.story_context import OutcomeContext, StoryContext
 
 ProviderState = Literal["ready", "unreachable", "misconfigured", "disabled"]
 
@@ -47,6 +47,18 @@ class StoryGeneratorPort(Protocol):
     name: str
 
     async def generate_turn(self, context: StoryContext) -> TurnGeneration: ...
+
+    async def narrate_outcome(self, context: OutcomeContext) -> OutcomeNarration:
+        """Describe an outcome the game has already committed.
+
+        A separate method rather than a flag on `generate_turn`, because the two are
+        different jobs with different contracts: one proposes and is reviewed, the other
+        describes what survived review and is not. Failure raises `StoryGenerationError`
+        like any provider failure -- and unlike a failed turn, a failed narration cannot
+        take the outcome down with it, because the outcome was committed before this was
+        called. See `app.application.narration_service`.
+        """
+        ...
 
     async def status(self) -> ProviderStatus: ...
 

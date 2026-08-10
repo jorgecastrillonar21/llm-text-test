@@ -16,6 +16,8 @@ apps/api/app/
 │   │                     per-session state, creation policy
 │   ├── world_situations/ what the world is doing: ongoing processes, their lifecycle,
 │   │                     participants, causal parentage, progression arithmetic
+│   ├── resolution/       how the world is allowed to change: commands, the context a
+│   │                     resolver may see, outcomes, dispositions, event significance
 │   ├── vocabulary.py     the shared shape rules for subtypes, tags and metadata bags
 │   ├── state_mutations.py  the one batch that carries fact, spatial and situation changes
 │   └── situation_progression.py  what one progression pass decided, before it is written
@@ -27,13 +29,16 @@ apps/api/app/
 │   ├── context_builder.py  all retrieval policy, in one place
 │   ├── rules_projection.py WorldRules → the compact AI-facing view
 │   ├── turn_service.py   the turn use case
+│   ├── resolution_service.py  the one path from a Command to a committed change
+│   ├── resolvers.py      the registry: command kind → the resolver that calculates it
+│   ├── event_service.py  significance policy, sequencing, append-only event writes
+│   ├── narration_service.py  prose for an outcome that is already committed
 │   ├── time_service.py   the only writer of the simulation clock
 │   ├── state_service.py  the only writer of world facts and spatial state
 │   ├── spatial_service.py  the spatial graph, materialisation, place creation
 │   ├── spatial_context.py  deterministic, scene-sized geography for the prompt
 │   ├── situation_service.py  starting, reading and progressing ongoing processes
 │   ├── situation_context.py  deterministic, scene-sized relevance for the prompt
-│   ├── progression_service.py  turning a progression result into one atomic batch
 │   ├── fact_proposals.py reviewing what the Story Director claims is true
 │   ├── location_proposals.py reviewing the places it says the story found
 │   └── situation_proposals.py reviewing the processes it says began
@@ -144,8 +149,8 @@ documents that requirement; the adapter satisfies it with a flush, and
 
 ## Persistence ports
 
-The turn use case reaches storage through three Protocols in
-`application/persistence.py`:
+Every use case reaches storage through a Protocol in `application/persistence.py`, and
+each one is exactly as wide as its job:
 
 | Port | Responsibility |
 |---|---|
@@ -156,12 +161,24 @@ The turn use case reaches storage through three Protocols in
 | `SpatialPort` | reading and growing the spatial graph, and per-session state |
 | `SituationPort` | reading and writing ongoing processes |
 | `StateStorePort` | facts, space and situations together — what one batch may touch |
-| `ProgressionPort` | `StateStorePort` plus scheduling the next evaluation |
+| `HistoryReaderPort` | reads over `game_events` |
+| `EventWriterPort` | `HistoryReaderPort` plus `add_event` — append, and nothing else |
+| `ResolutionReaderPort` | reads over `resolutions`, the mechanical trail |
+| `ResolutionStorePort` | everything one resolution may touch, behind one transaction |
+| `NarrationStorePort` | history, the resolution being narrated, and `commit()` |
 
-`TurnGatewayPort` composes the first three, plus `StateStorePort`. `build_story_context` takes only the reader
-— functions declare the narrowest port they need — while `execute_turn` takes the
-composite, because one transaction genuinely spans all three and splitting it into
-three arguments that must be the same object helps nobody.
+`TurnGatewayPort` composes `StoryContextReaderPort`, `TurnPersistencePort` and
+`ResolutionStorePort`. `build_story_context` takes only the reader — functions declare
+the narrowest port they need — while `execute_turn` takes the composite, because one
+transaction genuinely spans all three and splitting it into three arguments that must be
+the same object helps nobody.
+
+`EventWriterPort` has no update and no delete, in the Protocol and in the adapter. That
+absence is the enforcement of event immutability: a caller cannot rewrite history through
+a port that offers no verb for it. `NarrationStorePort` is narrow for the same reason in
+the opposite direction — narration runs after the resolution's transaction has closed, so
+it can read the verdict and write a message, and it cannot write a fact, an event, a
+mutation or the clock. See [event-resolution.md](event-resolution.md).
 
 `SessionClockPort` is deliberately outside that composite. A turn *reads* the clock and
 never moves it, so `advance_time` gets a port that reaches the clock, the scheduled
@@ -237,6 +254,19 @@ silently papered over.
   `ON DELETE SET NULL`, because losing a container must not delete what was inside it;
   the acyclicity no database can enforce lives in `world_locations.hierarchy`. See
   [world-state-locations.md](world-state-locations.md).
+- **`resolutions`** is one row per verdict: the disposition, the resolver and its version,
+  the revision before and after, and the idempotency key. `(session_id, idempotency_key)`
+  is **unique in the database**, not checked in Python — two concurrent retries of one
+  submission have to race and lose, and a check-then-insert would let both through.
+  Narration is deliberately not stored here; `messages.resolution_id` points back instead,
+  so regenerating a paragraph cannot disturb the mechanical audit trail.
+- **`game_events`** is significant history, not a log: `subtype` is an open string,
+  `category` is a closed enum because retrieval filters on it, and per-subtype policy
+  decides what is persisted at all and clamps proposed importance into a band. There is no
+  update path and no delete path anywhere — a correction is a new event pointing at the old
+  one with `caused_by_event_id`. `resolution_id` groups the events one verdict produced;
+  `(session_id, event_sequence)` is unique, which is what makes ordering total when a whole
+  turn shares one fictional minute. See [event-resolution.md](event-resolution.md).
 
 ## AI provider boundaries
 

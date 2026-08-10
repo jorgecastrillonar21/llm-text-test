@@ -28,10 +28,12 @@ from app.application.persistence import (
     NewMemory,
     NewMessage,
     NewParticipant,
+    NewResolution,
     NewSituation,
     RelationshipRecord,
     SessionSnapshot,
     SituationUpdate,
+    StoredMessage,
     TranscriptMessage,
     WorldSnapshot,
 )
@@ -40,6 +42,12 @@ from app.application.turn_service import execute_turn
 from app.domain.enums import Language, MemoryKind
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector
+from app.domain.resolution import (
+    EventCategory,
+    GameEvent,
+    Resolution,
+    ResolutionSourceType,
+)
 from app.domain.world_facts import FactKind, FactSubject, SetFact, WorldFact
 from app.domain.world_locations import (
     LocationConnection,
@@ -106,8 +114,10 @@ class FakeTurnGateway:
             )
         ]
         self.messages: list[NewMessage] = []
+        self.message_ids: list[uuid.UUID] = []
         self.memories: list[NewMemory] = []
-        self.events: list[NewEvent] = []
+        self.events: list[GameEvent] = []
+        self.resolutions: list[Resolution] = []
         self.relationships: dict[uuid.UUID, RelationshipVector] = {}
         self.turn_index_writes: list[int] = []
         self.commits = 0
@@ -287,6 +297,104 @@ class FakeTurnGateway:
     ) -> WorldFact | None:
         return self.facts.get((subject.key, canonical_property))
 
+    # -- history and resolution reads -------------------------------------------
+
+    async def load_events(
+        self,
+        session_id: uuid.UUID,
+        *,
+        min_importance: int | None = None,
+        categories: frozenset[EventCategory] | None = None,
+        subtypes: frozenset[str] | None = None,
+        since: int | None = None,
+        limit: int,
+    ) -> list[GameEvent]:
+        found = [
+            event
+            for event in self.events
+            if (min_importance is None or event.importance >= min_importance)
+            and (categories is None or event.category in categories)
+            and (subtypes is None or event.subtype in subtypes)
+            and (since is None or event.occurred_at >= since)
+        ]
+        # The total order the port's contract demands: recent first.
+        found.sort(key=lambda e: (-e.occurred_at, -e.sequence))
+        return found[:limit]
+
+    async def get_event(self, session_id: uuid.UUID, event_id: uuid.UUID) -> GameEvent | None:
+        return next((event for event in self.events if event.id == event_id), None)
+
+    async def load_events_for_resolution(self, resolution_id: uuid.UUID) -> list[GameEvent]:
+        found = [event for event in self.events if event.resolution_id == resolution_id]
+        found.sort(key=lambda e: (e.occurred_at, e.sequence))
+        return found
+
+    async def count_events_since(
+        self,
+        session_id: uuid.UUID,
+        *,
+        subtype: str,
+        since: int,
+        primary_location_id: uuid.UUID | None = None,
+    ) -> int:
+        return sum(
+            1
+            for event in self.events
+            if event.subtype == subtype
+            and event.occurred_at >= since
+            and event.primary_location_id == primary_location_id
+        )
+
+    async def get_resolution(
+        self, session_id: uuid.UUID, resolution_id: uuid.UUID
+    ) -> Resolution | None:
+        return next((entry for entry in self.resolutions if entry.id == resolution_id), None)
+
+    async def find_resolution_by_key(
+        self, session_id: uuid.UUID, idempotency_key: str
+    ) -> Resolution | None:
+        # Keyed exactly the way the unique index is, so this fake cannot hold two
+        # records under one key either.
+        return next(
+            (
+                entry
+                for entry in self.resolutions
+                if entry.session_id == session_id and entry.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def load_resolutions(
+        self,
+        session_id: uuid.UUID,
+        *,
+        source_type: ResolutionSourceType | None = None,
+        limit: int,
+    ) -> list[Resolution]:
+        found = [
+            entry
+            for entry in self.resolutions
+            if entry.session_id == session_id
+            and (source_type is None or entry.source_type is source_type)
+        ]
+        found.sort(key=lambda entry: (-entry.occurred_at, -entry.created_at.timestamp()))
+        return found[:limit]
+
+    async def load_turn_messages(
+        self, session_id: uuid.UUID, turn_index: int
+    ) -> list[StoredMessage]:
+        return [
+            StoredMessage(
+                id=message_id,
+                turn_index=message.turn_index,
+                role=message.role,
+                speaker_character_id=message.speaker_character_id,
+                content=message.content,
+            )
+            for message_id, message in zip(self.message_ids, self.messages, strict=True)
+            if message.turn_index == turn_index
+        ]
+
     # -- writes -----------------------------------------------------------------
 
     async def set_fact(self, fact: NewFact) -> uuid.UUID:
@@ -321,15 +429,58 @@ class FakeTurnGateway:
         return self.state_revision
 
     async def add_message(self, message: NewMessage) -> uuid.UUID:
+        message_id = uuid.uuid4()
         self.messages.append(message)
-        return uuid.uuid4()
+        self.message_ids.append(message_id)
+        return message_id
 
     async def add_memory(self, memory: NewMemory) -> None:
         self.memories.append(memory)
 
     async def add_event(self, event: NewEvent) -> uuid.UUID:
-        self.events.append(event)
-        return uuid.uuid4()
+        stored = GameEvent(
+            id=uuid.uuid4(),
+            session_id=event.session_id,
+            resolution_id=event.resolution_id,
+            turn_index=event.turn_index,
+            category=event.category,
+            subtype=event.subtype,
+            summary=event.summary,
+            occurred_at=event.occurred_at,
+            # The adapter assigns this; so does the fake, and for the same reason --
+            # `occurred_at` ties are the normal case and something has to break them.
+            sequence=len(self.events) + 1,
+            importance=event.importance,
+            primary_location_id=event.primary_location_id,
+            caused_by_event_id=event.caused_by_event_id,
+            payload=event.payload,
+            created_at=dt.datetime.now(dt.UTC),
+        )
+        self.events.append(stored)
+        return stored.id
+
+    async def add_resolution(self, resolution: NewResolution) -> uuid.UUID:
+        stored = Resolution(
+            id=uuid.uuid4(),
+            session_id=resolution.session_id,
+            source_type=resolution.source_type,
+            source_id=resolution.source_id,
+            parent_resolution_id=resolution.parent_resolution_id,
+            idempotency_key=resolution.idempotency_key,
+            disposition=resolution.disposition,
+            reason_code=resolution.reason_code,
+            resolver_name=resolution.resolver_name,
+            resolver_version=resolution.resolver_version,
+            state_revision_before=resolution.state_revision_before,
+            state_revision_after=resolution.state_revision_after,
+            occurred_at=resolution.occurred_at,
+            turn_index=resolution.turn_index,
+            event_count=resolution.event_count,
+            mutation_count=resolution.mutation_count,
+            created_at=dt.datetime.now(dt.UTC),
+        )
+        self.resolutions.append(stored)
+        return stored.id
 
     async def get_relationship(
         self, session_id: uuid.UUID, character_id: uuid.UUID
@@ -452,7 +603,13 @@ async def test_a_full_turn_runs_with_no_database_at_all() -> None:
                 MemoryCandidate(kind=MemoryKind.FACT, summary="Rin arrived.", importance=3)
             ],
             relationship_changes=[RelationshipChange(character_id=ELENA_ID, trust_delta=2)],
-            world_events=[WorldEvent(type="arrival", description="Rin reached the door.")],
+            world_events=[
+                WorldEvent(
+                    category=EventCategory.ACTION,
+                    subtype="arrival",
+                    summary="Rin reached the door.",
+                )
+            ],
         )
     )
 

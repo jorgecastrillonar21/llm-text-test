@@ -24,6 +24,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import RelationshipVector
+from app.domain.resolution import (
+    EventCategory,
+    GameEvent,
+    Resolution,
+    ResolutionDisposition,
+    ResolutionSourceType,
+)
+from app.domain.vocabulary import MetadataValue
 from app.domain.world_facts import (
     FactAuthority,
     FactKind,
@@ -145,6 +153,24 @@ class TranscriptMessage(BaseModel):
     content: str
 
 
+class StoredMessage(BaseModel):
+    """One persisted message, with its id.
+
+    Separate from `TranscriptMessage`, which is what context assembly reads and
+    deliberately has no id: prose fed to a model does not need one. This is what a
+    replayed turn returns, and there the id matters -- a client matching a retry against
+    what it already rendered has nothing else to match on.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: uuid.UUID
+    turn_index: int
+    role: MessageRole
+    speaker_character_id: uuid.UUID | None
+    content: str
+
+
 class MemoryRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -177,6 +203,9 @@ class NewMessage(BaseModel):
     role: MessageRole
     content: str
     speaker_character_id: uuid.UUID | None = None
+    resolution_id: uuid.UUID | None = None
+    """The mechanical outcome this prose describes, when it describes one. Set for
+    narration of a committed resolution; absent for ordinary turn dialogue."""
 
 
 class NewMemory(BaseModel):
@@ -190,6 +219,13 @@ class NewMemory(BaseModel):
 
 
 class NewEvent(BaseModel):
+    """A historical event to be written, with policy already applied.
+
+    Nothing reaches this model until `EventPolicy` has decided the event is worth
+    keeping and clamped its importance. An adapter writes what it is given; the decision
+    about whether history should record something is not a storage concern.
+    """
+
     model_config = ConfigDict(frozen=True)
 
     session_id: uuid.UUID
@@ -197,8 +233,36 @@ class NewEvent(BaseModel):
     occurred_at: int
     """Fictional time, in session elapsed minutes. Carried alongside `turn_index`
     because they answer different questions: which exchange, and when in the story."""
-    type: str
-    description: str
+    category: EventCategory
+    subtype: str
+    summary: str
+    importance: int
+    resolution_id: uuid.UUID | None = None
+    primary_location_id: uuid.UUID | None = None
+    caused_by_event_id: uuid.UUID | None = None
+    payload: dict[str, MetadataValue] = Field(default_factory=dict)
+
+
+class NewResolution(BaseModel):
+    """A verdict to be recorded. The id is minted by the adapter, like every other."""
+
+    model_config = ConfigDict(frozen=True)
+
+    session_id: uuid.UUID
+    source_type: ResolutionSourceType
+    idempotency_key: str
+    disposition: ResolutionDisposition
+    resolver_name: str
+    resolver_version: str
+    state_revision_before: int
+    state_revision_after: int
+    occurred_at: int
+    event_count: int = 0
+    mutation_count: int = 0
+    source_id: uuid.UUID | None = None
+    parent_resolution_id: uuid.UUID | None = None
+    reason_code: str | None = None
+    turn_index: int | None = None
 
 
 class NewScheduledEvent(BaseModel):
@@ -558,7 +622,99 @@ class SituationReaderPort(Protocol):
         ...
 
 
-class StoryContextReaderPort(FactReaderPort, SpatialReaderPort, SituationReaderPort, Protocol):
+class HistoryReaderPort(Protocol):
+    """Reads over `game_events` -- what has happened in this story."""
+
+    async def load_events(
+        self,
+        session_id: uuid.UUID,
+        *,
+        min_importance: int | None = None,
+        categories: frozenset[EventCategory] | None = None,
+        subtypes: frozenset[str] | None = None,
+        since: int | None = None,
+        limit: int,
+    ) -> list[GameEvent]:
+        """Most recent first in fictional time: `occurred_at` then `sequence`, both
+        descending. Recency leads because history is read to answer "what just
+        happened"; importance is a filter rather than the sort, so that a landmark from
+        year one does not permanently outrank everything since.
+
+        `since` is an absolute session minute, inclusive.
+        """
+        ...
+
+    async def get_event(self, session_id: uuid.UUID, event_id: uuid.UUID) -> GameEvent | None:
+        """Session-scoped on purpose: an id from another save must read as missing."""
+        ...
+
+    async def load_events_for_resolution(self, resolution_id: uuid.UUID) -> list[GameEvent]:
+        """Everything one resolution produced, in fictional order."""
+        ...
+
+    async def count_events_since(
+        self,
+        session_id: uuid.UUID,
+        *,
+        subtype: str,
+        since: int,
+        primary_location_id: uuid.UUID | None = None,
+    ) -> int:
+        """How many events of this subtype are already recorded at or after `since`.
+
+        The one query deduplication needs. Narrow on purpose: a general "find similar
+        events" would be a retrieval feature wearing a policy hat.
+        """
+        ...
+
+
+class EventWriterPort(HistoryReaderPort, Protocol):
+    """Writing history. The reader comes with it because deduplication has to look
+    before it writes, and a writer that could not read would have to be handed the
+    answer by a caller that read on its behalf."""
+
+    async def add_event(self, event: NewEvent) -> uuid.UUID:
+        """Assigns the next per-session `event_sequence`; returns the new id."""
+        ...
+
+
+class ResolutionReaderPort(Protocol):
+    """Reads over `resolutions` -- the mechanical trail."""
+
+    async def get_resolution(
+        self, session_id: uuid.UUID, resolution_id: uuid.UUID
+    ) -> Resolution | None: ...
+
+    async def find_resolution_by_key(
+        self, session_id: uuid.UUID, idempotency_key: str
+    ) -> Resolution | None:
+        """The idempotency lookup. `(session_id, idempotency_key)` is unique in the
+        schema, so this returns at most one row without the query having to say so."""
+        ...
+
+    async def load_resolutions(
+        self,
+        session_id: uuid.UUID,
+        *,
+        source_type: ResolutionSourceType | None = None,
+        limit: int,
+    ) -> list[Resolution]:
+        """Most recent first: `occurred_at` then `created_at`, both descending."""
+        ...
+
+
+class StoryContextReaderPort(
+    # `HistoryReaderPort` sits between facts and space, which reads oddly and is not
+    # negotiable. `WorldStatePort` inherits `EventWriterPort` and therefore
+    # `HistoryReaderPort`, and `StateStorePort` puts `WorldStatePort` ahead of the
+    # spatial and situation ports -- so any class combining both sides needs history
+    # before space. Cosmetic here; an unresolvable MRO in `TurnGatewayPort`.
+    FactReaderPort,
+    HistoryReaderPort,
+    SpatialReaderPort,
+    SituationReaderPort,
+    Protocol,
+):
     """Reads that feed context assembly.
 
     Limits are passed in by the caller because how much history is worth
@@ -605,19 +761,20 @@ class TurnPersistencePort(Protocol):
         """
         ...
 
-    async def add_memory(self, memory: NewMemory) -> None: ...
+    async def load_turn_messages(
+        self, session_id: uuid.UUID, turn_index: int
+    ) -> list[StoredMessage]:
+        """Every message of one exchange, oldest first.
 
-    async def add_event(self, event: NewEvent) -> uuid.UUID:
-        """Record something that happened, and return its id.
-
-        Implementations assign the per-session ordering key. Two events in the same
-        fictional minute must come back in the order they were added, and choosing
-        the number that guarantees that is a storage concern -- the same class of
-        thing as a primary key, and not something a caller should have to pass.
-
-        The id comes back because facts point at the event that caused them. A caller
-        with nothing to attach may ignore it.
+        For replaying an already-played turn. `load_recent_messages` cannot serve this:
+        it is capped by a context budget and returns no ids, and a turn's transcript is
+        exactly the rows of one `turn_index` however many that is.
         """
+        ...
+
+    async def add_memory(self, memory: NewMemory) -> None:
+        """Stage one memory. No id comes back because nothing points at a memory --
+        unlike an event, which facts cite as their cause."""
         ...
 
     async def get_relationship(
@@ -665,9 +822,11 @@ class SessionClockPort(TurnUnitOfWorkPort, Protocol):
         which is also where the never-backward rule is enforced."""
         ...
 
-    async def add_event(self, event: NewEvent) -> uuid.UUID:
-        """Used for the audit trail: why the clock moved, and by how much."""
-        ...
+    # No `add_event` here any more. The clock used to write a GameEvent for every
+    # advance, because a history table was the only audit trail there was. There is a
+    # better one now -- `resolutions` records the source, the resolver and the fictional
+    # instant -- and `time_advanced` is registered with persistence NONE, so a session's
+    # history is no longer mostly the engine narrating its own bookkeeping.
 
     async def add_scheduled_event(self, event: NewScheduledEvent) -> uuid.UUID: ...
 
@@ -692,13 +851,17 @@ class SessionClockPort(TurnUnitOfWorkPort, Protocol):
         ...
 
 
-class WorldStatePort(FactReaderPort, TurnUnitOfWorkPort, Protocol):
+class WorldStatePort(FactReaderPort, EventWriterPort, TurnUnitOfWorkPort, Protocol):
     """What changing the world's current truth needs, and nothing else.
 
     Deliberately narrow in the same way `SessionClockPort` is. The state service can
     read facts, write facts, record an event and move the revision counter. It cannot
     touch the transcript, the relationships or the clock, and the signature is what
     says so.
+
+    `EventWriterPort` is here rather than a bare `add_event` because writing history now
+    means reading it first: a policy may say an event is a repeat of one recorded ten
+    minutes ago, and that question cannot be answered by a port that can only write.
     """
 
     async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...
@@ -748,10 +911,6 @@ class WorldStatePort(FactReaderPort, TurnUnitOfWorkPort, Protocol):
         self, session_id: uuid.UUID, subject: FactSubject, canonical_property: str
     ) -> bool:
         """Delete the current value. True if a row went away."""
-        ...
-
-    async def add_event(self, event: NewEvent) -> uuid.UUID:
-        """The event that caused this change, written before the facts point at it."""
         ...
 
     async def bump_state_revision(self, session_id: uuid.UUID) -> int:
@@ -867,27 +1026,88 @@ class StateStorePort(WorldStatePort, SpatialPort, SituationPort, Protocol):
     """
 
 
-class ProgressionPort(StateStorePort, Protocol):
-    """What applying a situation progression needs.
+class NarrationStorePort(
+    HistoryReaderPort,
+    ResolutionReaderPort,
+    TurnUnitOfWorkPort,
+    Protocol,
+):
+    """What narrating an already-committed outcome needs, and nothing else.
 
-    `StateStorePort` plus one method: a progression may decide when it is worth looking
-    at this process again, and writing that down is scheduling. Everything else it
-    does -- moving the situation, changing a location, establishing a fact, starting a
-    child process -- is an ordinary state mutation and needs nothing new.
+    Narrow in a way that is load-bearing rather than tidy. Narration runs *after* the
+    resolution's transaction has closed, so this port deliberately cannot write a fact,
+    an event, a mutation or the clock: whatever the language model says, the only thing
+    that can change as a result is one row in `messages`. A provider that hallucinated a
+    consequence has nowhere to put it.
 
-    Deliberately not all of `SessionClockPort`: a progression schedules, it does not
-    move the clock. Advancing time is what *causes* progressions, and a resolver that
-    could advance time could evaluate itself forever.
+    Reads are here because the prompt is built from the record -- the resolution, the
+    events it produced, the session and the world -- and not from anything the caller
+    happened to be holding.
     """
 
-    async def add_scheduled_event(self, event: NewScheduledEvent) -> uuid.UUID: ...
+    async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...
+
+    async def get_world(self, world_id: uuid.UUID) -> WorldSnapshot | None:
+        """The world, for its language and its name. An outcome narrated in the wrong
+        language is a bug the player sees immediately."""
+        ...
+
+    async def get_resolution_narration(
+        self, session_id: uuid.UUID, resolution_id: uuid.UUID
+    ) -> StoredMessage | None:
+        """The message already describing this resolution, if one exists.
+
+        At most one: narration is stored once per resolution and regenerating replaces
+        it. Session-scoped, like every other resolution read, so an id from another save
+        reads as missing rather than as somebody else's prose.
+        """
+        ...
+
+    async def add_message(self, message: NewMessage) -> uuid.UUID:
+        """Stage the narration and return its id. Staged, not committed -- the service
+        commits explicitly, in one place."""
+        ...
+
+    async def replace_message_content(self, message_id: uuid.UUID, content: str) -> None:
+        """Overwrite one message's prose in place.
+
+        The single mutable thing in this whole subsystem, and only prose. Facts, events
+        and resolutions are append-only; a regenerated narration is a better description
+        of an outcome that has not changed, so a second row would give one outcome two
+        descriptions and no way to say which is current.
+        """
+        ...
+
+
+class ResolutionStorePort(
+    StateStorePort,
+    SessionClockPort,
+    ResolutionReaderPort,
+    EventWriterPort,
+    Protocol,
+):
+    """Everything one resolution can touch, behind one transaction.
+
+    Wider than any other store port, and it has to be: a resolution is the unit that
+    commits a verdict, the events it caused, the mutations it caused and the clock it
+    moved, all or nothing. Splitting it would mean two transactions and a window where
+    the world has changed but nothing records why.
+
+    `SessionClockPort` is in here, and the direction is what makes that safe: the
+    application hands a resolver's *request* to the time service, which processes
+    whatever comes due. The resolver itself never receives this port -- it is given a
+    `ResolutionContext` and returns an outcome. A resolver that could advance time
+    directly could trigger the progressions that advancing causes, and evaluate itself
+    forever.
+    """
+
+    async def add_resolution(self, resolution: NewResolution) -> uuid.UUID: ...
 
 
 class TurnGatewayPort(
     StoryContextReaderPort,
     TurnPersistencePort,
-    StateStorePort,
-    TurnUnitOfWorkPort,
+    ResolutionStorePort,
     Protocol,
 ):
     """The ports a turn needs, as one object, because one transaction spans them all.
@@ -910,4 +1130,10 @@ class TurnGatewayPort(
     `SituationPort` joined next, and the pattern is now the pattern: a turn reads what
     is under way to build its context, and may start a process the story just set in
     motion. Same transaction, so a failed turn takes the riot with it.
+
+    `ResolutionStorePort` replaced `StateStorePort` when turns gained idempotency. A
+    turn now looks for its own `client_action_id` before doing anything, and records a
+    `ResolutionRecord` for what it did -- both inside the same transaction as
+    everything else, which is what makes "this action was already played" a fact rather
+    than a guess.
     """

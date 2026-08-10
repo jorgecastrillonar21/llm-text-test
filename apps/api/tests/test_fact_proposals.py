@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.contracts import MAX_FACT_PROPOSALS, FactProposal, TurnGeneration
 from app.application.fact_proposals import ProposalOutcome, review_fact_proposals
-from app.application.state_service import StateChangeEvent, apply_state_change
+from app.application.state_service import apply_state_change
 from app.domain.state_mutations import StateMutationBatch
 from app.domain.world_facts import (
     WORLD_SUBJECT,
@@ -26,6 +26,7 @@ from app.domain.world_facts import (
 from app.domain.world_rules import default_world_rules
 from app.infrastructure.db import models
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
+from tests.support import cause_from_resolution
 
 
 async def _bootstrap(
@@ -259,7 +260,7 @@ async def test_a_proposal_that_contradicts_established_truth_is_refused(
             authority=FactAuthority.SEED,
             mutations=[SetFact(subject=subject, property="narrative.birthplace", value="Arven")],
         ),
-        event=StateChangeEvent(type="seed", description="Established at creation."),
+        cause=cause_from_resolution(),
     )
 
     review = await _review(
@@ -298,7 +299,7 @@ async def test_repeating_an_established_value_is_refused_too(
             authority=FactAuthority.SEED,
             mutations=[SetFact(subject=subject, property="narrative.birthplace", value="Arven")],
         ),
-        event=StateChangeEvent(type="seed", description="Established at creation."),
+        cause=cause_from_resolution(),
     )
 
     review = await _review(

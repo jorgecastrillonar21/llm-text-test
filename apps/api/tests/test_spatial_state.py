@@ -27,7 +27,7 @@ from app.application.spatial_service import (
     load_spatial_graph,
     materialize_initial_spatial_state,
 )
-from app.application.state_service import StateChangeEvent, apply_state_change
+from app.application.state_service import apply_state_change
 from app.domain.errors import (
     FactPolicyError,
     NotFoundError,
@@ -47,6 +47,7 @@ from app.domain.world_locations import (
 )
 from app.infrastructure.db import models
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
+from tests.support import cause_from_event, cause_from_resolution
 
 
 async def _world(db: AsyncSession, make_world) -> models.World:
@@ -158,7 +159,7 @@ async def test_definitions_are_shared_and_states_are_not(
                 UpdateLocationState(location_id=tavern.id, condition=LocationCondition.DESTROYED)
             ],
         ),
-        event=StateChangeEvent(type="FIRE", description="The Broken Crown burned down."),
+        cause=cause_from_resolution(),
     )
 
     ruined = await store.get_location_state(first.id, tavern.id)
@@ -408,7 +409,7 @@ async def test_a_blocked_connection_is_still_an_edge_but_not_passable(
                 )
             ],
         ),
-        event=StateChangeEvent(type="COLLAPSE", description="The doorway came down."),
+        cause=cause_from_resolution(),
     )
 
     graph = await load_spatial_graph(store, session_id=session.id, world_id=world.id)
@@ -556,7 +557,7 @@ async def test_a_default_state_is_left_out_of_the_context(
                 UpdateLocationState(location_id=tavern.id, condition=LocationCondition.RUINED)
             ],
         ),
-        event=StateChangeEvent(type="FIRE", description="It burned."),
+        cause=cause_from_resolution(),
     )
     changed = await get_spatial_context(
         store, session_id=session.id, world_id=world.id, location_id=tavern.id
@@ -649,7 +650,7 @@ async def test_one_bad_spatial_mutation_takes_the_whole_batch_with_it(
                     ),
                 ],
             ),
-            event=StateChangeEvent(type="COLLAPSE", description="Half a street came down."),
+            cause=cause_from_resolution(),
         )
 
     state = await store.get_location_state(session.id, tavern.id)
@@ -685,6 +686,7 @@ async def test_one_event_can_change_a_place_an_edge_and_a_fact_together(
     store = SqlAlchemyTurnGateway(db_session)
     await materialize_initial_spatial_state(store, session_id=session.id)
 
+    cause = await cause_from_event(store, session.id, subtype="bridge_collapsed")
     result = await apply_state_change(
         store,
         session_id=session.id,
@@ -708,7 +710,7 @@ async def test_one_event_can_change_a_place_an_edge_and_a_fact_together(
                 ),
             ],
         ),
-        event=StateChangeEvent(type="COLLAPSE", description="The front gave way."),
+        cause=cause,
     )
 
     assert result.revision == 1
@@ -718,7 +720,9 @@ async def test_one_event_can_change_a_place_an_edge_and_a_fact_together(
         "connection_state",
         f"location:{tavern.id}",
     }
-    # One event for the whole batch, not one per mutation.
+    # The one event is the collapse itself. Applying the batch adds none of its own --
+    # three mutations are three consequences of one thing happening, not three things.
+    assert result.event_id == cause.event_id
     events = (
         await db_session.execute(
             select(func.count())
@@ -750,7 +754,7 @@ async def test_a_spatial_mutation_leaves_the_definition_alone(
                 UpdateLocationState(location_id=tavern.id, condition=LocationCondition.DESTROYED)
             ],
         ),
-        event=StateChangeEvent(type="FIRE", description="It burned."),
+        cause=cause_from_resolution(),
     )
 
     after = await store.get_location(session.id, tavern.id)
@@ -791,7 +795,7 @@ async def test_destroying_a_place_does_not_cascade_to_what_is_inside_it(
                 UpdateLocationState(location_id=tavern.id, condition=LocationCondition.DESTROYED)
             ],
         ),
-        event=StateChangeEvent(type="FIRE", description="It burned."),
+        cause=cause_from_resolution(),
     )
 
     cellar_state = await store.get_location_state(session.id, cellar_id)
@@ -851,7 +855,7 @@ async def test_a_location_s_condition_may_not_be_written_as_a_fact(
                     )
                 ],
             ),
-            event=StateChangeEvent(type="debug", description="x"),
+            cause=cause_from_resolution(),
         )
 
 
@@ -885,7 +889,7 @@ async def test_no_authority_may_write_a_property_a_dedicated_model_owns(
                     )
                 ],
             ),
-            event=StateChangeEvent(type="debug", description="x"),
+            cause=cause_from_resolution(),
         )
 
 
@@ -937,12 +941,12 @@ async def test_a_stale_revision_still_refuses_a_spatial_batch(
         store,
         session_id=session.id,
         batch=batch,
-        event=StateChangeEvent(type="WEAR", description="Time passes."),
+        cause=cause_from_resolution(),
     )
     with pytest.raises(StaleStateError):
         await apply_state_change(
             store,
             session_id=session.id,
             batch=batch,
-            event=StateChangeEvent(type="WEAR", description="Again."),
+            cause=cause_from_resolution(),
         )

@@ -1,8 +1,14 @@
-"""Everything a story provider is allowed to see about a turn.
+"""Everything a story provider is allowed to see.
 
-Providers receive this object and nothing else -- no database session, no ORM
+Providers receive one of these objects and nothing else -- no database session, no ORM
 models. Retrieval policy therefore lives in one place (context_builder) and stays
 testable and deterministic.
+
+Two of them, for the two things a provider is asked to do. `StoryContext` is the turn:
+here is the world, here is what the player typed, narrate what happens. `OutcomeContext`
+is narration after the fact: here is what the game has already decided and committed,
+describe it. The second is much smaller on purpose -- there is nothing left to decide,
+so there is nothing left to show.
 """
 
 from __future__ import annotations
@@ -12,6 +18,8 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.enums import Language, MemoryKind, MessageRole
+from app.domain.resolution import ResolutionDisposition
+from app.domain.vocabulary import MetadataValue
 from app.domain.world_locations import LocationAccessibility, LocationCondition
 from app.domain.world_rules.enums import (
     ChanceModel,
@@ -231,6 +239,51 @@ class SituationsContext(BaseModel):
     ongoing: list[SituationContext] = Field(default_factory=list)
 
 
+class EventContext(BaseModel):
+    """One thing that has already happened, phrased for a reader.
+
+    No id, like `FactContext` and `PlaceContext`, and for the same reason. The director
+    is also given no payload: the structured detail an event carries is mechanical input
+    for game systems, and a narrator that reads `{"damage": 12}` starts doing arithmetic
+    in prose. What reaches the prompt is the summary that was written when the event was
+    recorded, and when it happened.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    summary: str
+    kind: str
+    """The subtype if there was one, otherwise the category: `bridge_collapsed`,
+    `action`."""
+
+    when: str
+    """Rendered relative to now -- "3 hours ago", "just now". The absolute minute stays
+    out of the prompt for the same reason the raw clock does."""
+
+
+class HistoryContext(BaseModel):
+    """What has happened in this session, in two bands.
+
+    Never the whole history. A session accumulates events indefinitely and a prompt does
+    not grow, so retrieval is bounded and deterministic; the limits and the reasoning
+    live in `context_builder` with every other retrieval decision.
+
+    The split exists because recency and weight answer different questions. A siege that
+    began forty turns ago still shapes every scene; what happened in the last hour is
+    what a character would actually mention.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    landmarks: list[EventContext] = Field(default_factory=list)
+    """The heaviest events of the whole session, oldest first. These are what the story
+    is about."""
+
+    recent: list[EventContext] = Field(default_factory=list)
+    """What has happened lately, oldest first, excluding anything already listed as a
+    landmark."""
+
+
 class CharacterContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -388,8 +441,56 @@ class StoryContext(BaseModel):
     same reason `space` is."""
 
     world_facts: WorldFactsContext = Field(default_factory=WorldFactsContext)
+    history: HistoryContext = Field(default_factory=HistoryContext)
+    """What has already happened, bounded. Empty on a session that has not recorded
+    anything worth remembering, which is most early sessions."""
+
     relevant_characters: list[CharacterContext] = Field(default_factory=list)
     recent_messages: list[MessageContext] = Field(default_factory=list)
     relevant_memories: list[MemoryContext] = Field(default_factory=list)
     relationships: list[RelationshipContext] = Field(default_factory=list)
     player_action: str
+
+
+class OutcomeContext(BaseModel):
+    """What a story provider is shown when it narrates an outcome that already happened.
+
+    Small, and deliberately so. Everything a turn's context carries in order to help a
+    model *decide* something -- the rules, the geography, the characters' secrets, the
+    relationship vectors -- is absent, because the deciding is over. What is left is the
+    verdict, the events history kept, and enough of the scene to write a paragraph in
+    the right language at the right time of day.
+
+    The mechanics in here are authoritative and already committed. A narrator's contract
+    (`OutcomeNarration`) has one field, so there is nowhere for it to disagree.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    world: WorldContext
+    player: PlayerContext
+    time: TimeContext
+
+    disposition: ResolutionDisposition
+    """`applied`, `rejected` or `no_effect`. Never `success` or `failure`: an attempt
+    that happened and went badly is `applied`, and prose that called it a failure would
+    read as the world refusing it."""
+
+    reason_code: str | None = None
+    """Why, when there is a machine-readable why: `already_progressed`, `invalid_target`.
+    Given to the narrator as a hint about what to write, never as a phrase to print."""
+
+    resolver: str
+    """What decided this, by name. Not shown to the player -- it is here so a narrator
+    of an unfamiliar outcome has something better than a shrug."""
+
+    events: list[EventContext] = Field(default_factory=list)
+    """What history kept, oldest first. Often empty: most outcomes change the world
+    without producing anything worth remembering, and the prose still has the detail
+    below to work from."""
+
+    detail: dict[str, MetadataValue] = Field(default_factory=dict)
+    """The resolver's own `narrative_context` -- flat, structured, and the authoritative
+    account of what happened. Empty when a stored resolution is being narrated after the
+    fact: the outcome object was a value in a process that has finished, and it is not
+    reconstructed from the rows. See `app.application.narration_service`."""

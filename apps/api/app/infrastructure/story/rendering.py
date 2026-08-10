@@ -1,8 +1,15 @@
-"""Renders a StoryContext into the user message sent to a language model."""
+"""Renders a context into the user message sent to a language model.
+
+Two contexts, two renderers, and they share almost nothing on purpose: a turn's prompt
+is the world, and an outcome's prompt is a verdict. See `app.application.story_context`.
+"""
 
 from __future__ import annotations
 
 from app.application.story_context import (
+    EventContext,
+    HistoryContext,
+    OutcomeContext,
     PlaceContext,
     SituationsContext,
     SpatialContext,
@@ -203,12 +210,37 @@ def _render_situations(situations: SituationsContext | None) -> list[str]:
     lines = ["\n# What is going on  (authoritative: you may narrate these, never change them)"]
     for entry in situations.ongoing:
         lines.append(
-            f"- {entry.title} ({entry.kind}, {_words(entry.scope)}) � "
+            f"- {entry.title} ({entry.kind}, {_words(entry.scope)}) — "
             f"{_words(entry.status)}, intensity {entry.intensity}/100, "
             f"danger {entry.threat}/100, {_momentum_word(entry.momentum)}, "
             f"running {entry.duration}"
         )
     return lines
+
+
+def _render_history(history: HistoryContext) -> list[str]:
+    """What has already happened, in two short lists.
+
+    Omitted when both are empty, like the geography and situation blocks. The heading
+    says these are settled: an event is a record of something that happened, and the
+    director's response has no field that edits one -- history is append-only, and a
+    correction would be a new event that a game system decides to write.
+    """
+    if not history.landmarks and not history.recent:
+        return []
+
+    lines = ["\n# What has already happened  (authoritative: settled, not open to revision)"]
+    if history.landmarks:
+        lines.append("This story so far:")
+        lines.extend(_event_line(event) for event in history.landmarks)
+    if history.recent:
+        lines.append("Lately:")
+        lines.extend(_event_line(event) for event in history.recent)
+    return lines
+
+
+def _event_line(event: EventContext) -> str:
+    return f"- [{_words(event.kind)}] {event.summary} ({event.when})"
 
 
 def render_context(context: StoryContext) -> str:
@@ -269,6 +301,10 @@ def render_context(context: StoryContext) -> str:
                 f"- {fact.subject} — {fact.property}: {fact.value}" for fact in facts.relevant
             )
 
+    # After the established truth and before the characters: what happened is the other
+    # thing the scene has to agree with, and a model reads a prompt in order.
+    lines.extend(_render_history(context.history))
+
     if context.relevant_characters:
         lines.append("\n# Characters present in this world")
         for character in context.relevant_characters:
@@ -316,3 +352,69 @@ def render_context(context: StoryContext) -> str:
     )
 
     return "\n".join(lines)
+
+
+def render_outcome(context: OutcomeContext) -> str:
+    """The prompt for narrating something that already happened.
+
+    Short by construction. Everything a turn's prompt carries so a model can decide
+    something is missing here, because the deciding is over -- what is left is the
+    verdict, what history kept, and the scene's language and hour.
+
+    The detail block is rendered as flat `key: value` lines rather than as JSON. A model
+    handed JSON tends to answer in the register of JSON, and this is the one part of the
+    prompt whose whole purpose is to become a sentence.
+    """
+    language = LANGUAGE_NAMES[context.world.language]
+    lines = [
+        f"# Output language\nWrite the narration in {language}. The JSON key stays in English.\n",
+        "# World",
+        f"{context.world.name} — {context.world.genre}",
+    ]
+    if context.world.setting:
+        lines.append(f"Setting: {context.world.setting}")
+
+    lines.append("\n# Player character")
+    lines.append(f"Name: {context.player.name}")
+    if context.player.description:
+        lines.append(context.player.description)
+
+    lines.append("\n# When")
+    lines.append(
+        f"{context.time.calendar_date}, {context.time.clock} "
+        f"({_words(context.time.period)}) — {context.time.elapsed_since_start} "
+        f"into this story"
+    )
+
+    lines.append("\n# The outcome  (authoritative: already resolved and recorded)")
+    lines.append(f"Disposition: {_words(context.disposition)}")
+    if context.reason_code:
+        lines.append(f"Reason: {_words(context.reason_code)}")
+    lines.append(f"Decided by: {context.resolver}")
+
+    if context.detail:
+        lines.append("\nWhat changed:")
+        lines.extend(
+            f"- {_words(key)}: {_detail_value(value)}" for key, value in context.detail.items()
+        )
+
+    if context.events:
+        lines.append("\nRecorded in history:")
+        lines.extend(f"- {event.summary} ({event.when})" for event in context.events)
+
+    lines.append("\nNarrate this outcome. Respond only with an object matching the JSON schema.")
+    return "\n".join(lines)
+
+
+def _detail_value(value: object) -> str:
+    """`True` -> `yes`, `[a, b]` -> `a, b`. The same rendering the fact block uses.
+
+    A raw Python repr in a prompt is a repr a model will quote back at the player.
+    """
+    if isinstance(value, bool):  # Before the int branch: bool is int.
+        return "yes" if value else "no"
+    if value is None:
+        return "none"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "nothing"
+    return str(value)

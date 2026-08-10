@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import ColumnElement, Select, func, or_, select
+from sqlalchemy import ColumnElement, Select, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 
@@ -32,6 +32,7 @@ from app.application.persistence import (
     NewMemory,
     NewMessage,
     NewParticipant,
+    NewResolution,
     NewScheduledEvent,
     NewSituation,
     NewZone,
@@ -39,11 +40,19 @@ from app.application.persistence import (
     ScheduledEventRecord,
     SessionSnapshot,
     SituationUpdate,
+    StoredMessage,
     TranscriptMessage,
     WorldSnapshot,
 )
 from app.domain.errors import NotFoundError
 from app.domain.relationships import RelationshipVector
+from app.domain.resolution import (
+    EventCategory,
+    GameEvent,
+    Resolution,
+    ResolutionDisposition,
+    ResolutionSourceType,
+)
 from app.domain.world_facts import FactKind, FactSubject, SetFact, WorldFact
 from app.domain.world_locations import (
     LocationConnection,
@@ -272,6 +281,47 @@ def _ordered_situations(query: Select[tuple[models.Situation]]) -> Select[tuple[
     )
 
 
+def _to_game_event(row: models.GameEvent) -> GameEvent:
+    return GameEvent(
+        id=row.id,
+        session_id=row.session_id,
+        resolution_id=row.resolution_id,
+        turn_index=row.turn_index,
+        category=EventCategory(row.category),
+        subtype=row.subtype,
+        summary=row.summary,
+        occurred_at=row.occurred_at,
+        sequence=row.event_sequence,
+        importance=row.importance,
+        primary_location_id=row.primary_location_id,
+        caused_by_event_id=row.caused_by_event_id,
+        payload=dict(row.payload),
+        created_at=row.created_at,
+    )
+
+
+def _to_resolution(row: models.Resolution) -> Resolution:
+    return Resolution(
+        id=row.id,
+        session_id=row.session_id,
+        source_type=ResolutionSourceType(row.source_type),
+        source_id=row.source_id,
+        parent_resolution_id=row.parent_resolution_id,
+        idempotency_key=row.idempotency_key,
+        disposition=ResolutionDisposition(row.disposition),
+        reason_code=row.reason_code,
+        resolver_name=row.resolver_name,
+        resolver_version=row.resolver_version,
+        state_revision_before=row.state_revision_before,
+        state_revision_after=row.state_revision_after,
+        occurred_at=row.occurred_at,
+        turn_index=row.turn_index,
+        event_count=row.event_count,
+        mutation_count=row.mutation_count,
+        created_at=row.created_at,
+    )
+
+
 def _to_scheduled_event(row: models.ScheduledEvent) -> ScheduledEventRecord:
     return ScheduledEventRecord(
         id=row.id,
@@ -434,6 +484,7 @@ class SqlAlchemyTurnGateway:
             turn_index=message.turn_index,
             role=message.role,
             speaker_character_id=message.speaker_character_id,
+            resolution_id=message.resolution_id,
             content=message.content,
         )
         self._db.add(row)
@@ -441,6 +492,70 @@ class SqlAlchemyTurnGateway:
         # context queries below while a failed turn still rolls the whole thing back.
         await self._db.flush()
         return row.id
+
+    async def get_resolution_narration(
+        self, session_id: uuid.UUID, resolution_id: uuid.UUID
+    ) -> StoredMessage | None:
+        row = (
+            await self._db.execute(
+                select(models.Message)
+                .where(
+                    models.Message.session_id == session_id,
+                    models.Message.resolution_id == resolution_id,
+                )
+                .order_by(models.Message.created_at, models.Message.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        # Ordered and limited rather than trusted to be unique: the schema does not
+        # enforce one message per resolution -- messages point at resolutions, not the
+        # other way round -- so "the narration" is defined here as the oldest one.
+        if row is None:
+            return None
+        return StoredMessage(
+            id=row.id,
+            turn_index=row.turn_index,
+            role=row.role,
+            speaker_character_id=row.speaker_character_id,
+            content=row.content,
+        )
+
+    async def replace_message_content(self, message_id: uuid.UUID, content: str) -> None:
+        await self._db.execute(
+            update(models.Message).where(models.Message.id == message_id).values(content=content)
+        )
+        await self._db.flush()
+
+    async def load_turn_messages(
+        self, session_id: uuid.UUID, turn_index: int
+    ) -> list[StoredMessage]:
+        rows = (
+            (
+                await self._db.execute(
+                    select(models.Message)
+                    .where(
+                        models.Message.session_id == session_id,
+                        models.Message.turn_index == turn_index,
+                    )
+                    .order_by(models.Message.created_at, models.Message.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # `id` breaks ties on `created_at`: within one turn every row is written in the
+        # same transaction, and SQLite's timestamp resolution is coarse enough that the
+        # player's action and the narration answering it can share a microsecond.
+        return [
+            StoredMessage(
+                id=row.id,
+                turn_index=row.turn_index,
+                role=row.role,
+                speaker_character_id=row.speaker_character_id,
+                content=row.content,
+            )
+            for row in rows
+        ]
 
     async def add_memory(self, memory: NewMemory) -> None:
         self._db.add(
@@ -456,11 +571,17 @@ class SqlAlchemyTurnGateway:
     async def add_event(self, event: NewEvent) -> uuid.UUID:
         row = models.GameEvent(
             session_id=event.session_id,
+            resolution_id=event.resolution_id,
             turn_index=event.turn_index,
             occurred_at=event.occurred_at,
             event_sequence=await self._next_event_sequence(event.session_id),
-            type=event.type,
-            description=event.description,
+            category=event.category,
+            subtype=event.subtype,
+            summary=event.summary,
+            importance=event.importance,
+            primary_location_id=event.primary_location_id,
+            caused_by_event_id=event.caused_by_event_id,
+            payload=dict(event.payload),
         )
         self._db.add(row)
         # Flushed immediately so the next event in this turn sees this one when it
@@ -1004,6 +1125,150 @@ class SqlAlchemyTurnGateway:
             role=participant.role,
         )
         self._db.add(row)
+        await self._db.flush()
+        return row.id
+
+    # -- HistoryReaderPort ------------------------------------------------------
+
+    async def load_events(
+        self,
+        session_id: uuid.UUID,
+        *,
+        min_importance: int | None = None,
+        categories: frozenset[EventCategory] | None = None,
+        subtypes: frozenset[str] | None = None,
+        since: int | None = None,
+        limit: int,
+    ) -> list[GameEvent]:
+        query = select(models.GameEvent).where(models.GameEvent.session_id == session_id)
+        if min_importance is not None:
+            query = query.where(models.GameEvent.importance >= min_importance)
+        if categories:
+            query = query.where(models.GameEvent.category.in_(categories))
+        if subtypes:
+            query = query.where(models.GameEvent.subtype.in_(subtypes))
+        if since is not None:
+            query = query.where(models.GameEvent.occurred_at >= since)
+        rows = (
+            await self._db.execute(
+                # Newest first in *fictional* time. `created_at` never participates:
+                # a save restored on another machine must read in the same order.
+                query.order_by(
+                    models.GameEvent.occurred_at.desc(),
+                    models.GameEvent.event_sequence.desc(),
+                ).limit(limit)
+            )
+        ).scalars()
+        return [_to_game_event(row) for row in rows]
+
+    async def get_event(self, session_id: uuid.UUID, event_id: uuid.UUID) -> GameEvent | None:
+        row = (
+            await self._db.execute(
+                select(models.GameEvent).where(
+                    models.GameEvent.session_id == session_id,
+                    models.GameEvent.id == event_id,
+                )
+            )
+        ).scalar_one_or_none()
+        return None if row is None else _to_game_event(row)
+
+    async def load_events_for_resolution(self, resolution_id: uuid.UUID) -> list[GameEvent]:
+        rows = (
+            await self._db.execute(
+                select(models.GameEvent)
+                .where(models.GameEvent.resolution_id == resolution_id)
+                .order_by(models.GameEvent.occurred_at, models.GameEvent.event_sequence)
+            )
+        ).scalars()
+        return [_to_game_event(row) for row in rows]
+
+    async def count_events_since(
+        self,
+        session_id: uuid.UUID,
+        *,
+        subtype: str,
+        since: int,
+        primary_location_id: uuid.UUID | None = None,
+    ) -> int:
+        query = select(func.count()).where(
+            models.GameEvent.session_id == session_id,
+            models.GameEvent.subtype == subtype,
+            models.GameEvent.occurred_at >= since,
+        )
+        if primary_location_id is not None:
+            query = query.where(models.GameEvent.primary_location_id == primary_location_id)
+        return (await self._db.execute(query)).scalar() or 0
+
+    # -- ResolutionReaderPort ---------------------------------------------------
+
+    async def get_resolution(
+        self, session_id: uuid.UUID, resolution_id: uuid.UUID
+    ) -> Resolution | None:
+        row = (
+            await self._db.execute(
+                select(models.Resolution).where(
+                    models.Resolution.session_id == session_id,
+                    models.Resolution.id == resolution_id,
+                )
+            )
+        ).scalar_one_or_none()
+        return None if row is None else _to_resolution(row)
+
+    async def find_resolution_by_key(
+        self, session_id: uuid.UUID, idempotency_key: str
+    ) -> Resolution | None:
+        row = (
+            await self._db.execute(
+                select(models.Resolution).where(
+                    models.Resolution.session_id == session_id,
+                    models.Resolution.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+        return None if row is None else _to_resolution(row)
+
+    async def load_resolutions(
+        self,
+        session_id: uuid.UUID,
+        *,
+        source_type: ResolutionSourceType | None = None,
+        limit: int,
+    ) -> list[Resolution]:
+        query = select(models.Resolution).where(models.Resolution.session_id == session_id)
+        if source_type is not None:
+            query = query.where(models.Resolution.source_type == source_type)
+        rows = (
+            await self._db.execute(
+                query.order_by(
+                    models.Resolution.occurred_at.desc(),
+                    models.Resolution.created_at.desc(),
+                ).limit(limit)
+            )
+        ).scalars()
+        return [_to_resolution(row) for row in rows]
+
+    async def add_resolution(self, resolution: NewResolution) -> uuid.UUID:
+        row = models.Resolution(
+            session_id=resolution.session_id,
+            source_type=resolution.source_type,
+            source_id=resolution.source_id,
+            parent_resolution_id=resolution.parent_resolution_id,
+            idempotency_key=resolution.idempotency_key,
+            disposition=resolution.disposition,
+            reason_code=resolution.reason_code,
+            resolver_name=resolution.resolver_name,
+            resolver_version=resolution.resolver_version,
+            state_revision_before=resolution.state_revision_before,
+            state_revision_after=resolution.state_revision_after,
+            occurred_at=resolution.occurred_at,
+            turn_index=resolution.turn_index,
+            event_count=resolution.event_count,
+            mutation_count=resolution.mutation_count,
+        )
+        self._db.add(row)
+        # Flushed so the unique constraint on (session_id, idempotency_key) is enforced
+        # here rather than at commit. A duplicate has to fail while the caller is still
+        # in a position to recognise it as a replay.
         await self._db.flush()
         return row.id
 

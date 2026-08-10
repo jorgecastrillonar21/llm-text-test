@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { useI18n } from '@/i18n/useI18n';
 import {
+  newClientActionId,
   useAiStatus,
   useCharacters,
   useMessages,
@@ -9,6 +10,7 @@ import {
   useSituations,
   useSubmitTurn,
 } from '@/api/hooks';
+import type { TurnSubmission } from '@/api/types';
 import { Button, Spinner } from '@/components/ui';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Timeline } from '@/features/sessions/Timeline';
@@ -28,13 +30,30 @@ export function SessionPage() {
   const submitTurn = useSubmitTurn(sessionId);
 
   const [suggestions, setSuggestions] = useState<string[]>([]);
-  const [lastAction, setLastAction] = useState('');
+  const [submission, setSubmission] = useState<TurnSubmission | null>(null);
 
-  function runTurn(action: string) {
-    setLastAction(action);
-    submitTurn.mutate(action, {
+  function send(next: TurnSubmission) {
+    setSubmission(next);
+    submitTurn.mutate(next, {
       onSuccess: (result) => setSuggestions(result.suggested_actions),
     });
+  }
+
+  /** A new action from the player: a new submission, and a new id for it. */
+  function runTurn(action: string) {
+    send({ action, clientActionId: newClientActionId() });
+  }
+
+  /**
+   * The same submission again, under the id it already had.
+   *
+   * This is what makes the retry button safe. A failed turn is usually a no-op, but a
+   * response that never arrived may have been a turn that was played -- and in that case
+   * the server recognises the id and returns the turn it already played instead of
+   * playing a second one.
+   */
+  function retryTurn() {
+    if (submission !== null) send(submission);
   }
 
   if (session.isPending) return <Spinner label={t('common.loading')} />;
@@ -97,8 +116,8 @@ export function SessionPage() {
           <Button
             variant="ghost"
             className="mt-2"
-            onClick={() => runTurn(lastAction)}
-            disabled={submitTurn.isPending || lastAction === ''}
+            onClick={retryTurn}
+            disabled={submitTurn.isPending || submission === null}
           >
             {t('common.retry')}
           </Button>

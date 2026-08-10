@@ -19,6 +19,7 @@ no database session.
 | `recent_messages` | transcript, oldest-first | 20 |
 | `relevant_memories` | importance desc, then recency | 30 |
 | `relationships` | current axis values per character | — |
+| `history` | what has already happened, in two bands | 8 + 12 |
 | `player_action` | this turn's raw input | 2000 chars |
 
 Retrieval is pure SQL ordering — deterministic and reproducible. The same context always
@@ -154,6 +155,32 @@ Selection is deterministic, banded and capped at six; see
 tags `secret` are withheld — a stopgap for the absent `KnowledgeState`, and documented
 there as the convention it is.
 
+### History in the context
+
+`history` is a `HistoryContext` — what has already happened in this session, in two
+bands. It renders as:
+
+```text
+# What has already happened  (authoritative: settled, not open to revision)
+This story so far:
+- [character] King Aldric is dead. (3 days ago)
+Lately:
+- [world] The east gate gave way. (an hour ago)
+```
+
+**Landmarks** are the heaviest events of the whole session — importance ≥ 4, at most 8 —
+and they are what the story is *about*: a siege that began forty turns ago still shapes
+every scene. **Recent** is importance ≥ 2, at most 12, with anything already listed as a
+landmark excluded. Both are oldest-first, and both are usually empty in an early session.
+
+Neither band grows with how long the save has been played. The whole history is never
+loaded: a session accumulates events indefinitely and a prompt does not grow.
+
+The `resolutions` table is **not** in the context at any size. Idempotency keys, resolver
+versions and revision numbers are engine bookkeeping — the director is told what happened,
+not how the engine decided it. Selection lives in `context_builder` with every other
+retrieval decision; semantics in [event-resolution.md](event-resolution.md).
+
 ## TurnGeneration — what the model returns
 
 ```text
@@ -202,6 +229,37 @@ world-scoped memory is a Phase 2 concern.
 A memory is not a fact. A memory is what someone recalls, fallibly; a fact is what the
 game asserts is so. See `fact_proposals` below and
 [world-state-facts.md](world-state-facts.md).
+
+### World events
+
+```text
+category   : action | combat | movement | social | world | situation | spatial
+             | character | political | economic | system | other
+subtype    : snake_case, 1..80 chars
+summary    : string, 1..500 chars
+importance : 1..5 | null
+```
+
+Something the model believes just happened and is worth remembering — a *proposal*, like
+`FactProposal`. `category` is a closed enum because retrieval filters on it, and it
+defaults to `other` rather than to a guess: a model that did not pick one has not told us
+anything. `subtype` is an open string, because an enum of several hundred event names is
+wrong the first time anyone adds a system.
+
+**Whether history keeps it, and at what importance, is decided by policy the model cannot
+see.** `application/event_service.py` looks the subtype up, drops it entirely if its
+policy says `none`, and clamps the proposed importance into the band that subtype allows.
+`importance: null` means "no opinion", which is the honest answer most of the time.
+
+That split is not politeness. A model asked to rate what it has just written rates all of
+it highly, so a spilled drink and a coronation both arrive at 5 — and the events reaching
+the *next* prompt are selected by importance, so a model that could set its own scale
+would be choosing what it gets to remember.
+
+`summary` is one line for people to read. It is **never parsed for mechanics**: a world
+event does not change a fact, move a thing, or advance the clock. Those go through
+`fact_proposals`, `location_proposals` and the resolution pipeline. See
+[event-resolution.md](event-resolution.md).
 
 ### Fact proposals
 
@@ -334,6 +392,39 @@ client; wiring it to actual generation is Phase 4.
 are **suggestions only** — the composer always accepts arbitrary free text, and the
 player can ignore them entirely.
 
+## Narrating an outcome
+
+A story provider has a second entry point, `narrate_outcome`, used **after** a resolution
+has already been committed. It is the same provider and a completely different contract.
+
+```text
+OutcomeContext                      OutcomeNarration
+├── world, player, time             └── narration : string, required, non-empty
+├── disposition                         (and nothing else)
+├── reason_code
+├── resolver
+├── events
+└── detail
+```
+
+`OutcomeContext` is small on purpose. Everything a turn's context carries in order to help
+a model *decide* something — the rules, the geography, the characters' secrets, the
+relationship vectors — is absent, because the deciding is over. `disposition` is `applied`,
+`rejected` or `no_effect`, never `success` or `failure`: prose that called a botched
+attempt a failure would read as the world refusing it. `detail` is the resolver's own
+structured account, and it is the authoritative one — the narrator describes it and does
+not restate it in numbers.
+
+`OutcomeNarration` has **one field**, and that is the whole point. A turn's contract is
+wide because the model is proposing things the application will review; this one is narrow
+because there is nothing left to propose. No events, no facts, no suggestions, no
+disposition — a narrator that could emit those would be resolving the action a second time,
+in prose, after the first resolution was already permanent.
+
+If the provider fails here, the outcome stays exactly as committed and the failure surfaces
+as the same 502 as any other. What is missing is a paragraph, not a turn. See
+[event-resolution.md](event-resolution.md#narration).
+
 ## Model failure behaviour
 
 `StoryGenerationError` carries `provider` and `retryable`, and maps to HTTP **502** with:
@@ -370,10 +461,11 @@ The strategy for now is deliberately minimal: **edit the file, bump `version`, d
 the behavioural change in the commit message.** The version is loaded and available for
 logging, so a turn can be correlated with the prompt that produced it.
 
-When prompt iteration starts affecting saved games, the next step is to record the
-prompt version on `GameEvent` or a `turns` table so old sessions can be interpreted
-against the prompt they were written under. A full prompt-management system (A/B
-testing, remote config, per-world overrides) is deliberately out of scope.
+When prompt iteration starts affecting saved games, the next step is to record the prompt
+version alongside `resolutions.resolver_version`, so old sessions can be interpreted
+against the prompt they were written under the same way they can already be interpreted
+against the resolver that decided them. A full prompt-management system (A/B testing,
+remote config, per-world overrides) is deliberately out of scope.
 
 ## Future semantic retrieval
 

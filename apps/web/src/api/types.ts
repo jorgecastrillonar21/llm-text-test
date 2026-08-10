@@ -260,6 +260,26 @@ export interface TurnResponse {
   situations_started: number;
   situations_rejected: number;
   visual_cue_generated: boolean;
+  /** The mechanical record of what this turn established. Always present. */
+  resolution_id: string;
+  /**
+   * True when this body is a turn that had already been played, returned because the
+   * same `client_action_id` arrived twice. The messages are the original ones.
+   */
+  replayed?: boolean;
+}
+
+/**
+ * One player submission, with the name the client gives it.
+ *
+ * The id belongs to the *submission*, not to the HTTP request that carries it. Retrying
+ * a submission — after a timeout, a dropped connection, or a tap on the retry button —
+ * must send the same id, which is why it is minted where the player acts and carried in
+ * here rather than generated inside the request.
+ */
+export interface TurnSubmission {
+  action: string;
+  clientActionId: string;
 }
 
 export interface ProviderStatus {

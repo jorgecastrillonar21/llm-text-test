@@ -17,8 +17,9 @@ Director's context. Configuration only: no dice, no combat, no simulation engine
 [world-rules.md](world-rules.md), whose *deferred questions* section lists what this
 deliberately did not decide.
 
-The systems below that read those rules — WorldState, CharacterSheet, PowerSystem, rules
-resolution, world simulation — are each their own epic and none of them is started.
+The systems that read those rules are each their own epic. `WorldState` is done in four
+parts (1.6–1.9) and the resolution boundary that changes it in a fifth (1.10);
+`CharacterSheet`, `PowerSystem`, rules resolution and world simulation are not started.
 
 ## Phase 1.6 — WorldState: simulation time ✅
 
@@ -78,6 +79,29 @@ Deliberately absent: the world simulation engine itself, fire/warfare/epidemic/e
 simulation, `FactionState`, NPC autonomy, a game RNG, a situation relation graph,
 `KnowledgeState`, and any background processing.
 
+## Phase 1.10 — Event / Resolution V1 ✅
+
+The four `WorldState` phases described what the world *is*. This is the door through which
+it is allowed to change, and the record it leaves behind. Every authoritative change now
+goes through one pipeline — Command, ResolutionContext at a known revision, a pure
+Resolver, an Outcome, then a single transaction that writes the verdict, the significant
+events, the mutations and the revision together, or writes nothing at all.
+
+Dispositions are `applied` / `rejected` / `no_effect`, never `success` / `failure`: a
+lockpick snapping is an attempt that happened and went badly, and the world having no locks
+is a refusal, and the two must not produce the same prose. Idempotency is a database
+constraint rather than a Python check, so a retried turn resolves once — no second model
+call, no duplicate events, no clock advanced twice. `GameEvent` became significant history
+rather than a log: per-subtype policy decides what is kept and clamps proposed importance,
+because a model asked to rate what it just wrote rates all of it highly. History is
+append-only, ordered by fictional minute plus a per-session sequence, and narration comes
+*after* the mechanics and merely describes them. See
+[event-resolution.md](event-resolution.md).
+
+Deliberately absent: a full Intent Interpreter, a complete Command hierarchy, skills and
+skill checks, a game RNG, combat, `CharacterState`, inventory, a power system, NPC
+autonomy, faction simulation, a full reaction engine, event sourcing, snapshots and rewind.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.
@@ -115,8 +139,14 @@ See [ai-contract.md](ai-contract.md#future-semantic-retrieval) for the seam.
 
 - Inventory and items.
 - Stats and skills.
-- Checks and dice, with outcomes fed back into the narration prompt.
+- Checks and dice, resolved by a resolver like everything else, with the seed and an RNG
+  audit policy recorded on the `ResolutionRecord`. The seam is already there: a resolver is
+  pure, so its randomness has to arrive as an argument, and the replay path already
+  guarantees a retried action does not draw twice.
 - Combat as a structured turn mode.
+- Compound actions — one player sentence producing several resolutions.
+  `parent_resolution_id` is stored and read back; what remains is deciding whether the
+  whole set is atomic.
 - Quests with state.
 
 ## Phase 6 — World simulation
@@ -124,12 +154,15 @@ See [ai-contract.md](ai-contract.md#future-semantic-retrieval) for the seam.
 - Locations as first-class entities, with a map.
 - Per-world calendars: custom month names, month lengths, week structures, eras. The
   clock and the projection landed in Phase 1.6; only the authoring half is missing.
-- NPC schedules — characters exist when the player is not looking. The generic
-  `ScheduledEvent` model exists; nothing produces one yet.
+- NPC schedules — characters exist when the player is not looking. `ScheduledEvent` exists
+  and time advancement already dispatches what comes due through the resolution pipeline;
+  what is missing is anything that schedules interesting work.
 - Action durations: a resolved action that actually costs fictional time, with variance
   drawn from the seeded game RNG rather than from model sampling.
 - Factions and reputation.
-- Autonomous events between turns.
+- Autonomous events between turns, and a reaction pipeline: "the guard notices" as a new
+  Resolution with `caused_by_event_id` pointing at what it reacted to. The depth bound is
+  the first thing that has to be decided, and there will be no event bus.
 
 ## Phase 7 — Mobile productization
 

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.context_builder import build_story_context
 from app.config import ImageProvider, Settings, StoryProvider
+from app.domain.resolution import EventCategory
 from app.infrastructure.db import models
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
 from app.infrastructure.story.rendering import render_context
@@ -231,8 +232,10 @@ async def test_events_are_stamped_with_the_fictional_time_they_happened_at(
             session_id=session.id,
             turn_index=412,
             occurred_at=28980,
-            type="arrival",
-            description="Rin reached the gate.",
+            category=EventCategory.ACTION,
+            subtype="arrival",
+            summary="Rin reached the gate.",
+            importance=2,
         )
     )
     await gateway.commit()
@@ -268,31 +271,71 @@ async def test_events_in_the_same_minute_keep_a_deterministic_order(
                 session_id=session.id,
                 turn_index=412,
                 occurred_at=28980,
-                type=name,
-                description=name,
+                category=EventCategory.ACTION,
+                subtype=name,
+                summary=name,
+                importance=2,
             )
         )
     await gateway.commit()
 
     stored = await _events(db_session, session.id)
-    assert [event.type for event in stored] == ["first", "second", "third"]
+    assert [event.subtype for event in stored] == ["first", "second", "third"]
     assert [event.event_sequence for event in stored] == [1, 2, 3]
     assert {event.occurred_at for event in stored} == {28980}
 
 
-async def test_the_sequence_keeps_climbing_across_advances(app_client: AsyncClient) -> None:
+async def test_the_sequence_keeps_climbing_across_fictional_minutes(
+    db_session: AsyncSession, make_world
+) -> None:
+    """The counter is per session, not per minute. A later minute never restarts it,
+    so `(occurred_at, sequence)` is a total order over a session's whole history."""
+    from app.application.persistence import NewEvent
+
+    world = make_world()
+    db_session.add(world)
+    await db_session.flush()
+    session = models.GameSession(world_id=world.id, title="Run", player_name="Rin")
+    db_session.add(session)
+    await db_session.flush()
+
+    gateway = SqlAlchemyTurnGateway(db_session)
+    for minute, name in ((60, "first"), (60, "second"), (120, "third")):
+        await gateway.add_event(
+            NewEvent(
+                session_id=session.id,
+                turn_index=0,
+                occurred_at=minute,
+                category=EventCategory.ACTION,
+                subtype=name,
+                summary=name,
+                importance=2,
+            )
+        )
+    await gateway.commit()
+
+    stored = await _events(db_session, session.id)
+    assert [event.event_sequence for event in stored] == [1, 2, 3]
+    assert [event.occurred_at for event in stored] == [60, 60, 120]
+
+
+async def test_advancing_the_clock_writes_no_history(app_client: AsyncClient) -> None:
+    """The clock moving is bookkeeping. `time_advanced` is registered
+    `EventPersistence.NONE`, and the audit trail for "why did the clock jump?" is the
+    `ResolutionRecord` of whatever asked -- see docs/event-resolution.md."""
     _, session = await bootstrap(app_client)
 
     await advance(app_client, session["id"], requested_minutes=60)
     await advance(app_client, session["id"], requested_minutes=60)
 
-    # Both advances are audited, and the second sorts after the first.
     transport = app_client._transport
     factory = transport.app.state.session_factory  # type: ignore[union-attr]
     async with factory() as db:
         stored = await _events(db, uuid.UUID(session["id"]))
-    assert [event.event_sequence for event in stored] == [1, 2]
-    assert [event.occurred_at for event in stored] == [60, 120]
+    assert stored == []
+
+    detail = (await app_client.get(f"/api/v1/sessions/{session['id']}")).json()
+    assert detail["elapsed_minutes"] == 120
 
 
 # ---------------------------------------------------------------------------

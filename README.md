@@ -194,6 +194,7 @@ It triggers on pushes to `master` and on pull requests. The push filter previous
 - [World facts](docs/world-state-facts.md) — objective truth, authority, state changes
 - [Locations](docs/world-state-locations.md) — places, containment, connections, spatial state
 - [Situations](docs/world-state-situations.md) — ongoing processes, lifecycle, progression
+- [Event / Resolution](docs/event-resolution.md) — how the world changes, and what it records
 - [Development](docs/development.md) — workflows, migrations, testing, contract sync
 - [Mobile access](docs/mobile-access.md) — LAN, PWA, HTTPS, security
 - [Roadmap](docs/roadmap.md) — what comes next

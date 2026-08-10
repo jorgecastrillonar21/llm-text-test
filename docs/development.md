@@ -136,6 +136,29 @@ curl -X POST .../dev/sessions/$S/situations/$I/progress -d '{}'
 It is the only caller the progression boundary has until a SimulationEngine exists; see
 [world-state-situations.md](world-state-situations.md#progression).
 
+### Inspecting what happened
+
+Every change the dev endpoints make goes through the resolution pipeline, so both of them
+leave a trail you can read back on the ordinary API:
+
+```bash
+curl ".../sessions/$S/resolutions?limit=20"
+```
+
+```bash
+curl ".../sessions/$S/events?min_importance=3&limit=20"
+```
+
+`resolutions` is the mechanical trail — the disposition, the resolver and its version, the
+revision before and after. `events` is world history, and most resolutions produce none:
+progressing a siege by six hours is a real state change and not a thing the story
+remembers. Both are read-only, and there is deliberately no write counterpart to either;
+see [event-resolution.md](event-resolution.md#http-surface).
+
+Retrying an action is safe by construction. A turn is keyed by its `client_action_id` and a
+due scheduled event by its own id, so re-sending one resolves it once and replays the
+stored result — no second model call, no duplicate events, no clock advanced twice.
+
 None of them is a shortcut. Each goes through the same application service a real caller
 will use, so a paused world still refuses to advance and a state change is still checked
 against the property's policy, the world's rules and the session's revision. `admin`

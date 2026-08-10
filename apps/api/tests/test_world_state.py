@@ -18,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.application.persistence import NewFact
 from app.application.state_service import (
     INITIAL_FACTS_EVENT,
-    StateChangeEvent,
     apply_state_change,
     materialize_initial_facts,
     stage_state_change,
@@ -42,6 +41,7 @@ from app.domain.world_facts import (
 )
 from app.infrastructure.db import models
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
+from tests.support import cause_from_event, cause_from_resolution
 
 
 async def _world_session(
@@ -56,10 +56,6 @@ async def _world_session(
     db.add(session)
     await db.flush()
     return world, character, session
-
-
-def _debug_event() -> StateChangeEvent:
-    return StateChangeEvent(type="test.change", description="A test made this happen.")
 
 
 async def _fact_rows(db: AsyncSession, session_id: uuid.UUID) -> list[models.WorldFact]:
@@ -170,7 +166,7 @@ async def test_an_explicit_null_is_not_the_same_as_an_absent_fact(
             authority=FactAuthority.ADMIN,
             mutations=[SetFact(subject=subject, property="narrative.birthplace", value=None)],
         ),
-        event=_debug_event(),
+        cause=cause_from_resolution(),
     )
 
     stored = await store.get_fact(session.id, subject, "narrative.birthplace")
@@ -197,7 +193,10 @@ async def test_setting_a_fact_creates_it_with_its_authority_and_provenance(
             authority=FactAuthority.ENGINE,
             mutations=[SetFact(subject=subject, property="system.alive", value=True, importance=5)],
         ),
-        event=StateChangeEvent(type="combat.survived", description="Elena walked away."),
+        # A real event, because this is the test that the fact points back at one.
+        cause=await cause_from_event(
+            store, session.id, subtype="character_survived", summary="Elena walked away."
+        ),
     )
 
     stored = await store.get_fact(session.id, subject, "system.alive")
@@ -220,7 +219,9 @@ async def test_setting_an_existing_fact_replaces_it_in_place_and_restamps_when(
         authority=FactAuthority.ENGINE,
         mutations=[SetFact(subject=subject, property="system.location", value="the tavern")],
     )
-    await apply_state_change(store, session_id=session.id, batch=batch, event=_debug_event())
+    await apply_state_change(
+        store, session_id=session.id, batch=batch, cause=cause_from_resolution()
+    )
     first = await store.get_fact(session.id, subject, "system.location")
     assert first is not None
     assert first.current_value_since == 0
@@ -238,7 +239,7 @@ async def test_setting_an_existing_fact_replaces_it_in_place_and_restamps_when(
             authority=FactAuthority.ENGINE,
             mutations=[SetFact(subject=subject, property="system.location", value="the docks")],
         ),
-        event=_debug_event(),
+        cause=cause_from_resolution(),
     )
 
     second = await store.get_fact(session.id, subject, "system.location")
@@ -266,7 +267,7 @@ async def test_removing_a_fact_withdraws_it_rather_than_making_it_false(
             authority=FactAuthority.ADMIN,
             mutations=[SetFact(subject=subject, property="narrative.birthplace", value="Arven")],
         ),
-        event=_debug_event(),
+        cause=cause_from_resolution(),
     )
 
     await apply_state_change(
@@ -276,7 +277,7 @@ async def test_removing_a_fact_withdraws_it_rather_than_making_it_false(
             authority=FactAuthority.ADMIN,
             mutations=[RemoveFact(subject=subject, property="narrative.birthplace")],
         ),
-        event=_debug_event(),
+        cause=cause_from_resolution(),
     )
 
     # Absent, not false, and not null: the row is gone entirely.
@@ -300,7 +301,7 @@ async def test_removing_a_fact_that_was_never_established_is_refused(
                 authority=FactAuthority.ADMIN,
                 mutations=[RemoveFact(subject=subject, property="narrative.birthplace")],
             ),
-            event=_debug_event(),
+            cause=cause_from_resolution(),
         )
 
 
@@ -332,7 +333,7 @@ async def test_the_revision_moves_once_per_batch_not_once_per_mutation(
                 SetFact(subject=WORLD_SUBJECT, property="world.condition", value="storm season"),
             ],
         ),
-        event=_debug_event(),
+        cause=cause_from_resolution(),
     )
 
     assert result.revision == 1
@@ -360,7 +361,7 @@ async def test_the_revision_does_not_move_when_the_transaction_rolls_back(
             authority=FactAuthority.ADMIN,
             mutations=[SetFact(subject=subject, property="narrative.birthplace", value="Arven")],
         ),
-        event=_debug_event(),
+        cause=cause_from_resolution(),
     )
     assert staged.revision == 1
 
@@ -385,7 +386,7 @@ async def test_a_batch_decided_against_an_older_revision_is_refused(
             authority=FactAuthority.ADMIN,
             mutations=[SetFact(subject=subject, property="narrative.birthplace", value="Arven")],
         ),
-        event=_debug_event(),
+        cause=cause_from_resolution(),
     )
 
     with pytest.raises(StaleStateError) as caught:
@@ -399,7 +400,7 @@ async def test_a_batch_decided_against_an_older_revision_is_refused(
                 ],
                 expected_revision=0,
             ),
-            event=_debug_event(),
+            cause=cause_from_resolution(),
         )
     assert caught.value.expected == 0
     assert caught.value.actual == 1
@@ -433,7 +434,7 @@ async def test_one_bad_mutation_takes_the_whole_batch_with_it(
                     SetFact(subject=subject, property="derived.is_injured", value=True),
                 ],
             ),
-            event=_debug_event(),
+            cause=cause_from_resolution(),
         )
 
     assert await _fact_rows(db_session, session.id) == []
@@ -465,7 +466,7 @@ async def test_a_fact_about_a_character_who_does_not_exist_is_refused(
                 authority=FactAuthority.ADMIN,
                 mutations=[SetFact(subject=stranger, property="narrative.birthplace", value="X")],
             ),
-            event=_debug_event(),
+            cause=cause_from_resolution(),
         )
     assert await _fact_rows(db_session, session.id) == []
 
@@ -509,7 +510,7 @@ async def test_changing_one_session_leaves_the_other_alone(
             authority=FactAuthority.ENGINE,
             mutations=[SetFact(subject=subject, property="system.alive", value=False)],
         ),
-        event=StateChangeEvent(type="death", description="Elena died in this run only."),
+        cause=cause_from_resolution(),
     )
 
     assert await store.get_fact(second.id, subject, "system.alive") is None
@@ -557,7 +558,7 @@ async def test_a_worlds_starting_facts_are_copied_into_a_new_session(
             )
         ).scalars()
     )
-    assert [event.type for event in events] == [INITIAL_FACTS_EVENT]
+    assert [event.subtype for event in events] == [INITIAL_FACTS_EVENT]
 
 
 async def test_materialising_a_world_with_no_starting_facts_does_nothing(
@@ -595,7 +596,7 @@ async def test_playing_a_session_never_writes_back_to_the_world_template(
             authority=FactAuthority.ENGINE,
             mutations=[SetFact(subject=subject, property="system.alive", value=False)],
         ),
-        event=StateChangeEvent(type="death", description="Elena died."),
+        cause=cause_from_resolution(),
     )
 
     template = await store.load_initial_facts(world.id)
@@ -661,7 +662,7 @@ async def test_the_worlds_rules_refuse_a_change_no_authority_can_make(
             authority=FactAuthority.ENGINE,
             mutations=[SetFact(subject=subject, property="system.alive", value=False)],
         ),
-        event=StateChangeEvent(type="death", description="Elena died."),
+        cause=cause_from_resolution(),
     )
 
     with pytest.raises(IncompatibleFactError):
@@ -672,5 +673,5 @@ async def test_the_worlds_rules_refuse_a_change_no_authority_can_make(
                 authority=FactAuthority.ADMIN,
                 mutations=[SetFact(subject=subject, property="system.alive", value=True)],
             ),
-            event=StateChangeEvent(type="miracle", description="Not in this world."),
+            cause=cause_from_resolution(),
         )

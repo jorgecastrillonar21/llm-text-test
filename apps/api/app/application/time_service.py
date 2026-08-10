@@ -6,17 +6,18 @@ states how long something took and why, and this decides what the world does wit
 that -- including refusing, when the world's rules do not let that kind of caller
 move time at all.
 
-# Who will call this
+# Who calls this
 
-    ActionResolutionService   a resolved action consumed time
-    TravelService             getting somewhere took a while
-    RestService               sleeping through the night
-    SimulationService         the world moving on its own
-    developer tooling         the /dev endpoints
+    resolution_service   an `AdvanceTimeCommand` was resolved and applied
+    developer tooling    the /dev endpoints
+    TravelService        getting somewhere took a while             (not built)
+    RestService          sleeping through the night                 (not built)
+    SimulationService    the world moving on its own                (not built)
 
-None of those exist yet, which is the point: the authority boundary is in place
-before the systems that will need it, so none of them can grow its own private path
-to the clock. Today the only callers are the dev router and the tests.
+The first is the real path: gameplay asks for time through a Command, so every
+movement of the clock leaves a `ResolutionRecord` saying who asked and what happened.
+The rest of the list is why the authority boundary went in before the systems that
+need it -- none of them can grow its own private path to `elapsed_minutes`.
 
 # Turns do not advance time
 
@@ -33,7 +34,6 @@ import uuid
 from typing import Any
 
 from app.application.persistence import (
-    NewEvent,
     NewScheduledEvent,
     SessionClockPort,
 )
@@ -48,23 +48,32 @@ from app.domain.world_time import (
     require_transition,
 )
 
-TIME_ADVANCED_EVENT = "time.advanced"
-"""GameEvent type for the audit trail. There is no separate audit table: a
-GameEvent already carries a session, a turn, a fictional timestamp and a stable
-position, which is everything "why did the clock jump?" needs."""
+TIME_ADVANCED_EVENT = "time_advanced"
+"""The event subtype for a clock movement, registered `EventPersistence.NONE`.
+
+Nothing writes one any more, and the name is kept because the policy registry and the
+migration both refer to it. "Why did the clock jump?" is answered by the
+`ResolutionRecord` that asked for the advance -- which carries the session, the turn,
+the fictional minute, the resolver and the disposition. A GameEvent per advance was an
+audit row wearing history's clothes, and it made a session's history mostly the engine
+narrating its own bookkeeping. See docs/event-resolution.md.
+"""
 
 
-async def advance_time(
+async def stage_time_advance(
     clock: SessionClockPort,
     *,
     session_id: uuid.UUID,
     request: TimeAdvanceRequest,
 ) -> TimeAdvanceResult:
-    """Move a session's clock forward and resolve anything that came due.
+    """Move a session's clock forward inside the caller's transaction, without committing.
 
     Long skips cost the same as short ones. Advancing six months looks at the events
     scheduled inside that span, not at every minute of it -- there is no per-minute
     loop here and there must never be one.
+
+    For callers whose unit of work is larger than this -- a resolution, which also
+    writes its own record, its events and its mutations, and commits once at the end.
     """
     session = await clock.get_session(session_id)
     if session is None:
@@ -116,18 +125,22 @@ async def advance_time(
     if result.advanced_minutes:
         await clock.set_elapsed_minutes(session_id, ended_at)
 
-    # A request that neither moved the clock nor resolved anything is not worth a row.
-    if result.advanced_minutes or processed:
-        await clock.add_event(
-            NewEvent(
-                session_id=session_id,
-                turn_index=session.turn_index,
-                occurred_at=ended_at,
-                type=TIME_ADVANCED_EVENT,
-                description=_describe(request, result),
-            )
-        )
+    return result
 
+
+async def advance_time(
+    clock: SessionClockPort,
+    *,
+    session_id: uuid.UUID,
+    request: TimeAdvanceRequest,
+) -> TimeAdvanceResult:
+    """`stage_time_advance`, then commit.
+
+    For callers whose whole unit of work this is: developer tooling, and tests. Gameplay
+    goes through `AdvanceTimeCommand` and the resolution pipeline, which records why the
+    clock moved.
+    """
+    result = await stage_time_advance(clock, session_id=session_id, request=request)
     await clock.commit()
     return result
 
@@ -187,22 +200,3 @@ async def cancel_scheduled_event(clock: SessionClockPort, *, event_id: uuid.UUID
     require_transition(event.status, ScheduledEventStatus.CANCELLED)
     await clock.set_scheduled_event_status(event_id, ScheduledEventStatus.CANCELLED)
     await clock.commit()
-
-
-def _describe(request: TimeAdvanceRequest, result: TimeAdvanceResult) -> str:
-    """The audit line: enough to answer "why did the clock jump?" without a join."""
-    parts = [
-        f"{request.reason}: requested {request.requested_minutes} min",
-        f"advanced {result.advanced_minutes} min",
-        f"{result.started_at} -> {result.ended_at}",
-    ]
-    if result.interruption is not None:
-        parts.append(f"interrupted by {result.interruption.event_type}")
-    if result.processed_event_ids:
-        count = len(result.processed_event_ids)
-        parts.append(f"{count} scheduled event{'' if count == 1 else 's'} processed")
-    if request.source_event_id is not None:
-        parts.append(f"source event {request.source_event_id}")
-    if request.detail:
-        parts.append(request.detail)
-    return " | ".join(parts)

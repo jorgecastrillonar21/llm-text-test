@@ -16,14 +16,16 @@ from dataclasses import dataclass
 from app.application.contracts import (
     DialogueLine,
     MemoryCandidate,
+    OutcomeNarration,
     RelationshipChange,
     TurnGeneration,
     VisualCue,
     WorldEvent,
 )
 from app.application.ports import ProviderStatus
-from app.application.story_context import CharacterContext, StoryContext
+from app.application.story_context import CharacterContext, OutcomeContext, StoryContext
 from app.domain.enums import Language, MemoryKind
+from app.domain.resolution import EventCategory, ResolutionDisposition
 
 # Words hinting the player did something with lasting consequences.
 _SIGNIFICANT = (
@@ -84,6 +86,10 @@ class _Phrases:
     ask: str
     look: str
     wait: str
+    applied: str
+    rejected: str
+    no_effect: str
+    recorded: str
 
 
 _PHRASES: dict[Language, _Phrases] = {
@@ -97,6 +103,13 @@ _PHRASES: dict[Language, _Phrases] = {
         ask="Ask {who} what they are not telling me.",
         look="Look around {location} for anything out of place.",
         wait="Wait, and let the silence do the work.",
+        applied="Something shifts in the world around {player}, and it holds.",
+        rejected=(
+            "Nothing comes of it. The world does not bend that way, "
+            "and {player} is left where they started."
+        ),
+        no_effect="{player} finds it already so, and the moment passes unchanged.",
+        recorded="What is remembered: {summaries}",
     ),
     Language.ES: _Phrases(
         acts="actúa: «{action}».",
@@ -111,6 +124,12 @@ _PHRASES: dict[Language, _Phrases] = {
         ask="Preguntar a {who} qué es lo que no me está contando.",
         look="Mirar alrededor de {location} por si algo está fuera de lugar.",
         wait="Esperar, y dejar que el silencio haga el trabajo.",
+        applied="Algo cambia en el mundo alrededor de {player}, y así queda.",
+        rejected=(
+            "No sale nada de ello. El mundo no se dobla así, y {player} se queda donde estaba."
+        ),
+        no_effect="{player} lo encuentra ya hecho, y el momento pasa sin cambiar nada.",
+        recorded="Lo que queda registrado: {summaries}",
     ),
 }
 
@@ -171,8 +190,12 @@ class MockStoryGenerator:
         if significant:
             events.append(
                 WorldEvent(
-                    type="player_action",
-                    description=f"{context.player.name}: {action[:200]}",
+                    category=EventCategory.ACTION,
+                    subtype="player_acted_consequentially",
+                    summary=f"{context.player.name}: {action[:200]}",
+                    # No importance. The mock has no way to judge one, and offering none
+                    # is what makes the policy's default the thing under test rather than
+                    # a number this file invented.
                 )
             )
 
@@ -190,6 +213,30 @@ class MockStoryGenerator:
             world_events=events,
             visual_cue=VisualCue(generate=False, reason="Mock provider does not request images."),
         )
+
+    async def narrate_outcome(self, context: OutcomeContext) -> OutcomeNarration:
+        """One sentence per disposition, plus whatever history kept.
+
+        Rule-based like everything else here, and it honours the three dispositions
+        separately on purpose: a mock that narrated `rejected` and `applied` with the
+        same sentence would let a bug where the two are confused pass every test that
+        uses it.
+        """
+        phrases = _PHRASES[context.world.language]
+        opening = {
+            ResolutionDisposition.APPLIED: phrases.applied,
+            ResolutionDisposition.REJECTED: phrases.rejected,
+            ResolutionDisposition.NO_EFFECT: phrases.no_effect,
+        }[context.disposition]
+
+        sentences = [opening.format(player=context.player.name)]
+        if context.events:
+            sentences.append(
+                phrases.recorded.format(
+                    summaries="; ".join(event.summary for event in context.events)
+                )
+            )
+        return OutcomeNarration(narration=" ".join(sentences))
 
     async def status(self) -> ProviderStatus:
         return ProviderStatus(
