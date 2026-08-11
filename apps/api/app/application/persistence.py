@@ -117,6 +117,11 @@ class SessionSnapshot(BaseModel):
     summary: str
     turn_index: int
 
+    world_state_version: int
+    """Which shape this session's WorldState root is stored in. Read rather than
+    assumed, so a build handed a session written by a later one can refuse instead of
+    misreading it -- see `app.domain.world_state.read_world_state`."""
+
     elapsed_minutes: int
     """Where this session sits on its own simulation clock. Independent of
     `turn_index`: neither one can be computed from the other."""
@@ -622,6 +627,48 @@ class SituationReaderPort(Protocol):
         ...
 
 
+class ScheduledEventReaderPort(Protocol):
+    """Reads over `scheduled_events` -- what the world has committed to doing later.
+
+    Separate from the clock port that writes them because reading them is not a
+    privilege: a snapshot wants to show what is coming, and it should not have to hold
+    a port that can also fire it.
+    """
+
+    async def get_scheduled_event(self, event_id: uuid.UUID) -> ScheduledEventRecord | None: ...
+
+    async def load_due_scheduled_events(
+        self, session_id: uuid.UUID, *, through: int
+    ) -> list[ScheduledEventRecord]:
+        """Pending events due at or before `through`, earliest first.
+
+        Earliest first is the processing order, so it has to come out of the query.
+        The lower bound is deliberately open: anything still pending is due, even if
+        its minute is already behind the clock. An event written into the past would
+        otherwise sit there forever, which is a worse failure than firing it late.
+        """
+        ...
+
+    async def load_scheduled_events(
+        self,
+        session_id: uuid.UUID,
+        *,
+        statuses: frozenset[ScheduledEventStatus] | None = None,
+        limit: int,
+    ) -> list[ScheduledEventRecord]:
+        """This session's scheduled events, soonest first, then by id for a total order.
+
+        `statuses=None` means every status, including the fired and cancelled ones --
+        they are the record of what the world already did with its commitments. A
+        caller wanting only what is still coming passes the set it means.
+
+        Distinct from `load_due_scheduled_events`, which answers "what must I process
+        now" and is the turn loop's query. This one answers "what is on the books",
+        which is a reading question and bounded by `limit` rather than by the clock.
+        """
+        ...
+
+
 class HistoryReaderPort(Protocol):
     """Reads over `game_events` -- what has happened in this story."""
 
@@ -740,6 +787,42 @@ class StoryContextReaderPort(
     async def load_relationships(self, session_id: uuid.UUID) -> list[RelationshipRecord]: ...
 
 
+class WorldStateReaderPort(
+    # Same base order as `StoryContextReaderPort`, and for the same reason: history has
+    # to precede space so that any class combining this with a write port linearizes.
+    FactReaderPort,
+    HistoryReaderPort,
+    SpatialReaderPort,
+    SituationReaderPort,
+    ScheduledEventReaderPort,
+    Protocol,
+):
+    """Every read a composed view of one session's world needs, and no write at all.
+
+    This is the port `world_state_service` builds a `CurrentWorldSnapshot` from. That it
+    cannot write is the point: a snapshot is a projection assembled from the domains
+    that own the state, and a reader that could also mutate would invite exactly the
+    "read the world, fix it up, hand it back" shortcut that the whole decomposition
+    exists to prevent. Changing state goes through a resolution, never through here.
+
+    There is no `commit` either. Reading happens inside whatever transaction the request
+    already opened, and a projection that committed would be a projection with side
+    effects.
+    """
+
+    async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...
+
+    async def get_world(self, world_id: uuid.UUID) -> WorldSnapshot | None:
+        """The world, for its calendar: the readable date in a snapshot is derived from
+        `initial_datetime`, and a snapshot that guessed it would show the wrong day."""
+        ...
+
+    async def known_character_ids(self, world_id: uuid.UUID) -> set[uuid.UUID]:
+        """Who exists in this world. For the consistency check, which has to be able to
+        tell a fact about a real person from a fact about an id nobody ever wrote."""
+        ...
+
+
 class TurnPersistencePort(Protocol):
     """Everything the turn use case reads or writes outside of context assembly."""
 
@@ -801,7 +884,7 @@ class TurnUnitOfWorkPort(Protocol):
         ...
 
 
-class SessionClockPort(TurnUnitOfWorkPort, Protocol):
+class SessionClockPort(ScheduledEventReaderPort, TurnUnitOfWorkPort, Protocol):
     """What advancing simulation time needs, and nothing else.
 
     Separate from `TurnGatewayPort` because they are separate use cases. A turn reads
@@ -829,20 +912,6 @@ class SessionClockPort(TurnUnitOfWorkPort, Protocol):
     # history is no longer mostly the engine narrating its own bookkeeping.
 
     async def add_scheduled_event(self, event: NewScheduledEvent) -> uuid.UUID: ...
-
-    async def get_scheduled_event(self, event_id: uuid.UUID) -> ScheduledEventRecord | None: ...
-
-    async def load_due_scheduled_events(
-        self, session_id: uuid.UUID, *, through: int
-    ) -> list[ScheduledEventRecord]:
-        """Pending events due at or before `through`, earliest first.
-
-        Earliest first is the processing order, so it has to come out of the query.
-        The lower bound is deliberately open: anything still pending is due, even if
-        its minute is already behind the clock. An event written into the past would
-        otherwise sit there forever, which is a worse failure than firing it late.
-        """
-        ...
 
     async def set_scheduled_event_status(
         self, event_id: uuid.UUID, status: ScheduledEventStatus

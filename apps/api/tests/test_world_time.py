@@ -28,6 +28,7 @@ from app.domain.enums import Language
 from app.domain.errors import NotFoundError, TimeProgressionError, ValidationError
 from app.domain.world_rules import WorldRules, default_world_rules
 from app.domain.world_rules.enums import TimeProgression
+from app.domain.world_state import WORLD_STATE_VERSION
 from app.domain.world_time import (
     DEFAULT_INITIAL_DATETIME,
     STANDARD_CALENDAR,
@@ -306,6 +307,7 @@ class FakeSessionClock:
             current_location="a town",
             summary="",
             turn_index=turn_index,
+            world_state_version=WORLD_STATE_VERSION,
             elapsed_minutes=elapsed_minutes,
             state_revision=0,
         )

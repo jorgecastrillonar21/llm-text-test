@@ -8,6 +8,8 @@ that boundary earns its keep: external AI systems and the database.
 ```text
 apps/api/app/
 ├── domain/           pure Python: enums, relationship rules, errors. No I/O, no ORM.
+│   ├── world_state/      the root: WorldStateV1, its version, its revision. Four
+│   │                     fields, and none of them a collection.
 │   ├── world_rules/      WorldRulesV1, its enums, presets, versioned parsing
 │   ├── world_time/       the simulation clock, calendar projection, scheduling
 │   ├── world_facts/      what is objectively true: values, properties, policy,
@@ -28,6 +30,9 @@ apps/api/app/
 │   ├── persistence.py    read/write DTOs + the persistence ports
 │   ├── context_builder.py  all retrieval policy, in one place
 │   ├── rules_projection.py WorldRules → the compact AI-facing view
+│   ├── world_state_service.py  composes the root and the four domains into one
+│   │                     read-only snapshot, at a requested scope
+│   ├── state_consistency.py  the cross-domain checks no single domain can make
 │   ├── turn_service.py   the turn use case
 │   ├── resolution_service.py  the one path from a Command to a committed change
 │   ├── resolvers.py      the registry: command kind → the resolver that calculates it
@@ -155,6 +160,7 @@ each one is exactly as wide as its job:
 | Port | Responsibility |
 |---|---|
 | `StoryContextReaderPort` | the reads that feed context assembly |
+| `WorldStateReaderPort` | every read a composed snapshot needs, and no write at all |
 | `TurnPersistencePort` | session/world lookups and every turn write |
 | `TurnUnitOfWorkPort` | `commit()` |
 | `SessionClockPort` | the simulation clock and its scheduled events |
@@ -179,6 +185,13 @@ a port that offers no verb for it. `NarrationStorePort` is narrow for the same r
 the opposite direction — narration runs after the resolution's transaction has closed, so
 it can read the verdict and write a message, and it cannot write a fact, an event, a
 mutation or the clock. See [event-resolution.md](event-resolution.md).
+
+`WorldStateReaderPort` is the mirror image: it can read all four state domains plus the
+clock and history, and it cannot write or commit anything. A snapshot is a projection, and
+a reader that could also mutate would invite the "read the world, fix it up, hand it back"
+shortcut the whole decomposition exists to prevent. Its base order matches
+`StoryContextReaderPort`'s, because both have to linearize when combined with a write port.
+See [world-state.md](world-state.md).
 
 `SessionClockPort` is deliberately outside that composite. A turn *reads* the clock and
 never moves it, so `advance_time` gets a port that reaches the clock, the scheduled
@@ -238,9 +251,16 @@ silently papered over.
   once as `world_truth` and once as `gameplay_flag` with opposite values.
   `source_event_id` is `ON DELETE SET NULL`, because provenance can decay and truth
   cannot. See [world-state-facts.md](world-state-facts.md).
-- **`game_sessions.state_revision`** is a third counter alongside `turn_index` and
-  `elapsed_minutes`, moving once per committed batch of state changes and never
-  backwards. None of the three can be computed from another.
+- **`game_sessions` is the persisted `WorldState` root**, and it is four columns wide:
+  `world_state_version`, `session_id`, `state_revision` and `elapsed_minutes`. There is no
+  serialized world document. Facts, geography, situations, schedule and history each keep
+  their own tables, because each has its own indexes, lifecycle, foreign keys, invariants
+  and mutation paths — putting them in one JSON blob would rewrite the whole world to move
+  one lantern. `state_revision` is a third counter alongside `turn_index` and
+  `elapsed_minutes`, moving once per committed batch of state changes and never backwards;
+  none of the three can be computed from another. `world_state_version` is read on load and
+  an unknown value fails loudly rather than being coerced. See
+  [world-state.md](world-state.md).
 - **`worlds.initial_facts`** stores a world's starting facts as `SetFact` documents,
   copied into each new session and never written back to during play.
 - **The five spatial tables** split along one line: `location_definitions`,

@@ -545,7 +545,10 @@ async def test_a_worlds_starting_facts_are_copied_into_a_new_session(
     result = await materialize_initial_facts(store, session_id=session.id)
 
     assert result is not None
-    assert result.revision == 1
+    # Still 0. Seeding is the world arriving, not the world changing: a session that
+    # has never been played is at revision 0 whether its template held two facts or
+    # none, so the starting revision does not depend on how much its author wrote.
+    assert result.revision == 0
     facts = await store.load_facts(session.id, limit=50)
     assert {fact.property for fact in facts} == {"world.political_status", "narrative.birthplace"}
     assert all(fact.authority is FactAuthority.SEED for fact in facts)

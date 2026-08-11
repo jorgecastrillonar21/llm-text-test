@@ -45,6 +45,7 @@ from app.domain.world_situations import (
     SituationScope,
     SituationStatus,
 )
+from app.domain.world_state import WORLD_STATE_VERSION
 from app.domain.world_time import DEFAULT_INITIAL_DATETIME, ScheduledEventStatus
 from app.infrastructure.db.base import Base
 from app.infrastructure.db.types import UtcDateTime, utcnow
@@ -145,10 +146,27 @@ class Character(Base):
 
 
 class GameSession(Base):
+    """One playthrough, and the root of its own mutable world.
+
+    `world_state_version`, `elapsed_minutes` and `state_revision` are the persisted
+    `WorldStateV1` root: which shape the state is stored in, what time it is, and how
+    many times its reality has changed. They live here rather than in a `world_states`
+    table with one row per session because that table would be this one with extra
+    joins -- a session and its world state have the same identity, the same lifetime
+    and the same cascade.
+
+    What is deliberately *not* here is everything with a cardinality. Facts, locations,
+    connections, situations, scheduled events, history and audit are separate tables
+    keyed by `session_id`. See `app.domain.world_state` and docs/world-state.md.
+    """
+
     __tablename__ = "game_sessions"
     __table_args__ = (
         CheckConstraint("elapsed_minutes >= 0", name="ck_game_sessions_elapsed_nonnegative"),
         CheckConstraint("state_revision >= 0", name="ck_game_sessions_revision_nonnegative"),
+        CheckConstraint(
+            "world_state_version >= 1", name="ck_game_sessions_world_state_version_positive"
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -158,10 +176,23 @@ class GameSession(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     player_name: Mapped[str] = mapped_column(String(200), nullable=False)
     player_description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # Free text, and the one piece of duplicated authority the WorldState audit found.
+    # Where the player is is a property of a character, and there is no CharacterState
+    # yet -- so this string stays, is resolved against the spatial graph by name when it
+    # happens to match (`spatial_context.resolve_scene_location`), and moves to
+    # CharacterState when that arrives. Deliberately not replaced with a second position
+    # system in the meantime: two half-authoritative answers are worse than one honest
+    # string. See docs/world-state.md, "Duplicated authority".
     current_location: Mapped[str] = mapped_column(String(300), default="", nullable=False)
     # Rolling recap of turns older than the recent-message window. Phase 2 fills this.
     summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     turn_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Which shape this session's WorldState root is stored in. Stored rather than
+    # assumed so that a build reading a session written by a later one can refuse
+    # instead of guessing -- see `app.domain.world_state.read_world_state`.
+    world_state_version: Mapped[int] = mapped_column(
+        Integer, default=WORLD_STATE_VERSION, nullable=False
+    )
     # The authoritative simulation clock, counted from this session's own start.
     # BigInteger because it is the one number a long-running story keeps adding to,
     # and because a 32-bit column would quietly cap a world at roughly four thousand

@@ -3,6 +3,39 @@
 Everything exchanged with a story provider is typed and validated. The model proposes;
 the application layer decides what is persisted.
 
+## Authority
+
+Everything in a `StoryContext` arrives with a different claim on the truth, and the Story
+Director's job depends on telling them apart. A siege is not a breach, a breach is not a
+ruined gate, and a guard *saying* the gate is ruined is none of the three.
+
+| What it is | What it claims |
+|---|---|
+| `world_rules` | **the boundary of the possible.** Not a fact about this session — a statement of what may ever be true in this universe. Nothing narrated may exceed it. |
+| current state — facts, geography, situations, the clock | **authoritative now.** These models, not the transcript, are what is currently true. Where prose and state disagree, state wins. |
+| `history` — `GameEvent` | **significant occurrences that already happened.** Settled, not open to revision, and deliberately not everything that happened. |
+| `situations` | **processes still running.** A siege is a thing in progress with a direction — not the event that started it, and not the damage it left behind. |
+| scheduled events | **future triggers, not completed facts.** A thing that is *due*. Nothing may be narrated as having happened merely because it was scheduled. |
+| `recent_messages` | **speech, which may be wrong.** A character can be mistaken, ignorant, or lying. A transcript line is evidence that something was *said*, never that it is true. |
+
+The director's own authority is narrower than the context might suggest:
+
+- **It may not rewrite current state.** No field in `TurnGeneration` sets a fact, moves a
+  thing, ends a situation or advances the clock. The absence is the enforcement — see
+  [world-state.md](world-state.md#who-may-change-what).
+- **It narrates outcomes that are already committed.** Narration runs *after* the
+  resolution's transaction has closed. The prose describes a verdict; it never produces
+  one, and regenerating a paragraph cannot change what happened. See
+  [event-resolution.md](event-resolution.md).
+- **Its proposals are proposals.** New facts, places and situations arrive as
+  `fact_proposals`, `location_proposals` and `situation_proposals`, and every one is
+  reviewed against policy, authority and the world's rules before anything is written. A
+  rejected proposal is normal operation, not an error.
+- **What a character knows is not modelled yet.** Every character currently shares one
+  context, secrets included, and the prompt asks for a discretion it cannot enforce. A
+  future `KnowledgeState` will make viewpoint knowledge structural. Until then, treat NPC
+  secrecy as flavour rather than as a boundary.
+
 ## StoryContext — what the model sees
 
 Built by `application/context_builder.py`. A provider receives this and nothing else —

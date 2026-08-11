@@ -29,7 +29,7 @@ import uuid
 
 from fastapi import APIRouter, status
 
-from app.api.deps import ResolutionStore, SessionClock, WorldStateStore
+from app.api.deps import ResolutionStore, SessionClock, WorldStateReader, WorldStateStore
 from app.api.schemas import (
     ResolutionResponse,
     ScheduledEventCreate,
@@ -38,8 +38,14 @@ from app.api.schemas import (
 )
 from app.application.persistence import ScheduledEventRecord
 from app.application.resolution_service import ResolutionRequest, resolve
+from app.application.state_consistency import ConsistencyReport, check_state_consistency
 from app.application.state_service import StateChangeResult, apply_state_change
 from app.application.time_service import advance_time, cancel_scheduled_event, schedule_event
+from app.application.world_state_service import (
+    CurrentWorldSnapshot,
+    SnapshotScope,
+    build_snapshot,
+)
 from app.domain.errors import NotFoundError
 from app.domain.resolution import ProgressSituationCommand, ResolutionSourceType
 from app.domain.world_time import TimeAdvanceRequest, TimeAdvanceResult
@@ -109,6 +115,43 @@ async def apply_world_state_change(
     lift the authority model, because the authority model is the feature.
     """
     return await apply_state_change(store, session_id=session_id, batch=payload.batch)
+
+
+@router.get("/sessions/{session_id}/world-state", response_model=CurrentWorldSnapshot)
+async def read_full_world_state(
+    session_id: uuid.UUID, reader: WorldStateReader
+) -> CurrentWorldSnapshot:
+    """Everything this session's world currently is, for a person looking at it.
+
+    The `full_debug` scope the public endpoint refuses: every fact, every place and its
+    state, every connection and its state, every situation, the whole schedule and the
+    recent event trail. Bounded, but bounded high -- this is the view you want when
+    something is wrong and you do not yet know where.
+
+    Emphatically not a context source. Nothing that builds a prompt calls this, and
+    nothing should: `story_context` decides what a language model sees, and the amount
+    of state available here has never been an argument for sending more of it.
+
+    Read-only, like every snapshot. There is no development endpoint that writes a
+    world back, because a world that could be uploaded is a world with no invariants.
+    """
+    return await build_snapshot(reader, session_id=session_id, scope=SnapshotScope.FULL_DEBUG)
+
+
+@router.get("/sessions/{session_id}/world-state/check", response_model=ConsistencyReport)
+async def check_world_state(session_id: uuid.UUID, reader: WorldStateReader) -> ConsistencyReport:
+    """Does this session's world still hang together?
+
+    Runs every referential check in `app.application.state_consistency` and reports what
+    it found. A diagnostic, not a gate: nothing in the turn loop waits on this, and a
+    report of issues is a thing for a person to read rather than something the
+    application acts on.
+
+    Always 200 when the session exists, even when the world is inconsistent -- the
+    report *is* the answer, and turning a finding into an HTTP error would make the
+    interesting case the one a client cannot read.
+    """
+    return await check_state_consistency(reader, session_id=session_id)
 
 
 @router.post(

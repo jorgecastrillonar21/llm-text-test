@@ -20,6 +20,7 @@ from app.application.persistence import (
     SpatialPort,
     StateStorePort,
     TurnGatewayPort,
+    WorldStateReaderPort,
 )
 from app.application.ports import ImageGeneratorPort, StoryGeneratorPort
 from app.config import Settings
@@ -74,6 +75,20 @@ def get_world_state_store(session: Annotated[AsyncSession, Depends(get_db)]) -> 
     Facts and space together, because one batch may change both -- a collapsing bridge
     is a connection, a location and a danger modifier -- and splitting them would split
     the transaction that makes it one event.
+    """
+    return SqlAlchemyTurnGateway(session)
+
+
+def get_world_state_reader(
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> WorldStateReaderPort:
+    """The same adapter once more, seen through a port that cannot write anything.
+
+    The widest *read* in the application and deliberately the narrowest privilege: a
+    snapshot spans facts, geography, situations, the schedule and history, which is
+    exactly the surface that must never also be able to change them. Composing a view
+    of the world and rewriting it are different powers, and this signature is what says
+    so at the boundary.
     """
     return SqlAlchemyTurnGateway(session)
 
@@ -143,6 +158,7 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 TurnGateway = Annotated[TurnGatewayPort, Depends(get_turn_gateway)]
 SessionClock = Annotated[SessionClockPort, Depends(get_session_clock)]
 WorldStateStore = Annotated[StateStorePort, Depends(get_world_state_store)]
+WorldStateReader = Annotated[WorldStateReaderPort, Depends(get_world_state_reader)]
 SpatialStore = Annotated[SpatialPort, Depends(get_spatial_store)]
 SituationStore = Annotated[SituationPort, Depends(get_situation_store)]
 ResolutionStore = Annotated[ResolutionStorePort, Depends(get_resolution_store)]

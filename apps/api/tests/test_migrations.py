@@ -322,8 +322,11 @@ def test_reshaping_game_events_keeps_the_rows_that_point_at_them(
             # rather than only a log line.
             assert conn.execute(text("PRAGMA foreign_key_check")).all() == []
 
-        # Down and back up, with data in the table both ways.
-        command.downgrade(config, "-1")
+        # Down and back up, with data in the table both ways. The target is named
+        # rather than counted: `-1` meant "undo the event reshape" only for as long as
+        # it was head, and every migration added since would have silently retargeted
+        # this test at something else.
+        command.downgrade(config, "f429e3bc3d11")
         with engine.connect() as conn:
             restored = conn.execute(
                 text("SELECT type, description FROM game_events ORDER BY event_sequence")

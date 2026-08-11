@@ -450,6 +450,7 @@ class SqlAlchemyTurnGateway:
             current_location=row.current_location,
             summary=row.summary,
             turn_index=row.turn_index,
+            world_state_version=row.world_state_version,
             elapsed_minutes=row.elapsed_minutes,
             state_revision=row.state_revision,
         )
@@ -665,6 +666,27 @@ class SqlAlchemyTurnGateway:
                 # Chronological, then by insertion, so two events due in the same
                 # fictional minute always resolve in the order they were scheduled.
                 .order_by(models.ScheduledEvent.due_at, models.ScheduledEvent.created_at)
+            )
+        ).scalars()
+        return [_to_scheduled_event(row) for row in rows]
+
+    async def load_scheduled_events(
+        self,
+        session_id: uuid.UUID,
+        *,
+        statuses: frozenset[ScheduledEventStatus] | None = None,
+        limit: int,
+    ) -> list[ScheduledEventRecord]:
+        query = select(models.ScheduledEvent).where(models.ScheduledEvent.session_id == session_id)
+        if statuses is not None:
+            query = query.where(
+                models.ScheduledEvent.status.in_([status.value for status in statuses])
+            )
+        rows = (
+            await self._db.execute(
+                query.order_by(
+                    models.ScheduledEvent.due_at, models.ScheduledEvent.created_at
+                ).limit(limit)
             )
         ).scalars()
         return [_to_scheduled_event(row) for row in rows]

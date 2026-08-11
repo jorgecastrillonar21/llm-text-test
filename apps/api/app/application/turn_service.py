@@ -336,13 +336,21 @@ async def execute_turn(
         known_character_ids=known_character_ids,
     )
 
+    # Everything the three reviews let through, counted together. A turn is one
+    # resolution, and one resolution moves the state revision exactly once -- so the
+    # count that decides whether it moves has to include the places and the situations,
+    # not just the facts. Counting only facts is how a turn that founded a bookshop and
+    # started a siege used to leave the revision sitting still, telling every client
+    # polling it that nothing had happened.
+    mutation_count = len(review.accepted) + len(places.created) + len(situations.created)
+
     resolution_id = await _record_turn_resolution(
         gateway,
         session=session,
         turn_index=turn_index,
         client_action_id=client_action_id,
         events=selected_events,
-        mutation_count=len(review.accepted),
+        mutation_count=mutation_count,
     )
     event_ids = await write_events(
         gateway,
@@ -360,6 +368,13 @@ async def execute_turn(
             resolution_id=resolution_id, event_id=event_ids[0] if event_ids else None
         ),
     )
+
+    if mutation_count:
+        # The turn's single bump, once everything it established is staged. Here rather
+        # than inside `_establish_proposed_facts` because places and situations are
+        # written by their own services and never reach that batch: a bump living with
+        # the facts would only ever have counted a third of what changed.
+        await gateway.bump_state_revision(session.id)
 
     await gateway.set_turn_index(session.id, turn_index)
 
@@ -433,9 +448,10 @@ async def _record_turn_resolution(
     one into the other would fill the mechanical trail with rows claiming the world said
     no to things nobody attempted.
 
-    The revision is projected rather than read back. `stage_state_change` bumps it
-    exactly once per batch and a turn stages at most one, so `+1` when facts survived is
-    knowable here -- and the record has to exist before the events that point at it.
+    The revision is projected rather than read back. A turn bumps it exactly once, and
+    only when something survived review, so `+1` is knowable here -- and the record has
+    to exist before the events that point at it. `mutation_count` is everything the turn
+    established, across facts, places and situations.
     """
     changed = bool(events) or bool(mutation_count)
     revision_before = session.state_revision
@@ -482,6 +498,10 @@ async def _establish_proposed_facts(
     The cause is still recorded: the turn's own resolution, and the first event it wrote
     when it wrote one. That is what makes "why is this true?" answerable without a
     GameEvent per fact.
+
+    The revision is not moved here. `execute_turn` owns the turn's single bump, because
+    the turn may also have created places and started situations and all of it is one
+    resolution.
     """
     if not review.accepted:
         return
@@ -492,6 +512,7 @@ async def _establish_proposed_facts(
             authority=FactAuthority.STORY_DIRECTOR, mutations=list(review.accepted)
         ),
         cause=cause,
+        moves_revision=False,
     )
 
 

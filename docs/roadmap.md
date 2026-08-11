@@ -18,8 +18,9 @@ Director's context. Configuration only: no dice, no combat, no simulation engine
 deliberately did not decide.
 
 The systems that read those rules are each their own epic. `WorldState` is done in four
-parts (1.6–1.9) and the resolution boundary that changes it in a fifth (1.10);
-`CharacterSheet`, `PowerSystem`, rules resolution and world simulation are not started.
+parts (1.6–1.9), the resolution boundary that changes it in a fifth (1.10), and the
+consolidation that names the whole thing in a sixth (1.11); `CharacterSheet`,
+`PowerSystem`, rules resolution and world simulation are not started.
 
 ## Phase 1.6 — WorldState: simulation time ✅
 
@@ -101,6 +102,30 @@ append-only, ordered by fictional minute plus a per-session sequence, and narrat
 Deliberately absent: a full Intent Interpreter, a complete Command hierarchy, skills and
 skill checks, a game RNG, combat, `CharacterState`, inventory, a power system, NPC
 autonomy, faction simulation, a full reaction engine, event sourcing, snapshots and rewind.
+
+## Phase 1.11 — Consolidate WorldState V1 ✅
+
+Six phases built the mutable reality of a session in pieces. This one gives it a name and
+a single conceptual root without merging any of it: `WorldStateV1` is four fields —
+version, session, revision, time — and every collection stays in the domain that owns it.
+The root is not a serialized document, and it was never going to be; a world where the
+lantern goes out should not rewrite the siege.
+
+What is new is the composition. `CurrentWorldSnapshot` reads across facts, geography,
+situations, schedule and history at one revision and returns a projection, at one of four
+scopes — `minimal`, `relevant`, `regional`, `full_debug` — because the default answer must
+never be the expensive one and the model never receives the debug view. A consistency
+validator reports cross-domain disagreements no single domain can see. Reads are
+read-only all the way down: the snapshot port has no write method and no commit.
+
+`state_revision` is now the only revision mechanism, `elapsed_minutes` remains the only
+clock, and `turn_index` counts turns; none is derived from another. Persistence changed by
+one column and one migration, and the index audit added nothing — the access patterns were
+already covered. See [world-state.md](world-state.md), the canonical document for all six
+phases.
+
+Deliberately absent: everything in Phase 5 and 6, plus `CharacterState`, `KnowledgeState`,
+event sourcing, snapshots and rewind, and any state editor in the UI.
 
 ## Phase 2 — Narrative quality
 

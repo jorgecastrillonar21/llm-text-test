@@ -103,11 +103,11 @@ async def test_a_new_session_materialises_the_worlds_starting_facts(
             json={"world_id": world["id"], "title": "Run", "player_name": "Rin"},
         )
     ).json()
-    assert session["state_revision"] == 1, "seeding is a state change like any other"
+    assert session["state_revision"] == 0, "a session that has never been played is at 0"
 
     state = (await app_client.get(f"/api/v1/sessions/{session['id']}/world-state/facts")).json()
     assert [fact["property"] for fact in state["facts"]] == ["world.political_status"]
-    assert state["state_revision"] == 1
+    assert state["state_revision"] == 0
     assert state["facts"][0]["authority"] == "seed"
     assert state["truncated"] is False
 
@@ -316,10 +316,17 @@ async def test_the_only_way_to_write_a_fact_is_the_development_endpoint(
     off has no way to change a fact over HTTP at all.
     """
     assert _fact_surface(app_client) == {
+        "/api/v1/sessions/{session_id}/world-state": ["get"],
         "/api/v1/sessions/{session_id}/world-state/facts": ["get"],
         "/api/v1/worlds/{world_id}/initial-facts": ["get"],
+        "/api/v1/dev/sessions/{session_id}/world-state": ["get"],
+        "/api/v1/dev/sessions/{session_id}/world-state/check": ["get"],
         "/api/v1/dev/sessions/{session_id}/world-state/changes": ["post"],
     }
+    # Everything but the one `post` is a read. Consolidating WorldState added a snapshot
+    # endpoint and a consistency check and deliberately no way to send a root back: the
+    # state model has no `put` and no `patch`, because a world that could be uploaded
+    # is a world whose invariants are advisory.
 
 
 async def test_dev_routes_are_absent_when_the_environment_does_not_allow_them() -> None:

@@ -6,7 +6,14 @@ from fastapi import APIRouter, Query, status
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 
-from app.api.deps import DbSession, NarrationStore, StoryGen, TurnGateway, WorldStateStore
+from app.api.deps import (
+    DbSession,
+    NarrationStore,
+    StoryGen,
+    TurnGateway,
+    WorldStateReader,
+    WorldStateStore,
+)
 from app.api.schemas import (
     EventListRead,
     MemoryRead,
@@ -29,6 +36,11 @@ from app.application.situation_service import materialize_initial_situations
 from app.application.spatial_service import materialize_initial_spatial_state
 from app.application.state_service import materialize_initial_facts
 from app.application.turn_service import execute_turn
+from app.application.world_state_service import (
+    CurrentWorldSnapshot,
+    SnapshotScope,
+    build_snapshot,
+)
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.resolution import EventCategory, ResolutionSourceType
 from app.domain.world_facts import FactKind, FactSubject, FactSubjectType
@@ -47,6 +59,18 @@ EVENT_PAGE_LIMIT = 200
 """Ceilings for the two history reads, for the reason `FACT_PAGE_LIMIT` exists. Both
 are audit views: a client showing "what has happened" wants the last screenful, and
 nothing in this application has a reason to pull a whole session's history at once."""
+
+PUBLIC_SNAPSHOT_SCOPES = frozenset(
+    {SnapshotScope.MINIMAL, SnapshotScope.RELEVANT, SnapshotScope.REGIONAL}
+)
+"""The scopes a normal gameplay client may ask for.
+
+`full_debug` is missing on purpose. It reads every fact, every place, every situation
+and the whole schedule, which is a database dump wearing a JSON hat -- fine for an
+operator looking at one session, wrong as something a game screen can trigger by
+passing a query string. It lives on the development router instead, which is off
+unless the environment says otherwise.
+"""
 
 
 @router.get("/sessions", response_model=list[SessionRead])
@@ -152,6 +176,35 @@ async def list_relationships(session_id: uuid.UUID, db: DbSession) -> list[model
         select(models.Relationship).where(models.Relationship.session_id == session_id)
     )
     return list(rows.scalars())
+
+
+@router.get("/sessions/{session_id}/world-state", response_model=CurrentWorldSnapshot)
+async def read_world_state_snapshot(
+    session_id: uuid.UUID,
+    reader: WorldStateReader,
+    scope: SnapshotScope = Query(default=SnapshotScope.MINIMAL),
+) -> CurrentWorldSnapshot:
+    """A composed view of this session's world at one revision.
+
+    Read-only, and there is deliberately no `PUT` or `PATCH` beside it. The root is not
+    a document a client can send back: changing what is true goes through a resolution
+    and a typed mutation, and an endpoint that accepted a whole world would be a way
+    around every rule the domains enforce on the way in.
+
+    `scope` decides how much comes back and defaults to `minimal`, because the
+    expensive answer should never be the accidental one. `full_debug` is refused here;
+    see `PUBLIC_SNAPSHOT_SCOPES` and the development router.
+
+    Not a context source. What a language model sees is decided by
+    `app.application.story_context`, and having more of the world available through
+    this endpoint has never meant sending more of it to a provider.
+    """
+    if scope not in PUBLIC_SNAPSHOT_SCOPES:
+        raise ValidationError(
+            f"Scope {scope.value!r} is not available here. Ask for one of "
+            f"{sorted(item.value for item in PUBLIC_SNAPSHOT_SCOPES)}."
+        )
+    return await build_snapshot(reader, session_id=session_id, scope=scope)
 
 
 @router.get("/sessions/{session_id}/world-state/facts", response_model=WorldStateRead)

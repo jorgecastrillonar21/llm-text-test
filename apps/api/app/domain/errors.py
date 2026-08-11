@@ -43,6 +43,22 @@ class UnsupportedRulesVersionError(InvalidWorldRulesError):
         self.supported = supported
 
 
+class UnsupportedWorldStateVersionError(DomainError):
+    """A stored session declares a WorldState version this build cannot read.
+
+    Deliberately not a `ValidationError`: nothing about the caller's request is wrong.
+    The server is holding a row written by a build that knew a shape this one does not,
+    and the only honest answers are "refuse" and "say which version". Guessing would run
+    a story against a state model nobody wrote.
+    """
+
+    def __init__(self, version: object, supported: tuple[int, ...]) -> None:
+        listed = ", ".join(str(v) for v in supported)
+        super().__init__(f"Unsupported WorldState version {version!r}; this build reads {listed}.")
+        self.version = version
+        self.supported = supported
+
+
 class TimeProgressionError(ValidationError):
     """Something asked to advance the clock in a world whose rules do not allow it.
 

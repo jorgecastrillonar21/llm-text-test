@@ -17,6 +17,7 @@ import { Timeline } from '@/features/sessions/Timeline';
 import { Composer } from '@/features/sessions/Composer';
 import { FictionalClock } from '@/features/sessions/FictionalClock';
 import { OngoingSituations } from '@/features/sessions/OngoingSituations';
+import { WorldStateReadout } from '@/features/sessions/WorldStateReadout';
 
 export function SessionPage() {
   const { sessionId = '' } = useParams();
@@ -87,6 +88,10 @@ export function SessionPage() {
         </div>
         {/* Next to the turn count, not instead of it: they measure different things. */}
         <FictionalClock time={session.data.time} />
+        {/* And the third counter, under the other two. Fictional minutes, turns and
+            state revisions each move for their own reasons; none is derived from
+            another, so all three are shown. */}
+        <WorldStateReadout session={session.data} />
       </header>
 
       {/* Above the transcript, not inside it: the world is doing this regardless of

@@ -136,6 +136,11 @@ const en = {
   'session.situations.growing': 'growing',
   'session.situations.steady': 'steady',
   'session.situations.fading': 'winding down',
+  // The world-state readout. Three inert values and a developer link; see
+  // docs/world-state.md for why there is no editor next to them.
+  'session.world.label': 'World state',
+  'session.world.revision': 'state {n}',
+  'session.world.debug': 'inspect state',
 
   'settings.heading': 'Settings',
   'settings.uiLanguage': 'Interface language',
@@ -278,6 +283,9 @@ const es: Record<MessageKey, string> = {
   'session.situations.growing': 'creciendo',
   'session.situations.steady': 'estable',
   'session.situations.fading': 'remitiendo',
+  'session.world.label': 'Estado del mundo',
+  'session.world.revision': 'estado {n}',
+  'session.world.debug': 'inspeccionar estado',
 
   'settings.heading': 'Ajustes',
   'settings.uiLanguage': 'Idioma de la interfaz',

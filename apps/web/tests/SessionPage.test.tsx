@@ -168,6 +168,29 @@ describe('SessionPage', () => {
     expect(screen.queryByText(/29022/)).not.toBeInTheDocument();
   });
 
+  it('shows where the scene is and how many times the world has changed', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    const readout = await screen.findByLabelText('World state');
+    expect(readout).toHaveTextContent('the market');
+    // A session that has never been played sits at revision 0, and the turn count is
+    // shown separately: the two counters measure different things and neither is
+    // derived from the other.
+    expect(readout).toHaveTextContent('state 0');
+    expect(screen.getByText('Turn 0')).toBeInTheDocument();
+  });
+
+  it('offers no way to edit the world it is showing', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    const readout = await screen.findByLabelText('World state');
+    // The readout is inert on purpose. What is true changes through a resolution and a
+    // typed mutation; a control here would be a way around every rule those enforce.
+    expect(readout.querySelectorAll('input, button, select, textarea')).toHaveLength(0);
+  });
+
   it('sends an action and shows the returned suggestions', async () => {
     const user = userEvent.setup();
     installFetch((url) =>

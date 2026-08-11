@@ -175,12 +175,27 @@ async def stage_state_change(
     session_id: uuid.UUID,
     batch: StateMutationBatch,
     cause: ChangeCause | None = None,
+    moves_revision: bool = True,
 ) -> StateChangeResult:
     """Validate and apply a batch inside the caller's transaction, without committing.
 
     For callers whose unit of work is larger than this -- a turn, which also writes
     messages, memories and relationships, and commits once at the end. If the caller
     fails afterwards, its rollback takes these changes with it.
+
+    `moves_revision=False` is for the two callers whose batch is not, by itself, one
+    logical state change:
+
+    * A turn. It may also create a place and start a situation, neither of which comes
+      through here, and the whole turn is one resolution -- so it bumps once itself,
+      afterwards, for everything together. See `turn_service.execute_turn`.
+    * Session initialization. Materializing a template into a new session is not a
+      change to that session's world; it *is* that world, arriving. A new session sits
+      at revision 0 whether or not its template declared anything.
+
+    Nothing else should pass it. The revision is a per-resolution counter, and a caller
+    that turned it off because a second bump was inconvenient would be inventing the
+    second revision mechanism this design exists to avoid.
     """
     session = await store.get_session(session_id)
     if session is None:
@@ -259,7 +274,9 @@ async def stage_state_change(
             AppliedMutation(op=mutation.op, scope=scope, target=target, entity_id=entity_id)
         )
 
-    revision = await store.bump_state_revision(session_id)
+    revision = (
+        await store.bump_state_revision(session_id) if moves_revision else session.state_revision
+    )
 
     return StateChangeResult(
         session_id=session_id, revision=revision, event_id=event_id, applied=applied
@@ -295,6 +312,13 @@ async def materialize_initial_facts(
     world, and there is deliberately no code path that could.
 
     Returns None when the world defines no starting facts, which is the common case.
+
+    The state revision does not move. A session that has just been initialized is at
+    revision 0 -- the world exactly as its template declared it -- and it stays there
+    whether the template held forty facts or none. Bumping here would have made the
+    starting revision depend on how much content the world's author wrote, so two
+    sessions that had equally never been played would disagree about how many times
+    their reality had changed.
     """
     session = await store.get_session(session_id)
     if session is None:
@@ -327,6 +351,7 @@ async def materialize_initial_facts(
         session_id=session_id,
         batch=StateMutationBatch(authority=FactAuthority.SEED, mutations=list(seeds)),
         cause=ChangeCause(event_id=written[0] if written else None),
+        moves_revision=False,
     )
 
 
