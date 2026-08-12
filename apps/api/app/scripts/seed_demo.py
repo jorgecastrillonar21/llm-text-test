@@ -139,9 +139,13 @@ def _initial_facts(elena_id: uuid.UUID, kael_id: uuid.UUID) -> list[SetFact]:
 
 
 DEMO_START_LOCATION = "The Broken Crown"
-"""Where a demo session begins. Matches `SessionCreate.current_location` exactly, which
-is how the scene finds its place until CharacterPosition exists -- see
-`app.application.spatial_context.resolve_scene_location`."""
+"""Where a demo session begins.
+
+Passed as `SessionCreate.current_location` and spelled to match this location's name
+exactly, because session creation resolves that string to an id *once* to seed the
+player's canonical position. Get it wrong and the demo session starts `unlocated` --
+which is the correct behaviour for an unmatched name, and would make the demo scene
+placeless. See `app.application.position_service.materialize_initial_position`."""
 
 
 async def _seed_geography(db: AsyncSession, world_id: uuid.UUID) -> tuple[list[str], uuid.UUID]:

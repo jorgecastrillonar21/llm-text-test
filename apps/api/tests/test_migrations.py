@@ -21,6 +21,7 @@ EXPECTED_TABLES = {
     "game_events",
     "scheduled_events",
     "resolutions",
+    "character_positions",
 }
 
 # A save written before simulation time existed: one world, one session, and three
@@ -338,6 +339,136 @@ def test_reshaping_game_events_keeps_the_rows_that_point_at_them(
         with engine.connect() as conn:
             assert conn.execute(text("SELECT COUNT(*) FROM game_events")).scalar() == 2
             assert conn.execute(text("SELECT COUNT(*) FROM resolutions")).scalar() == 0
+    finally:
+        get_settings.cache_clear()
+        engine.dispose()
+
+
+# A save from just before CharacterPosition: one world, three sessions whose
+# `current_location` strings cover the three outcomes the backfill can have.
+POSITION_WORLD = "8" * 32
+MATCHED_SESSION = "9" * 32
+AMBIGUOUS_SESSION = "a" * 32
+BLANK_SESSION = "b" * 32
+
+SEED_ROWS_BEFORE_POSITION = (
+    """
+    INSERT INTO worlds (id, name, description, genre, setting, language, rules_json,
+                        initial_datetime, initial_facts, initial_situations,
+                        created_at, updated_at)
+    VALUES (:world, 'Asterfall', '', 'fantasy', '', 'en', '{"version": 1}',
+            '{"year": 842, "month": 10, "day": 4, "hour": 6, "minute": 0}',
+            '[]', '[]',
+            '2026-01-01 10:00:00.000000', '2026-01-01 10:00:00.000000')
+    """,
+    # One tavern, and two streets that share a name. The tavern is matchable; the
+    # streets are the ambiguity the backfill must refuse to resolve.
+    """
+    INSERT INTO location_definitions (id, world_id, origin_session_id, name, description,
+                                      category, subtype, scale, parent_location_id,
+                                      importance, tags, spatial_metadata,
+                                      created_at, updated_at)
+    VALUES ('d0', :world, NULL, 'The Broken Crown', '', 'structure', 'tavern', 'building',
+            NULL, 4, '[]', '{}',
+            '2026-01-01 10:00:00.000000', '2026-01-01 10:00:00.000000'),
+           ('d1', :world, NULL, 'Market Street', '', 'transit', 'street', 'site',
+            NULL, 3, '[]', '{}',
+            '2026-01-01 10:00:00.000000', '2026-01-01 10:00:00.000000'),
+           ('d2', :world, NULL, 'Market Street', '', 'transit', 'street', 'site',
+            NULL, 3, '[]', '{}',
+            '2026-01-01 10:00:00.000000', '2026-01-01 10:00:00.000000')
+    """,
+    # Trimmed and differently cased on purpose: the match folds both.
+    """
+    INSERT INTO game_sessions (id, world_id, title, player_name, player_description,
+                               current_location, summary, turn_index, elapsed_minutes,
+                               state_revision, world_state_version, created_at, updated_at)
+    VALUES (:matched, :world, 'Run', 'Rin', '', '  the broken crown ', '', 1, 0, 0, 1,
+            '2026-01-01 10:00:00.000000', '2026-01-01 10:00:00.000000'),
+           (:ambiguous, :world, 'Run', 'Rin', '', 'Market Street', '', 1, 0, 0, 1,
+            '2026-01-01 10:00:00.000000', '2026-01-01 10:00:00.000000'),
+           (:blank, :world, 'Run', 'Rin', '', '', '', 1, 0, 0, 1,
+            '2026-01-01 10:00:00.000000', '2026-01-01 10:00:00.000000')
+    """,
+)
+
+
+def test_existing_saves_get_a_position_and_an_ambiguous_name_gets_no_guess(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The last name-to-id resolution in the life of the system, done once.
+
+    Every existing session comes out with a position row, because "no row" is the one
+    state the new contract does not have. A session whose old string names exactly one
+    visible place starts there; ambiguous and blank ones start `unlocated`, which is an
+    honest gap rather than a guess written into a save as canon.
+    """
+    db_path = tmp_path / "positions.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    config = build_config(db_path)
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        command.upgrade(config, "2d9f47c1a8be")
+        with engine.begin() as conn:
+            for statement in SEED_ROWS_BEFORE_POSITION:
+                conn.execute(
+                    text(statement),
+                    {
+                        "world": POSITION_WORLD,
+                        "matched": MATCHED_SESSION,
+                        "ambiguous": AMBIGUOUS_SESSION,
+                        "blank": BLANK_SESSION,
+                    },
+                )
+
+        command.upgrade(config, "head")
+
+        with engine.connect() as conn:
+            rows = {
+                row.session_id: row
+                for row in conn.execute(
+                    text(
+                        "SELECT session_id, actor_kind, actor_id, kind, location_id "
+                        "FROM character_positions"
+                    )
+                ).all()
+            }
+            assert len(rows) == 3, "every existing session gets exactly one position"
+            # The player of a session is that session; see position_service.
+            assert all(row.actor_kind == "player" for row in rows.values())
+            assert all(row.actor_id == row.session_id for row in rows.values())
+
+            assert rows[MATCHED_SESSION].kind == "at_location"
+            assert rows[MATCHED_SESSION].location_id == "d0"
+
+            for session_id in (AMBIGUOUS_SESSION, BLANK_SESSION):
+                assert rows[session_id].kind == "unlocated"
+                assert rows[session_id].location_id is None
+
+            # The old string is untouched. Nothing was dropped or rewritten -- what
+            # changed is what it means, not what it holds.
+            assert (
+                conn.execute(
+                    text("SELECT current_location FROM game_sessions WHERE id = :id"),
+                    {"id": MATCHED_SESSION},
+                ).scalar()
+                == "  the broken crown "
+            )
+            assert conn.execute(text("PRAGMA foreign_key_check")).all() == []
+
+        # Down and back up with data in the table both ways.
+        command.downgrade(config, "2d9f47c1a8be")
+        with engine.connect() as conn:
+            assert "character_positions" not in set(inspect(engine).get_table_names())
+            assert conn.execute(text("SELECT COUNT(*) FROM game_sessions")).scalar() == 3
+
+        command.upgrade(config, "head")
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM character_positions")).scalar() == 3
     finally:
         get_settings.cache_clear()
         engine.dispose()

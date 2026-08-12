@@ -64,9 +64,14 @@ fills with the engine narrating its own bookkeeping. A resolver that produces
 """
 
 SITUATION_PROGRESS_DUE_EVENT = "situation.progress"
-"""ScheduledEvent type for "look at this process again". Payload carries the situation
-id. Nothing dispatches it yet -- `advance_time` marks it processed and no simulation
-engine exists to act on it. See docs/world-state-situations.md."""
+"""ScheduledEvent type for "look at this process again". Payload carries the situation id.
+
+No automatic dispatcher exists yet. A time advance that reaches one marks it DUE and
+leaves it there -- `advance_time` used to mark it PROCESSED, which recorded a progression
+that had not happened and hid the work in the same stroke. Until a World Simulation
+Scheduler owns this type, the due entries are visible through
+`GET /dev/sessions/{id}/scheduled-events/due` and answered by progressing the situation
+with `completes_scheduled_event_id`. See docs/world-state-situations.md."""
 
 
 class Resolver(Protocol):

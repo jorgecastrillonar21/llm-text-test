@@ -198,7 +198,15 @@ class SessionCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     player_name: str = Field(min_length=1, max_length=200)
     player_description: str = Field(default="", max_length=4000)
+
     current_location: str = Field(default="", max_length=300)
+    """DEPRECATED. Where the player says they are starting, in their own words.
+
+    Read exactly once, at session creation, to seed a canonical `CharacterPosition`
+    when the string names one visible place unambiguously; after that it is neither read
+    nor authoritative. It survives as an input because it is how a player says where to
+    begin in a world whose geography they have not seen -- not because a name is a
+    position. See `app.application.position_service.materialize_initial_position`."""
 
 
 class SessionRead(BaseModel):
@@ -552,6 +560,15 @@ class SituationProgressRequest(BaseModel):
 
     trigger: ProgressionTrigger = ProgressionTrigger.EXPLICIT
 
+    completes_scheduled_event_id: uuid.UUID | None = None
+    """The due `situation.progress` event this call is executing, when it is answering one.
+
+    Optional because a person may progress a situation for its own sake. Supplied when
+    acting as the dispatcher the schedule is waiting for: the event is marked PROCESSED
+    inside the same transaction as the progression, so the acknowledgement and the world
+    change it acknowledges cannot come apart. An event that is not due is a 422.
+    """
+
 
 class ResolutionResponse(BaseModel):
     """What one resolution did. The shape every command endpoint returns.
@@ -574,6 +591,11 @@ class ResolutionResponse(BaseModel):
 
     created_situation_ids: list[uuid.UUID] = Field(default_factory=list)
     scheduled_event_ids: list[uuid.UUID] = Field(default_factory=list)
+
+    completed_scheduled_event_id: uuid.UUID | None = None
+    """The due scheduled event this resolution executed and marked done, when it was
+    answering one. Null for a resolution nobody scheduled."""
+
     narrative_context: dict[str, Any] = Field(default_factory=dict)
     """Structured, flat, and for the Story Director to narrate. Absent on a replay,
     because the outcome object is not reconstructed from the record."""

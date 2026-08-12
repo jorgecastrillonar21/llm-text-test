@@ -18,9 +18,10 @@ Director's context. Configuration only: no dice, no combat, no simulation engine
 deliberately did not decide.
 
 The systems that read those rules are each their own epic. `WorldState` is done in four
-parts (1.6–1.9), the resolution boundary that changes it in a fifth (1.10), and the
-consolidation that names the whole thing in a sixth (1.11); `CharacterSheet`,
-`PowerSystem`, rules resolution and world simulation are not started.
+parts (1.6–1.9), the resolution boundary that changes it in a fifth (1.10), the
+consolidation that names the whole thing in a sixth (1.11) and the review corrections in a
+seventh (1.12); `CharacterSheet`, `PowerSystem`, rules resolution and world simulation are
+not started.
 
 ## Phase 1.6 — WorldState: simulation time ✅
 
@@ -57,8 +58,9 @@ saves and state is not; gameplay may invent small places that become determinist
 for that session and are invisible to every other. See
 [world-state-locations.md](world-state-locations.md).
 
-Deliberately absent: `CharacterState` and canonical position, travel, scenes, tactical
-space, perception, interaction range, weather, and any interactive map.
+Deliberately absent: `CharacterState`, travel, scenes, tactical space, perception,
+interaction range, weather, and any interactive map. Canonical position was absent here
+too, and Phase 1.12 corrected that.
 
 ## Phase 1.9 — WorldState: situations ✅
 
@@ -127,6 +129,33 @@ phases.
 Deliberately absent: everything in Phase 5 and 6, plus `CharacterState`, `KnowledgeState`,
 event sourcing, snapshots and rewind, and any state editor in the UI.
 
+## Phase 1.12 — World Foundation corrections ✅
+
+A review of the six phases above found four places where the foundation said something it
+did not do. No redesign — four corrections, each the smallest one that makes the claim
+true:
+
+- **Canonical position.** Where an actor is was a free-text string on the session,
+  matched by name. It is now `character_positions`: one row per actor, four typed shapes
+  (`at_location`, `in_transit`, `offstage`, `unlocated`), ids validated against geography
+  the session can see. `InTransit` records the commitment and computes nothing — travel
+  mechanics remain unbuilt. See [world-state.md](world-state.md#where-the-player-is).
+- **`due` is not `processed`.** Advancing time marked events processed, recording as
+  finished work no code had done. Time now marks what it reached `due` and stops; the
+  system that owns the work calls `complete_scheduled_event` after doing it. See
+  [world-state-time.md](world-state-time.md#due-is-not-processed).
+- **Fact subjects must resolve.** A location fact could name an id that was nothing, or
+  another world's geography, whenever a trusted caller reached the state service without
+  passing the proposal reviewer. Checked at the mutation door now, for every caller. See
+  [world-state-facts.md](world-state-facts.md#a-subject-must-name-something-that-exists).
+- **Nested situations in one batch.** Documented as supported and never expressible. A
+  parent must have existed before the batch began, and saying so beats inventing a
+  mutation scripting language. See
+  [world-state-situations.md](world-state-situations.md#a-batch-cannot-nest-a-situation-inside-one-it-just-started).
+
+Deliberately absent, still: Character Foundation, `CharacterSheet`, the travel engine, the
+World Simulation Scheduler, NPC autonomy, factions, knowledge and perception.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.
@@ -180,8 +209,9 @@ See [ai-contract.md](ai-contract.md#future-semantic-retrieval) for the seam.
 - Per-world calendars: custom month names, month lengths, week structures, eras. The
   clock and the projection landed in Phase 1.6; only the authoring half is missing.
 - NPC schedules — characters exist when the player is not looking. `ScheduledEvent` exists
-  and time advancement already dispatches what comes due through the resolution pipeline;
-  what is missing is anything that schedules interesting work.
+  and time advancement marks what the clock reached `due`; what is missing is the
+  dispatcher that executes due work and anything that schedules interesting work in the
+  first place. See [DUE is not PROCESSED](world-state-time.md#due-is-not-processed).
 - Action durations: a resolved action that actually costs fictional time, with variance
   drawn from the seeded game RNG rather than from model sampling.
 - Factions and reputation.

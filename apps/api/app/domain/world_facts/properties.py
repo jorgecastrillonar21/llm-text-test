@@ -3,7 +3,7 @@
 A property is `namespace.segment[.segment...]`, every part snake_case:
 
     system.alive
-    system.location
+    system.hp
     world.political_status
     narrative.birthplace
     gameplay.palace_secret_discovered
@@ -40,7 +40,11 @@ class PropertyNamespace(StrEnum):
     """The first segment of every property. Closed: a new one is a design decision."""
 
     SYSTEM = "system"
-    """Mechanical state owned by deterministic game systems. Alive, location, hp."""
+    """Mechanical state owned by deterministic game systems. Alive, hp, inventory.
+
+    Not position: `system.location` is registered as DEDICATED, because
+    `character_positions` owns where an actor is and a fact saying otherwise would be a
+    second answer."""
 
     WORLD = "world"
     """Diegetic truth about a place, object or the world itself. Condition, status."""

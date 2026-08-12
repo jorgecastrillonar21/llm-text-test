@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.character_position import ActorKind, CharacterPosition
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import RelationshipVector
 from app.domain.resolution import (
@@ -193,6 +194,27 @@ class RelationshipRecord(BaseModel):
     affection: int
     respect: int
     fear: int
+
+
+class ActorPosition(BaseModel):
+    """Where one actor is, and whose position it is.
+
+    Read and write use the same shape, unlike `LocationState` and `LocationStateWrite`,
+    because a position has no server-assigned parts a caller could get wrong: there is
+    no id in it, no timestamps and nothing derived. The row's own id belongs to the
+    adapter, and a position is replaced whole rather than patched -- `AtLocation` to
+    `InTransit` shares no field, so a partial update of one is not expressible.
+
+    `actor_kind` plus `actor_id` is the identity. See `character_position.ActorKind` for
+    why the player is a kind of its own and why its id is the session's.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    session_id: uuid.UUID
+    actor_kind: ActorKind
+    actor_id: uuid.UUID
+    position: CharacterPosition
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +518,50 @@ class FactReaderPort(Protocol):
         ...
 
 
-class SpatialReaderPort(Protocol):
+class CharacterPositionReaderPort(Protocol):
+    """Reading where actors are. The canonical answer, by id.
+
+    A separate port rather than three more methods on `SpatialReaderPort`, because this
+    is the seam Character Foundation will adopt: when characters gain a state model,
+    the thing it composes is this contract, and a named port is what makes that a
+    re-pointing rather than a rewrite. It is a base of `SpatialReaderPort` all the same
+    -- where an actor is *is* part of a session's spatial reality, and every caller that
+    resolves a scene needs both halves against one transaction.
+    """
+
+    async def get_character_position(
+        self, session_id: uuid.UUID, *, actor_kind: ActorKind, actor_id: uuid.UUID
+    ) -> ActorPosition | None:
+        """One actor's position, or None when nothing has been written for them.
+
+        None means *unwritten*, which the application turns into `Unlocated` at the one
+        place that reads it. Adapters must not invent that themselves: an absent row and
+        a stored `Unlocated` are the same answer to a caller and different answers to
+        anyone debugging why a session has no position.
+        """
+        ...
+
+    async def load_character_positions(
+        self,
+        session_id: uuid.UUID,
+        *,
+        location_id: uuid.UUID | None = None,
+        limit: int,
+    ) -> list[ActorPosition]:
+        """Positions in this session, ordered by actor kind then actor id.
+
+        `location_id` narrows to "who is at this place" -- the reverse lookup, and the
+        reason no location keeps an occupants list. A list on the room would be a second
+        copy of what this table already says, free to disagree with it the moment one of
+        the two is written and the other is not. It matches `AtLocation` only: somebody
+        travelling towards a place is not in it.
+
+        The order has to be total, like every other read that can reach a prompt.
+        """
+        ...
+
+
+class SpatialReaderPort(CharacterPositionReaderPort, Protocol):
     """Reading a session's spatial reality.
 
     Every method takes `session_id` and every implementation must apply the same
@@ -640,12 +705,16 @@ class ScheduledEventReaderPort(Protocol):
     async def load_due_scheduled_events(
         self, session_id: uuid.UUID, *, through: int
     ) -> list[ScheduledEventRecord]:
-        """Pending events due at or before `through`, earliest first.
+        """Unresolved events due at or before `through`, earliest first.
 
-        Earliest first is the processing order, so it has to come out of the query.
-        The lower bound is deliberately open: anything still pending is due, even if
-        its minute is already behind the clock. An event written into the past would
-        otherwise sit there forever, which is a worse failure than firing it late.
+        Earliest first is the surfacing order, so it has to come out of the query.
+        The lower bound is deliberately open: anything still owed is due, even if its
+        minute is already behind the clock. An event written into the past would
+        otherwise sit there forever, which is a worse failure than surfacing it late.
+
+        Unresolved means PENDING *or* DUE. An event the last advance reached and nobody
+        has executed yet is still owed, and filtering on PENDING alone would hide it the
+        moment it became someone's problem.
         """
         ...
 
@@ -658,13 +727,14 @@ class ScheduledEventReaderPort(Protocol):
     ) -> list[ScheduledEventRecord]:
         """This session's scheduled events, soonest first, then by id for a total order.
 
-        `statuses=None` means every status, including the fired and cancelled ones --
-        they are the record of what the world already did with its commitments. A
+        `statuses=None` means every status, including the processed and cancelled ones
+        -- they are the record of what the world already did with its commitments. A
         caller wanting only what is still coming passes the set it means.
 
-        Distinct from `load_due_scheduled_events`, which answers "what must I process
-        now" and is the turn loop's query. This one answers "what is on the books",
+        Distinct from `load_due_scheduled_events`, which answers "what has the clock
+        reached" and is the advance's query. This one answers "what is on the books",
         which is a reading question and bounded by `limit` rather than by the clock.
+        `statuses={DUE}` is how a dispatcher asks for its backlog.
         """
         ...
 
@@ -993,12 +1063,41 @@ class WorldStatePort(FactReaderPort, EventWriterPort, TurnUnitOfWorkPort, Protoc
         ...
 
 
-class SpatialPort(SpatialReaderPort, TurnUnitOfWorkPort, Protocol):
+class CharacterPositionPort(CharacterPositionReaderPort, TurnUnitOfWorkPort, Protocol):
+    """What moving an actor needs, and nothing else.
+
+    The write half of the position seam. Deliberately unable to touch geography: a
+    position points at places, it does not create them, and an actor arriving somewhere
+    that did not exist a moment ago is a bug rather than a discovery.
+    """
+
+    async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...
+
+    async def known_character_ids(self, world_id: uuid.UUID) -> set[uuid.UUID]:
+        """Ids a position may be about. A position for a character nobody wrote is a
+        position for nobody, and the check has to happen before the row exists because
+        `actor_id` has no foreign key to carry it -- see
+        `infrastructure.db.models.CharacterPositionRow`."""
+        ...
+
+    async def set_character_position(self, position: ActorPosition) -> uuid.UUID:
+        """Insert or replace one actor's position in place, returning the row's id.
+
+        In place, like `set_fact` and `set_location_state`: one current position per
+        actor is the invariant, enforced by a unique constraint rather than by this
+        method remembering to delete first. Replaced whole, because the four shapes
+        share no fields -- see `ActorPosition`.
+        """
+        ...
+
+
+class SpatialPort(SpatialReaderPort, CharacterPositionPort, Protocol):
     """What changing spatial reality needs, and nothing else.
 
     Narrow in the same way `SessionClockPort` and `WorldStatePort` are. This can read
-    the graph, add to it and write per-session state. It cannot touch the transcript,
-    the relationships, the clock or the facts, and the signature is what says so.
+    the graph, add to it, write per-session state and move actors through it. It cannot
+    touch the transcript, the relationships, the clock or the facts, and the signature
+    is what says so.
     """
 
     async def get_session(self, session_id: uuid.UUID) -> SessionSnapshot | None: ...

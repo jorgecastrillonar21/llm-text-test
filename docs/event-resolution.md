@@ -3,8 +3,9 @@
 Everything before this described the world. This describes the **door through which the
 world changes** — and the record it leaves behind.
 
-Four systems now say what is true (`world_facts`), where things are (`location_states`),
-what is under way (`situations`) and what time it is (`elapsed_minutes`). None of them
+Four systems now say what is true (`world_facts`), where things are (`location_states`
+and `character_positions`), what is under way (`situations`) and what time it is
+(`elapsed_minutes`). None of them
 said *how* any of it is allowed to change. That was the hole: the Story Director
 proposed, reviewers accepted, and a fact appeared. There was no verdict, no audit trail,
 no way to retry a turn safely, and no answer to "why is this so?" beyond "a model said
@@ -85,6 +86,27 @@ because events carry its foreign key and it has to state how many events it prod
 That also means a mutation failing at the end takes the record and its events down with
 it, which is what `test_one_failing_mutation_takes_the_record_and_its_events_with_it`
 actually exercises.
+
+### Being a trusted caller is not being an unchecked one
+
+A resolution reaches `stage_state_change` directly. It does not pass through the Story
+Director's proposal reviewer, and neither do ADMIN, ENGINE or the dev router — so
+everything a proposal is checked for and the world depends on is checked again at the
+mutation door, for every caller:
+
+- **Every fact subject must name something that exists.** A `location` subject is read
+  session-scoped and must resolve to a place this session can see; a `character` subject
+  must be a character of this world; `faction` and `other` have no owning domain yet and
+  are refused outright rather than accepted as an id nothing can check. See
+  [A subject must name something that exists](world-state-facts.md#a-subject-must-name-something-that-exists).
+- **A situation's parent must have existed before the batch began.** One batch cannot
+  start a situation and nest a child inside it, because the child would have to name an
+  id that does not exist until the batch is half-applied. See
+  [A batch cannot nest a situation inside one it just started](world-state-situations.md#a-batch-cannot-nest-a-situation-inside-one-it-just-started).
+
+The reviewer keeps its own copy of the location check and is not redundant: it can reject
+one claim and let the turn continue, which is worth more than a refusal that ends the
+turn. The boundary check is the one that cannot be bypassed.
 
 ### Resolution source
 
@@ -457,19 +479,26 @@ ScheduledEvent  something expected to happen.  Future. Has a status.
 A scheduled event is a **request to evaluate something later**. It is not history and must
 never be written into it.
 
-Time advancement owns the dispatch. `stage_time_advance` walks the events that came due in
-the interval, marks each `processed` through the same transition rules everything else
-uses, and stops at the first one flagged as interrupting.
+Time advancement owns the chronology, and only the chronology. `stage_time_advance` walks
+the events the interval reached, marks each `due` through the same transition rules
+everything else uses, returns their ids, and stops at the first one flagged as
+interrupting.
 
-**What a due event does not yet do is resolve.** `stage_time_advance` marks it processed;
-nothing routes it into `resolve()`, so a due scheduled event produces no ResolutionRecord
-today. The seam is deliberately left in place and unused: `ResolutionSourceType` already
-carries `scheduled_event`, and a resolver keyed on the scheduled event's own id would drop
-into the existing pipeline without changing it. Wiring that up belongs to whatever system
-first needs the world to act on its own — see the non-goals below. **`elapsed_minutes += X` is not a
-generic StateMutation** and there is no mutation type that can express it: Time V1 owns the
-clock, a resolver *requests* an advance, and the resolution service routes that request to
-the time service rather than applying it.
+**Reaching an event is not resolving it.** `due` means the clock arrived and nobody has
+answered yet; `processed` means the work the event owned was actually carried out. Nothing
+routes a due event into `resolve()`, so a due scheduled event produces no ResolutionRecord
+today — and it stays `due`, visible to `load_due_work`, until something executes it and
+calls `complete_scheduled_event` in the same transaction as whatever the work changed. An
+interrupting event nobody answers stops the clock at its minute every time it is asked to
+advance. See [DUE is not PROCESSED](world-state-time.md#due-is-not-processed).
+
+The seam is deliberately left in place and unused: `ResolutionSourceType` already carries
+`scheduled_event`, and a resolver keyed on the scheduled event's own id would drop into the
+existing pipeline without changing it. Wiring that up belongs to whatever system first
+needs the world to act on its own — see the non-goals below. **`elapsed_minutes += X` is
+not a generic StateMutation** and there is no mutation type that can express it: Time V1
+owns the clock, a resolver *requests* an advance, and the resolution service routes that
+request to the time service rather than applying it.
 
 There is **no event bus.** No queue, no broker, no subscribers, no recursive dispatch. A
 resolution may schedule work; scheduled work is picked up by an explicit call. Kafka,

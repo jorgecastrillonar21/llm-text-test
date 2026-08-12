@@ -113,10 +113,20 @@ It exists because nothing in the game moves time or changes state yet:
 ```text
 POST   /api/v1/dev/sessions/{id}/advance-time
 POST   /api/v1/dev/sessions/{id}/scheduled-events
+GET    /api/v1/dev/sessions/{id}/scheduled-events/due
 DELETE /api/v1/dev/scheduled-events/{id}
 POST   /api/v1/dev/sessions/{id}/world-state/changes
+GET    /api/v1/dev/sessions/{id}/world-state
+GET    /api/v1/dev/sessions/{id}/world-state/check
 POST   /api/v1/dev/sessions/{id}/situations/{situation_id}/progress
 ```
+
+The due-events endpoint is the seam nothing consumes yet. Advancing time marks what the
+clock reached `due` and stops there — it does not execute it — so this is how to see what
+the world is owed and has not been given. Until a dispatcher exists, an interrupting
+event that nobody answers keeps stopping the clock at its minute, which is the honest
+answer rather than a bug. See
+[DUE is not PROCESSED](world-state-time.md#due-is-not-processed).
 
 The mutation endpoint carries spatial and situation mutations too -- `update_location_state`,
 `update_connection_state`, `start_situation`, `update_situation` and `resolve_situation`

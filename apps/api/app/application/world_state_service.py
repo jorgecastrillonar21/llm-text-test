@@ -56,9 +56,10 @@ from app.application.persistence import (
     SessionSnapshot,
     WorldStateReaderPort,
 )
+from app.application.position_service import player_position
 from app.application.situation_service import MAX_SITUATIONS
-from app.application.spatial_context import resolve_scene_location
 from app.application.spatial_service import MAX_GRAPH_SIZE, SpatialGraph, load_spatial_graph
+from app.domain.character_position import scene_location_id
 from app.domain.errors import NotFoundError
 from app.domain.resolution import GameEvent
 from app.domain.world_facts import WorldFact
@@ -73,6 +74,7 @@ from app.domain.world_locations import (
 from app.domain.world_situations import LIVE_STATUSES, Situation
 from app.domain.world_state import WorldStateV1, read_world_state
 from app.domain.world_time import (
+    UNRESOLVED_STATUSES,
     ScheduledEventStatus,
     TimeProjection,
     TimeState,
@@ -164,7 +166,17 @@ class SnapshotCounts(BaseModel):
     connections: int
     active_situations: int
     situations: int
+
     pending_scheduled_events: int
+    """Commitments the clock has not reached yet."""
+
+    due_scheduled_events: int
+    """Commitments the clock reached and nobody has executed.
+
+    Separate from the pending count, and worth its own line, because a number that only
+    grows is the visible symptom of a schedule with no dispatcher behind it. Counting
+    the two together would let a backlog hide inside "things are scheduled".
+    """
 
 
 class CurrentWorldSnapshot(BaseModel):
@@ -197,10 +209,12 @@ class CurrentWorldSnapshot(BaseModel):
 
     # RELEVANT and up.
     current_location: PlaceView | None = None
-    """Where the scene is, when the session's location string resolves to a known
-    place. None for most sessions today: there is no canonical position in this system
-    yet, and `GameSession.current_location` is still free text. See
-    `spatial_context.resolve_scene_location`."""
+    """Where the scene is, from the player's canonical `CharacterPosition`.
+
+    None when the world has no geography, when nobody has written a position, or when
+    the player is `in_transit` or `offstage` -- somebody on the road between two cities
+    is in neither of them. Never derived from `GameSession.current_location`, which is
+    legacy presentation. See `app.domain.character_position`."""
 
     exits: list[ConnectionView] = []
 
@@ -297,8 +311,8 @@ async def build_snapshot(
         graph = await load_spatial_graph(reader, session_id=session_id, world_id=world.id)
         truncated = truncated or len(graph.index) == MAX_GRAPH_SIZE
 
-    pending = await reader.load_scheduled_events(
-        session_id, statuses=_PENDING, limit=MAX_SITUATIONS
+    unresolved = await reader.load_scheduled_events(
+        session_id, statuses=UNRESOLVED_STATUSES, limit=MAX_SITUATIONS
     )
 
     counts = SnapshotCounts(
@@ -307,7 +321,12 @@ async def build_snapshot(
         connections=len(graph.connections) if graph is not None else 0,
         active_situations=len(live),
         situations=len(situations),
-        pending_scheduled_events=len(pending),
+        pending_scheduled_events=sum(
+            1 for event in unresolved if event.status is ScheduledEventStatus.PENDING
+        ),
+        due_scheduled_events=sum(
+            1 for event in unresolved if event.status is ScheduledEventStatus.DUE
+        ),
     )
     if graph is None:
         # Counted without loading the whole graph: a minimal snapshot should not pay for
@@ -340,7 +359,11 @@ async def build_snapshot(
     if graph is None:
         return snapshot
 
-    current = resolve_scene_location(graph, session.current_location)
+    # By id, from the player's canonical position. `None` covers a session with no
+    # geography, a player nobody has placed, and a player in transit or offstage --
+    # `scene_location_id` returns None for the last two on purpose.
+    location_id = scene_location_id(await player_position(reader, session_id=session_id))
+    current = None if location_id is None else graph.index.get(location_id)
     snapshot = snapshot.model_copy(
         update={
             "current_location": _place(graph, current) if current is not None else None,
@@ -379,8 +402,6 @@ async def build_snapshot(
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
-
-_PENDING = frozenset({ScheduledEventStatus.PENDING})
 
 
 def _at_least(scope: SnapshotScope, floor: SnapshotScope) -> bool:

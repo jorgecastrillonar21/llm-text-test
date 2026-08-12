@@ -15,11 +15,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.persistence import NewConnection, NewLocation, NewZone
-from app.application.spatial_context import (
-    build_scene_spatial_context,
-    get_spatial_context,
-    resolve_scene_location,
-)
+from app.application.position_service import materialize_initial_position, player_position
+from app.application.spatial_context import build_scene_spatial_context, get_spatial_context
 from app.application.spatial_service import (
     create_connection,
     create_location,
@@ -28,6 +25,7 @@ from app.application.spatial_service import (
     materialize_initial_spatial_state,
 )
 from app.application.state_service import apply_state_change
+from app.domain.character_position import Unlocated
 from app.domain.errors import (
     FactPolicyError,
     NotFoundError,
@@ -565,55 +563,47 @@ async def test_a_default_state_is_left_out_of_the_context(
     assert changed.current.condition is LocationCondition.RUINED
 
 
-async def test_the_scene_finds_its_place_by_an_exact_unambiguous_name(
+async def test_the_scene_finds_its_place_from_the_canonical_position(
     db_session: AsyncSession, make_world
 ) -> None:
-    """The temporary bridge until CharacterPosition exists; see
-    `spatial_context.resolve_scene_location` for why it refuses to guess."""
+    """By id, from `CharacterPosition` -- not by matching a name against the graph."""
     world = await _world(db_session, make_world)
-    await _town_and_tavern(db_session, world.id)
-    session = await _session(db_session, world.id)
+    _, tavern, _ = await _town_and_tavern(db_session, world.id)
+    session = await _session(db_session, world.id, current_location="  broken crown ")
     store = SqlAlchemyTurnGateway(db_session)
-    graph = await load_spatial_graph(store, session_id=session.id, world_id=world.id)
+    await materialize_initial_position(store, session_id=session.id)
 
-    found = resolve_scene_location(graph, "  broken crown ")
-    assert found is not None
-    assert found.name == "Broken Crown"
-
-    assert resolve_scene_location(graph, "the broken crown") is None, "no fuzzy matching"
-    assert resolve_scene_location(graph, "") is None
+    context = await build_scene_spatial_context(store, session_id=session.id, world_id=world.id)
+    assert context is not None
+    assert context.current.name == tavern.name
 
 
-async def test_an_ambiguous_name_resolves_to_nothing_rather_than_to_the_first_row(
+async def test_an_ambiguous_start_name_leaves_the_player_unlocated(
     db_session: AsyncSession, make_world
 ) -> None:
+    """Two places by one name seed nothing rather than whichever row came back first."""
     world = await _world(db_session, make_world)
     for _ in range(2):
         db_session.add(_place(world.id, "Market Street", scale=LocationScale.SITE))
     await db_session.flush()
-    session = await _session(db_session, world.id)
+    session = await _session(db_session, world.id, current_location="Market Street")
     store = SqlAlchemyTurnGateway(db_session)
-    graph = await load_spatial_graph(store, session_id=session.id, world_id=world.id)
+    await materialize_initial_position(store, session_id=session.id)
 
-    assert resolve_scene_location(graph, "Market Street") is None
+    assert await player_position(store, session_id=session.id) == Unlocated()
 
 
-async def test_a_session_with_no_matching_place_gets_no_spatial_block(
+async def test_a_session_with_no_canonical_position_gets_no_spatial_block(
     db_session: AsyncSession, make_world
 ) -> None:
     world = await _world(db_session, make_world)
     await _town_and_tavern(db_session, world.id)
     session = await _session(db_session, world.id, current_location="somewhere else entirely")
     store = SqlAlchemyTurnGateway(db_session)
+    await materialize_initial_position(store, session_id=session.id)
 
     assert (
-        await build_scene_spatial_context(
-            store,
-            session_id=session.id,
-            world_id=world.id,
-            current_location=session.current_location,
-        )
-        is None
+        await build_scene_spatial_context(store, session_id=session.id, world_id=world.id) is None
     )
 
 
@@ -921,6 +911,230 @@ async def test_a_narrative_fact_about_a_location_is_still_a_fact(
     stored = await store.get_fact(session.id, subject, "narrative.childhood_nickname")
     assert stored is not None
     assert stored.value == "a meeting place for smugglers"
+
+
+# -- a fact must be about a place that exists ---------------------------------
+
+
+async def test_a_fact_about_a_location_that_does_not_exist_is_refused(
+    db_session: AsyncSession, make_world
+) -> None:
+    """The dangling reference the consistency checker used to find after the fact.
+
+    A location id is a UUID, so nothing about the shape of one says whether it names a
+    place. Until this check existed, any trusted caller could establish a truth about a
+    room that was never built.
+    """
+    world = await _world(db_session, make_world)
+    session = await _session(db_session, world.id)
+    store = SqlAlchemyTurnGateway(db_session)
+
+    with pytest.raises(NotFoundError, match="Location"):
+        await apply_state_change(
+            store,
+            session_id=session.id,
+            batch=StateMutationBatch(
+                authority=FactAuthority.ADMIN,
+                mutations=[
+                    SetFact(
+                        subject=FactSubject(type=FactSubjectType.LOCATION, id=uuid.uuid4()),
+                        property="narrative.childhood_nickname",
+                        value="nowhere",
+                    )
+                ],
+            ),
+            cause=cause_from_resolution(),
+        )
+
+    facts = await store.load_facts(session.id, limit=10)
+    assert facts == []
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [FactAuthority.ADMIN, FactAuthority.ENGINE, FactAuthority.SEED, FactAuthority.STORY_DIRECTOR],
+)
+async def test_no_authority_can_write_a_fact_about_a_place_that_is_not_there(
+    db_session: AsyncSession, make_world, authority: FactAuthority
+) -> None:
+    """The reason the check moved here from the proposal reviewer.
+
+    The reviewer only ever saw the Story Director. Resolution, ADMIN, ENGINE and the
+    dev router all reach `stage_state_change` without passing it, so the check that
+    matters has to be at the door every one of them uses.
+    """
+    world = await _world(db_session, make_world)
+    session = await _session(db_session, world.id)
+    store = SqlAlchemyTurnGateway(db_session)
+
+    with pytest.raises(NotFoundError, match="Location"):
+        await apply_state_change(
+            store,
+            session_id=session.id,
+            batch=StateMutationBatch(
+                authority=authority,
+                mutations=[
+                    SetFact(
+                        subject=FactSubject(type=FactSubjectType.LOCATION, id=uuid.uuid4()),
+                        property="narrative.reputation",
+                        value="infamous",
+                    )
+                ],
+            ),
+            cause=cause_from_resolution(),
+        )
+
+
+async def test_another_sessions_private_geography_cannot_be_written_about(
+    db_session: AsyncSession, make_world
+) -> None:
+    """Invisible and absent have to be the same answer.
+
+    A place one save generated is not "somewhere I may not write about" from another
+    save's point of view -- it is not there at all, and the refusal says so without
+    leaking that anything exists.
+    """
+    world = await _world(db_session, make_world)
+    town, _, _ = await _town_and_tavern(db_session, world.id)
+    first = await _session(db_session, world.id, title="A")
+    second = await _session(db_session, world.id, title="B", player_name="Kai")
+    store = SqlAlchemyTurnGateway(db_session)
+
+    theirs = await create_location(
+        store,
+        session_id=first.id,
+        location=NewLocation(
+            world_id=world.id,
+            origin_session_id=first.id,
+            name="Starfall Books",
+            category=LocationCategory.STRUCTURE,
+            scale=LocationScale.BUILDING,
+            parent_location_id=town.id,
+        ),
+        narrated=True,
+    )
+
+    with pytest.raises(NotFoundError, match="Location"):
+        await apply_state_change(
+            store,
+            session_id=second.id,
+            batch=StateMutationBatch(
+                authority=FactAuthority.ADMIN,
+                mutations=[
+                    SetFact(
+                        subject=FactSubject(type=FactSubjectType.LOCATION, id=theirs),
+                        property="narrative.reputation",
+                        value="burnt down",
+                    )
+                ],
+            ),
+            cause=cause_from_resolution(),
+        )
+
+    # And the same subject is perfectly writable from the save that made the place.
+    await apply_state_change(
+        store,
+        session_id=first.id,
+        batch=StateMutationBatch(
+            authority=FactAuthority.ADMIN,
+            mutations=[
+                SetFact(
+                    subject=FactSubject(type=FactSubjectType.LOCATION, id=theirs),
+                    property="narrative.reputation",
+                    value="well stocked",
+                )
+            ],
+        ),
+        cause=cause_from_resolution(),
+    )
+
+
+async def test_another_worlds_template_geography_cannot_be_written_about_either(
+    db_session: AsyncSession, make_world
+) -> None:
+    """The half of visibility that `origin_session_id IS NULL` does not cover.
+
+    Template rows are shared by every session *of their own world*, so an id from a
+    second world passes the leakage filter on its own. `get_location` scopes the
+    session's world as well, which is what makes "visible to this session" true rather
+    than nearly true.
+    """
+    world = await _world(db_session, make_world)
+    elsewhere = await _world(db_session, make_world)
+    _, their_tavern, _ = await _town_and_tavern(db_session, elsewhere.id)
+    session = await _session(db_session, world.id)
+    store = SqlAlchemyTurnGateway(db_session)
+
+    assert await store.get_location(session.id, their_tavern.id) is None
+
+    with pytest.raises(NotFoundError, match="Location"):
+        await apply_state_change(
+            store,
+            session_id=session.id,
+            batch=StateMutationBatch(
+                authority=FactAuthority.ADMIN,
+                mutations=[
+                    SetFact(
+                        subject=FactSubject(type=FactSubjectType.LOCATION, id=their_tavern.id),
+                        property="narrative.reputation",
+                        value="somebody else's",
+                    )
+                ],
+            ),
+            cause=cause_from_resolution(),
+        )
+
+
+async def test_a_subject_type_with_no_owning_domain_is_refused_rather_than_assumed(
+    db_session: AsyncSession, make_world
+) -> None:
+    """V1 is explicit about what it cannot check.
+
+    Factions do not exist yet, so nothing can say whether a faction id names anything.
+    Accepting the UUID anyway would mean claiming every fact refers to something real
+    while quietly making that untrue.
+    """
+    world = await _world(db_session, make_world)
+    session = await _session(db_session, world.id)
+    store = SqlAlchemyTurnGateway(db_session)
+
+    with pytest.raises(ValidationError, match="cannot be verified"):
+        await apply_state_change(
+            store,
+            session_id=session.id,
+            batch=StateMutationBatch(
+                authority=FactAuthority.ADMIN,
+                mutations=[
+                    SetFact(
+                        subject=FactSubject(type=FactSubjectType.FACTION, id=uuid.uuid4()),
+                        property="narrative.motto",
+                        value="No gods, no kings.",
+                    )
+                ],
+            ),
+            cause=cause_from_resolution(),
+        )
+
+
+async def test_the_world_itself_stays_a_valid_subject_without_an_id(
+    db_session: AsyncSession, make_world
+) -> None:
+    world = await _world(db_session, make_world)
+    session = await _session(db_session, world.id)
+    store = SqlAlchemyTurnGateway(db_session)
+    subject = FactSubject(type=FactSubjectType.WORLD)
+
+    await apply_state_change(
+        store,
+        session_id=session.id,
+        batch=StateMutationBatch(
+            authority=FactAuthority.SEED,
+            mutations=[SetFact(subject=subject, property="narrative.season", value="the long dry")],
+        ),
+    )
+
+    stored = await store.get_fact(session.id, subject, "narrative.season")
+    assert stored is not None
 
 
 async def test_a_stale_revision_still_refuses_a_spatial_batch(

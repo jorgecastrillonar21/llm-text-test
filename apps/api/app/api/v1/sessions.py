@@ -32,6 +32,7 @@ from app.api.schemas import (
     WorldStateRead,
 )
 from app.application.narration_service import narrate_resolution
+from app.application.position_service import materialize_initial_position
 from app.application.situation_service import materialize_initial_situations
 from app.application.spatial_service import materialize_initial_spatial_state
 from app.application.state_service import materialize_initial_facts
@@ -101,7 +102,9 @@ async def create_session(
     the processes a world was already running before anyone played it.
 
     Geography before situations, because a seeded situation may be centred on a place
-    and the location has to be visible before the siege of it can be written.
+    and the location has to be visible before the siege of it can be written. The
+    player's position comes last, because it points at a location by id and the
+    geography has to exist first.
     """
     world = await db.get(models.World, payload.world_id)
     if world is None:
@@ -114,6 +117,9 @@ async def create_session(
     await materialize_initial_facts(store, session_id=session.id)
     await materialize_initial_spatial_state(store, session_id=session.id)
     await materialize_initial_situations(store, session_id=session.id)
+    # Always a row, even when it says `unlocated`. A session with no position at all is
+    # the ambiguity `CharacterPosition` exists to remove.
+    await materialize_initial_position(store, session_id=session.id)
 
     await db.commit()
     return session

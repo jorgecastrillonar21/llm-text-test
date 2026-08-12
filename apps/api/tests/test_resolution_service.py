@@ -38,8 +38,13 @@ from app.application.persistence import EventWriterPort, ResolutionStorePort
 from app.application.resolution_service import ResolutionRequest, ResolutionResult, resolve
 from app.application.resolvers import known_resolvers, register_resolver
 from app.application.situation_service import start_situation
-from app.application.time_service import advance_time, schedule_event
-from app.domain.errors import NotFoundError, StaleStateError
+from app.application.time_service import (
+    advance_time,
+    complete_scheduled_event,
+    load_due_work,
+    schedule_event,
+)
+from app.domain.errors import NotFoundError, StaleStateError, ValidationError
 from app.domain.resolution import (
     AdvanceTimeCommand,
     Command,
@@ -918,9 +923,14 @@ async def test_a_correction_is_a_second_event_pointing_at_the_first(
 # ---------------------------------------------------------------------------
 
 
-async def test_a_scheduled_event_is_processed_once_however_often_the_clock_moves(
+async def test_a_scheduled_event_stays_owed_until_an_owner_answers_it(
     db_session: AsyncSession, make_world
 ) -> None:
+    """Against the real adapter: the clock reaching an event does not resolve it.
+
+    Two advances surface the same row twice, because nothing between them did the work.
+    Completing it is what takes it off the books.
+    """
     _, session_id = await _world_and_session(db_session, make_world)
     store = SqlAlchemyTurnGateway(db_session)
     scheduled_id = await schedule_event(
@@ -938,10 +948,167 @@ async def test_a_scheduled_event_is_processed_once_however_often_the_clock_moves
         request=TimeAdvanceRequest(requested_minutes=60, reason=TimeAdvanceReason.DEBUG),
     )
 
-    assert first.processed_event_ids == [scheduled_id]
-    assert second.processed_event_ids == []
+    assert first.due_event_ids == [scheduled_id]
+    assert second.due_event_ids == [scheduled_id]
     record = await store.get_scheduled_event(scheduled_id)
-    assert record is not None and record.status is ScheduledEventStatus.PROCESSED
+    assert record is not None and record.status is ScheduledEventStatus.DUE
+
+    await complete_scheduled_event(store, session_id=session_id, event_id=scheduled_id)
+
+    third = await advance_time(
+        store,
+        session_id=session_id,
+        request=TimeAdvanceRequest(requested_minutes=60, reason=TimeAdvanceReason.DEBUG),
+    )
+    assert third.due_event_ids == []
+    settled = await store.get_scheduled_event(scheduled_id)
+    assert settled is not None and settled.status is ScheduledEventStatus.PROCESSED
+
+
+async def test_due_situation_progress_is_dispatched_rather_than_consumed_by_the_clock(
+    db_session: AsyncSession, make_world
+) -> None:
+    """The whole seam, end to end, against the database.
+
+        start a Situation
+              |
+        schedule `situation.progress` for a later minute
+              |
+        advance Time past it        -> the siege has NOT moved
+              |
+        the work is still on the backlog
+              |
+        execute it through its owner (the resolution pipeline)
+              |
+        the authoritative mutation and the acknowledgement commit together
+              |
+        only now is it PROCESSED
+
+    Time cannot progress a siege. The correction is that it no longer pretends it did.
+    """
+    session_id, situation_id, store = await _siege_under_way(db_session, make_world, at=0)
+    before = await store.get_situation(session_id, situation_id)
+    assert before is not None
+
+    scheduled_id = await schedule_event(
+        store,
+        session_id=session_id,
+        event_type="situation.progress",
+        delay_minutes=240,
+        payload={"situation_id": str(situation_id)},
+    )
+
+    advanced = await advance_time(
+        store,
+        session_id=session_id,
+        request=TimeAdvanceRequest(requested_minutes=480, reason=TimeAdvanceReason.DEBUG),
+    )
+
+    # Time walked past it and stopped there. Nothing progressed.
+    assert advanced.due_event_ids == [scheduled_id]
+    untouched = await store.get_situation(session_id, situation_id)
+    assert untouched is not None
+    assert untouched.intensity == before.intensity
+    assert untouched.last_progressed_at == before.last_progressed_at
+    assert await _revision(store, session_id) == 0
+
+    # And it is still discoverable, which is what makes a dispatcher possible at all.
+    owed = await load_due_work(store, session_id=session_id)
+    assert [event.id for event in owed] == [scheduled_id]
+
+    result = await resolve(
+        store,
+        request=ResolutionRequest(
+            session_id=session_id,
+            command=ProgressSituationCommand(situation_id=situation_id),
+            idempotency_key=f"scheduled:{scheduled_id}",
+            source_type=ResolutionSourceType.SCHEDULED_EVENT,
+            source_id=scheduled_id,
+            completes_scheduled_event_id=scheduled_id,
+        ),
+    )
+
+    assert result.resolution.disposition is ResolutionDisposition.APPLIED
+    assert result.completed_scheduled_event_id == scheduled_id
+    progressed = await store.get_situation(session_id, situation_id)
+    assert progressed is not None
+    assert progressed.last_progressed_at == 480
+    assert await _revision(store, session_id) == 1
+
+    settled = await store.get_scheduled_event(scheduled_id)
+    assert settled is not None and settled.status is ScheduledEventStatus.PROCESSED
+    assert await load_due_work(store, session_id=session_id) == []
+
+
+async def test_acknowledging_the_same_due_event_twice_is_refused(
+    db_session: AsyncSession, make_world
+) -> None:
+    """A retried dispatch cannot execute the same fictional moment twice.
+
+    The idempotency key already replays the resolution; this is the second lock, on the
+    schedule row itself, for a retry that arrives with a different key.
+    """
+    session_id, situation_id, store = await _siege_under_way(db_session, make_world, at=0)
+    scheduled_id = await schedule_event(
+        store, session_id=session_id, event_type="situation.progress", delay_minutes=240
+    )
+    await advance_time(
+        store,
+        session_id=session_id,
+        request=TimeAdvanceRequest(requested_minutes=480, reason=TimeAdvanceReason.DEBUG),
+    )
+    await _dispatch(store, session_id, situation_id, scheduled_id, key="scheduled:1")
+
+    with pytest.raises(ValidationError, match="already resolved"):
+        await _dispatch(store, session_id, situation_id, scheduled_id, key="scheduled:2")
+
+
+async def test_a_progression_without_a_dispatch_leaves_the_schedule_alone(
+    db_session: AsyncSession, make_world
+) -> None:
+    """A person poking at a situation by hand is not answering the schedule."""
+    session_id, situation_id, store = await _siege_under_way(db_session, make_world, at=0)
+    scheduled_id = await schedule_event(
+        store, session_id=session_id, event_type="situation.progress", delay_minutes=240
+    )
+    await advance_time(
+        store,
+        session_id=session_id,
+        request=TimeAdvanceRequest(requested_minutes=480, reason=TimeAdvanceReason.DEBUG),
+    )
+
+    result = await _resolve(
+        store,
+        session_id,
+        ProgressSituationCommand(situation_id=situation_id),
+        key="by-hand:1",
+        source_type=ResolutionSourceType.ADMIN,
+    )
+
+    assert result.completed_scheduled_event_id is None
+    still_owed = await store.get_scheduled_event(scheduled_id)
+    assert still_owed is not None and still_owed.status is ScheduledEventStatus.DUE
+
+
+async def _dispatch(
+    store: SqlAlchemyTurnGateway,
+    session_id: uuid.UUID,
+    situation_id: uuid.UUID,
+    scheduled_id: uuid.UUID,
+    *,
+    key: str,
+) -> ResolutionResult:
+    return await resolve(
+        store,
+        request=ResolutionRequest(
+            session_id=session_id,
+            command=ProgressSituationCommand(situation_id=situation_id),
+            idempotency_key=key,
+            source_type=ResolutionSourceType.SCHEDULED_EVENT,
+            source_id=scheduled_id,
+            completes_scheduled_event_id=scheduled_id,
+        ),
+    )
 
 
 async def test_processing_one_scheduled_event_twice_resolves_it_once(

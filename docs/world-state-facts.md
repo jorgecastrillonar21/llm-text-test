@@ -69,6 +69,37 @@ Nothing else is part of identity. Not the value, not the kind, not who wrote it.
 A subject is never a display name: two characters named Elena are two subjects, and a
 character who is renamed is the same one.
 
+### A subject must name something that exists
+
+Checked in `stage_state_change`, for **every** caller and every authority:
+
+```text
+world       the session's own world — the subject carries no id, so nothing can dangle
+character   must be a character of this session's world
+location    must resolve to a Location visible to this session
+faction     refused: nothing in this system resolves a faction id yet
+other       refused, for the same reason
+```
+
+The check lives at the mutation door rather than in the proposal reviewer because the
+reviewer only ever sees the Story Director. Resolution, `ADMIN`, `ENGINE`, `SEED` and the
+dev router all reach `stage_state_change` without passing it, and any one of them could
+establish a truth about a room that was never built. A dangling reference used to be
+something the consistency checker found afterwards, which is a report about a fact that
+is already stored.
+
+"Visible to this session" means both halves: the location must belong to this session's
+world **and** be either shared template geography or this save's own. Another world's
+template rooms and another save's generated rooms are equally unreachable, and both fail
+as `NotFoundError` — the same answer the caller would get for an id that names nothing,
+which is deliberate: a distinct error would confirm the row exists.
+
+**`faction` and `other` are refused rather than accepted.** Factions do not exist yet, so
+nothing can say whether a faction id names anything, and accepting the uuid anyway would
+mean claiming that every fact refers to something real while quietly making that untrue.
+The V1 policy is explicit and safe: use a world fact until the owning domain exists. When
+Factions arrive, this is one branch to add and one refusal to delete.
+
 **Properties** are `namespace.snake_case`, and the grammar is enforced rather than
 suggested:
 
@@ -324,9 +355,10 @@ Three refusals worth naming:
   the store holds current truth and the story already committed to one.
 - **The same value again.** Refused too, for a duller reason: it would move the state
   revision without moving the world.
-- **Subjects nothing can check.** The director may only speak about the world and about
-  characters, because those are the only ids this application can resolve today. A
-  proposal about `location:<uuid>` names an entity nothing can confirm exists.
+- **Subjects nothing can check.** The director may only speak about the world, about
+  characters and about locations, because those are the only ids this application can
+  resolve. A proposal about `faction:<uuid>` names an entity nothing can confirm exists,
+  and is refused here as well as at the mutation door.
 
 The model also has no *shape* in which to express a replacement WorldState: the contract
 is a list of individual claims about single properties, which is what can be adjudicated

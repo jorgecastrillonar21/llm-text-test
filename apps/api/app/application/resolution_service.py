@@ -70,7 +70,7 @@ from app.application.persistence import (
 )
 from app.application.resolvers import Resolver, resolver_for
 from app.application.state_service import ChangeCause, StateChangeResult, stage_state_change
-from app.application.time_service import stage_time_advance
+from app.application.time_service import stage_scheduled_event_completion, stage_time_advance
 from app.domain.errors import NotFoundError, StaleStateError, ValidationError
 from app.domain.resolution import (
     MAX_IDEMPOTENCY_KEY_LENGTH,
@@ -143,6 +143,20 @@ class ResolutionRequest(BaseModel):
     """The resolution that caused this one, for cascades. A collapsing bridge resolving
     into a drowning is two resolutions, and this is the link between them."""
 
+    completes_scheduled_event_id: uuid.UUID | None = None
+    """The due ScheduledEvent this resolution is the execution of, when it is one.
+
+    This is the dispatch half of the schedule's lifecycle. A time advance only ever marks
+    an event DUE -- Time has no idea what `situation.progress` means -- so something has
+    to run the work and say it ran. A caller doing that names the event here, and the
+    acknowledgement is staged inside this resolution's transaction, after the mutations:
+    the world change and "that work is done" commit together or neither does.
+
+    Distinct from `source_id`, which says what *prompted* the resolution and claims
+    nothing. Naming an event that is not DUE is refused, which is what stops a retry
+    under a fresh idempotency key from executing the same fictional moment twice.
+    """
+
     expected_revision: int | None = None
     """Refuse if the world moved since the caller read it.
 
@@ -172,6 +186,9 @@ class ResolutionResult(BaseModel):
     time_advance: TimeAdvanceResult | None = None
     scheduled_event_ids: list[uuid.UUID] = Field(default_factory=list)
     created_situation_ids: list[uuid.UUID] = Field(default_factory=list)
+
+    completed_scheduled_event_id: uuid.UUID | None = None
+    """The due ScheduledEvent this resolution executed and acknowledged, when it did."""
 
     replayed: bool = False
     """Whether this came back from the idempotency check rather than from resolving.
@@ -401,6 +418,16 @@ async def _commit(
         for scheduled in outcome.scheduled_events
     ]
 
+    if request.completes_scheduled_event_id is not None:
+        # Last, and deliberately: the work this event owned is everything above. Saying
+        # "done" before doing it is precisely the ordering that let a crashed advance
+        # leave PROCESSED rows behind for work nothing had run.
+        await stage_scheduled_event_completion(
+            store,
+            session_id=session.id,
+            event_id=request.completes_scheduled_event_id,
+        )
+
     await store.commit()
 
     resolution = await store.get_resolution(session.id, resolution_id)
@@ -414,6 +441,7 @@ async def _commit(
         state_change=state_change,
         time_advance=time_advance,
         scheduled_event_ids=scheduled_event_ids,
+        completed_scheduled_event_id=request.completes_scheduled_event_id,
         created_situation_ids=[
             entry.entity_id
             for entry in (state_change.applied if state_change else [])

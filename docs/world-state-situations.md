@@ -435,6 +435,23 @@ timestamps, and every one of those is something a query will need.
 `UpdateSituation` and `ResolveSituation` share a target key, so one batch cannot both
 nudge a siege and lift it — a caller that sends both has not decided what happened.
 
+### A batch cannot nest a situation inside one it just started
+
+`parent_situation_id` on a `StartSituation` may only name a situation that **existed
+before the batch began**. Naming one that does not is a `NotFoundError`, refused during
+validation, before anything is written.
+
+This is a consequence of `StartSituation` carrying no `id`: the id is minted at write
+time, deliberately, so that nothing outside `state_service` chooses situation identity.
+A batch therefore has no vocabulary for referring to one of its own results — "the war
+two mutations ago" is not something that can be written down — and for a while the
+docs claimed the opposite.
+
+A caller that wants a tree writes the root, commits, and starts the children against the
+id it got back. The alternative — local aliases a later mutation could resolve — is a
+mutation scripting language, and no use case has asked for one. Batches stay flat lists
+of independent changes.
+
 ### Atomicity
 
 A siege progressing:
@@ -484,11 +501,15 @@ investigation next evaluation = +1 day
 
 Absolute, never `"in six hours"`.
 
-> **Nothing dispatches that event yet.** `advance_time` will find it due and mark it
-> processed, because processing a scheduled event means resolving it, and the thing that
-> would resolve a `situation.progress` event is the SimulationEngine — out of scope for
-> this task. The row is written so the schedule is real and the wiring has one obvious
-> place to happen. Until then, a scheduled progression is a note nobody reads.
+> **Nothing dispatches that event automatically yet, and it is no longer consumed
+> silently.** `advance_time` marks it `DUE` and leaves it there — see
+> [DUE is not PROCESSED](world-state-time.md#due-is-not-processed). Time owns chronology
+> and cannot progress a situation, so a `situation.progress` event stays owed until
+> something executes it. `GET /api/v1/dev/sessions/{id}/scheduled-events/due` lists what
+> is owed, and `POST /api/v1/dev/sessions/{id}/situations/{sid}/progress` is the one
+> dispatcher that exists: it runs the progression and acknowledges the event in the same
+> transaction. A due list that keeps growing is the visible backlog that used to be
+> invisible, and the World Simulation Scheduler that will drain it is out of scope here.
 
 ---
 

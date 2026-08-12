@@ -151,7 +151,7 @@ many rows it touched.
 
 ## The decomposition
 
-Six tables carry one session's current reality and its record of itself. Each is keyed
+Seven tables carry one session's current reality and its record of itself. Each is keyed
 by `session_id` with a non-null foreign key and `ON DELETE CASCADE`, which is what makes
 "a session's world" a real thing rather than a manner of speaking.
 
@@ -160,6 +160,7 @@ by `session_id` with a non-null foreign key and `ON DELETE CASCADE`, which is wh
 | `world_facts` | declarative truth: one current value per subject and property | [facts](world-state-facts.md) |
 | `location_states` | what is currently true of a place, in this save | [locations](world-state-locations.md) |
 | `location_connection_states` | whether a way through is currently passable | [locations](world-state-locations.md) |
+| `character_positions` | where each actor is — one row per actor, no exceptions | [below](#where-the-player-is) |
 | `situations` | ongoing processes with a lifecycle and a direction | [situations](world-state-situations.md) |
 | `scheduled_events` | commitments the world has made about its future | [time](world-state-time.md) |
 | `game_events` | significant history — what happened, not what is | [event/resolution](event-resolution.md) |
@@ -178,7 +179,8 @@ that conflates any pair starts lying about one of them.
 TEMPORAL            what time is it              elapsed_minutes
 DECLARATIVE         what is true                 world_facts
 SPATIAL             where things are and are     location_states,
-                    they reachable               location_connection_states
+                    they reachable               location_connection_states,
+                                                 character_positions
 ONGOING PROCESS     what the world is doing      situations
 FUTURE COMMITMENT   what it has promised to do   scheduled_events
 ```
@@ -387,11 +389,17 @@ POST /sessions
   ├─ materialize_initial_facts        template facts → world_facts
   ├─ materialize_initial_spatial_state state rows for the world's places
   ├─ materialize_initial_situations   template situations → situations
+  ├─ materialize_initial_position     the player's canonical CharacterPosition
   └─ commit                            ← one transaction, all of it
 ```
 
 Geography before situations, because a seeded situation may be centred on a place and
-the location has to be visible before the siege of it can be written.
+the location has to be visible before the siege of it can be written. The position comes
+last, because it points at a location by id and the geography has to exist first.
+
+The position is always written, even when it says `unlocated` — see
+[where the player is](#where-the-player-is). A session with no position row at all is
+precisely the ambiguity that table exists to remove.
 
 **All of it or none of it.** A session that exists without the truths its world declared,
 or without a state row for the places in it, is a world the player is playing a different
@@ -399,10 +407,10 @@ version of, and there is no retry that fixes it afterwards.
 `test_initialisation_that_fails_leaves_no_half_built_world` fails a seeding step and
 asserts no session row survives.
 
-The three steps are three services rather than one because they are three different
-kinds of thing: a batch of mutations, materialising defaults that no event caused, and
-starting processes the world was already running before anyone played it. None of them
-moves the revision.
+The four steps are four services rather than one because they are four different kinds
+of thing: a batch of mutations, materialising defaults that no event caused, starting
+processes the world was already running before anyone played it, and placing the actor
+the save is about. None of them moves the revision.
 
 ## StoryContext is not WorldState
 
@@ -539,19 +547,70 @@ mutation path enforces.
 Deliberately not built: a map, a strategy dashboard, a state editor, a character sheet,
 a timeline editor.
 
+## Where the player is
+
+`character_positions` is the canonical answer, and the only one. One row per
+`(session, actor kind, actor)`, enforced by a unique constraint, because two rows would
+be two answers to "where is the player?".
+
+A position is one of four shapes, discriminated on `kind`:
+
+```text
+at_location   at a place, optionally in a zone of it
+in_transit    between two places, on a declared connection
+offstage      not in the scene, deliberately
+unlocated     nobody has said
+```
+
+`offstage` and `unlocated` are both fieldless and both kept, because they are different
+claims. An actor the story set aside is not secretly somewhere; an actor nobody has
+placed is an honest gap. Collapsing them would make "we decided" and "we never said"
+the same row.
+
+Everything is referenced by id, never by name, and every id is validated against the
+geography the session can actually see before a position is stored: the location, the
+zone (which must belong to that location), both ends of a transit, and the connection —
+which must actually run from the origin to the destination, so a one-way edge cannot be
+walked backwards by writing a position. A `character` position must name a character of
+this world; the player's `actor_id` **is** the session id, because this build has no
+player character row to point at, and `ActorKind` is what discriminates. The column
+carries no foreign key for exactly that reason — it addresses two tables — so
+`position_service` makes the check the database cannot.
+
+**`LocationState` keeps no occupant list.** "Who is here" is a query against positions
+(`position_service.actors_at`), not a field on the room. Two places recording the same
+fact would disagree the first time one was written without the other, and the room is
+the copy that would go stale.
+
+`in_transit` records a *commitment* — who left where for where, along which connection,
+when, and when they are expected — and computes nothing from it. No speed, no path, no
+partial progress, no arrival logic. Reaching the expected minute is not arriving, the
+same distinction [`ScheduledEvent`](world-state-time.md#due-is-not-processed) draws
+between due and processed. Arriving is a caller writing `at_location`; the caller that
+will do it is TravelEngine, which does not exist.
+
+**`game_sessions.current_location` is legacy presentation.** It is read exactly once, at
+session creation, by `position_service.materialize_initial_position`, which resolves the
+string against this session's visible geography — exact, case-insensitive, trimmed, and
+**refusing ambiguity**: two places called "Market Street" seed `unlocated` rather than
+whichever row came back first. That is the last name-to-id resolution in the system's
+life. From then on the position is the authority and the string cannot override it:
+`StoryContext.session.current_location`, the prompt's geography block and
+`CurrentWorldSnapshot.current_location` all derive from the position's location by id.
+Migration `7c41a9f2b6d3` applied the same one-off rule to every existing save, so no
+session anywhere is without a row.
+
+Nothing else lives here. No discovery or knowledge flags, no tactical coordinates, no
+character sheet. This is the smallest complete spatial-presence authority, drawn so that
+Character Foundation composes it rather than growing a second one beside it.
+
 ## Duplicated authority
 
-The audit for this consolidation looked for facts with two homes. It found exactly one.
-
-**`game_sessions.current_location` is free text**, and where the player is is properly a
-property of a character. There is no `CharacterState` yet, so the string stays. It is
-resolved against the spatial graph by name when it happens to match
-(`spatial_context.resolve_scene_location`), which is why `CurrentWorldSnapshot.current_location`
-is `None` for most sessions, and it moves to `CharacterState` when that arrives.
-
-It was deliberately *not* replaced with a session-scoped position column in the meantime.
-Two half-authoritative answers to "where is the player" are worse than one honest string,
-and a second temporary position system would have to be migrated away from twice.
+The audit for this consolidation looked for facts with two homes. It found exactly one,
+and the correction above closed it: `game_sessions.current_location` was free text
+resolved by name match, and where an actor is now has one canonical, id-addressed home.
+The string is kept as a legacy seed and as presentation, documented as deprecated, and
+nothing in the running system reads it after session creation.
 
 Everything else came back clean. The clock has one authority (`time_service`), facts have
 one writer (`state_service`), the revision has one mechanism (`bump_state_revision`), and
@@ -560,12 +619,14 @@ intensity projections are all computed on read.
 
 ## Persistence and indexes
 
-The index audit for this epic added nothing. Every access pattern WorldState introduced
-was already served:
+The index audit for this epic added nothing to the tables that already existed. Every
+access pattern WorldState introduced was already served:
 
 | query | index |
 |---|---|
 | the root | primary key on `game_sessions` |
+| one actor's position | the unique constraint `(session_id, actor_kind, actor_id)` |
+| who is at a place | `ix_character_positions_session_location` |
 | facts for a session | `ix_world_facts_session_subject` on `(session_id, subject_type, subject_id)`, plus the two partial unique indexes on subject and property |
 | spatial state | the unique constraints `(session_id, location_id)` and `(session_id, connection_id)`, which are indexes |
 | situations | `ix_situations_session_status` on `(session_id, status)` |
@@ -584,6 +645,11 @@ sessions and a `>= 1` check constraint. It does **not** renumber any existing re
 the 0-versus-1 convention was chosen to match what the code already did, precisely so
 that no migration had to exist solely to change a number.
 
+Migration `7c41a9f2b6d3` adds `character_positions` and backfills one player row per
+existing session — `at_location` where `current_location` names exactly one visible
+place, `unlocated` otherwise. It is purely additive: no column is dropped, no existing
+row is rewritten, and `game_sessions.current_location` is left exactly as it was.
+
 ## Future extensibility
 
 New state domains attach the same way the existing five did, and the shape of the work
@@ -597,9 +663,11 @@ is now fixed:
 5. A bounded, deterministic retrieval function for `StoryContext` — never "send it all".
 6. A referential check in `state_consistency`.
 
-`CharacterState` is the next one, and it is the one that will take `current_location`
-off the session row. Nothing about that requires the root to change: a character's state
-is a table keyed by session and character, and the root will still be four fields.
+`CharacterState` is the next one. It does **not** take position with it: position already
+has a canonical home, and Character Foundation composes `character_positions` rather than
+establishing a second authority beside it. Nothing about that requires the root to
+change: a character's state is a table keyed by session and character, and the root will
+still be four fields.
 
 ## Explicitly not built
 

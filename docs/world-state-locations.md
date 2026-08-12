@@ -433,18 +433,21 @@ Three decisions worth naming:
 
 ### How the scene finds its place
 
-There is no canonical position in this system — `CharacterState` does not exist and is
-explicitly out of scope for this release. Until it arrives,
-`resolve_scene_location` matches `GameSession.current_location` — a string the player
-typed — against location names: exact, case-insensitive, trimmed, and **refusing
-ambiguity**. Two places called "Market Street" resolve to nothing rather than to
-whichever row came back first.
+From the player's canonical `CharacterPosition`, by id. `spatial_context.resolve_scene`
+asks `position_service.player_position` where the player is and looks that id up in the
+graph it just loaded. Nothing matches a name against anything.
 
-No fuzzy matching, no substring search, no closest-name. Those turn a missing match into
-a *wrong* one, and a wrong match hands the director the exits of somewhere else. Nothing
-is stored from it and nothing is written by it; a failed match costs the prompt one
-optional section. **This is a temporary bridge and is meant to be deleted** when
-`CharacterPosition` supplies a real id.
+Three of the four position shapes give the scene no place, on purpose: `in_transit` is
+between two locations and in neither, `offstage` is deliberately not in the scene, and
+`unlocated` is nobody having said. Each of those costs the prompt its geography section
+rather than producing a plausible guess. A position that names a location this session
+cannot see is logged as a warning and treated the same way — reported, never silently
+swapped for something nearby.
+
+The free-text `GameSession.current_location` is read exactly once, at session creation,
+to seed that first position, and never again. See
+[the canonical position](world-state.md#where-the-player-is) for the full contract and
+the one-off name resolution that seeds it.
 
 ## Deterministic topology
 
@@ -482,13 +485,17 @@ happened to a place goes through `state_service`, reachable in development at
 
 Named so the absence is a decision:
 
-- **CharacterState and canonical position.** The largest gap, and the one that keeps the
-  scene anchored by a name-match today. `SpatialPresence` will be `{location_id, zone_id}`
-  — coarse position plus an optional intra-scene area, and no metric coordinates.
-- **InTransit.** Being *between* places, with a connection, an origin, a destination, a
-  departure and an expected arrival. The graph is shaped to carry it; nothing implements
-  it, and travel is not assumed to be instantaneous.
+- **CharacterState.** The rest of a character — sheet, skills, condition, inventory,
+  goals. Only the spatial part exists, as [`CharacterPosition`](world-state.md#where-the-player-is),
+  and it is a seam Character Foundation composes rather than a small character model to
+  grow. `LocationState` still keeps no occupant list: "who is here" is a query against
+  positions, because two places recording it would disagree the first time one was
+  written without the other.
 - **TravelEngine.** Routing, mode selection, real durations, encounters en route.
+  `InTransit` records the *commitment* — origin, destination, connection, departure,
+  expected arrival — and computes nothing from it. Nothing advances a journey, nothing
+  decides an actor has arrived, and reaching the expected minute is not arriving. Until
+  this exists, arriving is a caller writing `AtLocation`.
 - **SceneState.** The immediate ephemeral context: participants, active zone, temporary
   objects, relative positions. Different lifetime, different owner, different failure
   mode — writing it into a durable table would fill a save's permanent truth with

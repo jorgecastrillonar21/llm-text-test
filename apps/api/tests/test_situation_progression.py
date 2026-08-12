@@ -700,6 +700,100 @@ async def test_one_batch_changes_a_situation_a_place_and_starts_a_child(
     assert state is not None and state.condition is LocationCondition.DESTROYED
 
 
+async def test_a_batch_cannot_start_a_situation_inside_one_it_is_also_starting(
+    db_session: AsyncSession, make_world
+) -> None:
+    """The V1 contract, stated as behaviour: a parent must predate the batch.
+
+    `StartSituation` carries no id -- the id is minted at write time, deliberately, so
+    nothing outside the situation service chooses situation identity. A batch therefore
+    has no way to write down "the war two mutations ago", which means it cannot hang a
+    siege off a war it is starting in the same breath. That was documented as working
+    for a while; it never was.
+
+    Writing the root, committing, and starting the children against the id that comes
+    back is the way to build a tree. The alternative is a local-reference mechanism,
+    which is a mutation scripting language, and nothing has asked for one.
+    """
+    _, session_id = await _world_and_session(db_session, make_world)
+    store = SqlAlchemyTurnGateway(db_session)
+    await db_session.commit()
+    before = await store.get_session(session_id)
+    assert before is not None
+
+    # The only id a caller could name for a situation this batch is creating is one it
+    # invented, and no such situation exists.
+    invented = uuid.uuid4()
+
+    with pytest.raises(NotFoundError, match="Situation"):
+        await apply_state_change(
+            store,
+            session_id=session_id,
+            batch=StateMutationBatch(
+                authority=FactAuthority.SIMULATION,
+                mutations=[
+                    _siege(title="The war in the north"),
+                    StartSituation(
+                        category=SituationCategory.CONFLICT,
+                        subtype="siege",
+                        title="Siege of Asterfall",
+                        parent_situation_id=invented,
+                    ),
+                ],
+            ),
+            cause=await cause_from_event(store, session_id, subtype="war_declared"),
+        )
+
+    # Refused before anything was written: neither situation exists, and the revision
+    # did not move.
+    live = await store.load_situations(session_id, limit=10)
+    assert live == []
+    after = await store.get_session(session_id)
+    assert after is not None and after.state_revision == before.state_revision
+
+
+async def test_a_child_started_against_a_committed_parent_is_the_supported_path(
+    db_session: AsyncSession, make_world
+) -> None:
+    """Two batches, which is what building a tree actually looks like."""
+    _, session_id = await _world_and_session(db_session, make_world)
+    store = SqlAlchemyTurnGateway(db_session)
+
+    first = await apply_state_change(
+        store,
+        session_id=session_id,
+        batch=StateMutationBatch(
+            authority=FactAuthority.SIMULATION,
+            mutations=[_siege(title="The war in the north")],
+        ),
+        cause=await cause_from_event(store, session_id, subtype="war_declared"),
+    )
+    war = first.applied[0].entity_id
+    assert war is not None
+
+    second = await apply_state_change(
+        store,
+        session_id=session_id,
+        batch=StateMutationBatch(
+            authority=FactAuthority.SIMULATION,
+            mutations=[
+                StartSituation(
+                    category=SituationCategory.CONFLICT,
+                    subtype="siege",
+                    title="Siege of Asterfall",
+                    parent_situation_id=war,
+                )
+            ],
+        ),
+        cause=await cause_from_event(store, session_id, subtype="siege_begins"),
+    )
+
+    child_id = second.applied[0].entity_id
+    assert child_id is not None
+    child = await store.get_situation(session_id, child_id)
+    assert child is not None and child.parent_situation_id == war
+
+
 async def test_a_batch_that_fails_partway_leaves_nothing_behind(
     db_session: AsyncSession, make_world
 ) -> None:

@@ -138,7 +138,7 @@ async def test_advancing_reports_what_it_did(app_client: AsyncClient) -> None:
         "ended_at": 480,
         "interrupted": False,
         "interruption": None,
-        "processed_event_ids": [],
+        "due_event_ids": [],
     }
 
 
@@ -377,15 +377,42 @@ async def test_an_interrupting_event_cuts_an_advance_short_end_to_end(
     assert result["advanced_minutes"] == 192
     assert result["interrupted"] is True
     assert result["interruption"]["event_id"] == scheduled["id"]
-    assert result["processed_event_ids"] == [scheduled["id"]]
+    assert result["due_event_ids"] == [scheduled["id"]]
 
     detail = (await app_client.get(f"/api/v1/sessions/{session['id']}")).json()
     assert detail["elapsed_minutes"] == 192
 
 
-async def test_cancelling_an_event_that_already_fired_is_refused(
+async def test_work_the_clock_reached_is_readable_and_not_processed(
     app_client: AsyncClient,
 ) -> None:
+    """End to end, the correction: advancing marks work due and leaves it findable.
+
+    Nothing in the application can land a caravan, so nothing pretends one landed. The
+    row stays on the backlog endpoint until an owner executes it.
+    """
+    _, session = await bootstrap(app_client)
+    scheduled = (
+        await app_client.post(
+            f"/api/v1/dev/sessions/{session['id']}/scheduled-events",
+            json={"type": "caravan_arrives", "delay_minutes": 100},
+        )
+    ).json()
+
+    await advance(app_client, session["id"], requested_minutes=480)
+
+    owed = (
+        await app_client.get(f"/api/v1/dev/sessions/{session['id']}/scheduled-events/due")
+    ).json()
+    assert [event["id"] for event in owed] == [scheduled["id"]]
+    assert owed[0]["status"] == "due"
+
+    snapshot = (await app_client.get(f"/api/v1/dev/sessions/{session['id']}/world-state")).json()
+    assert snapshot["counts"]["due_scheduled_events"] == 1
+    assert snapshot["counts"]["pending_scheduled_events"] == 0
+
+
+async def test_due_work_can_be_called_off_over_http(app_client: AsyncClient) -> None:
     _, session = await bootstrap(app_client)
     scheduled = (
         await app_client.post(
@@ -394,6 +421,25 @@ async def test_cancelling_an_event_that_already_fired_is_refused(
         )
     ).json()
     await advance(app_client, session["id"], requested_minutes=60)
+
+    response = await app_client.delete(f"/api/v1/dev/scheduled-events/{scheduled['id']}")
+
+    assert response.status_code == 204, response.text
+    owed = (
+        await app_client.get(f"/api/v1/dev/sessions/{session['id']}/scheduled-events/due")
+    ).json()
+    assert owed == []
+
+
+async def test_cancelling_an_event_twice_is_refused(app_client: AsyncClient) -> None:
+    _, session = await bootstrap(app_client)
+    scheduled = (
+        await app_client.post(
+            f"/api/v1/dev/sessions/{session['id']}/scheduled-events",
+            json={"type": "shop_closes", "delay_minutes": 10},
+        )
+    ).json()
+    await app_client.delete(f"/api/v1/dev/scheduled-events/{scheduled['id']}")
 
     response = await app_client.delete(f"/api/v1/dev/scheduled-events/{scheduled['id']}")
 

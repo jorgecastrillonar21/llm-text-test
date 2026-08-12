@@ -112,7 +112,12 @@ class TimeAdvanceRequest(BaseModel):
 
 
 class Interruption(BaseModel):
-    """Why an advance stopped early."""
+    """Why an advance stopped early.
+
+    The named event is what the clock ran into, and it is DUE, not done. Stopping is all
+    Time does about it: the caller is being handed a fictional instant and told what is
+    waiting there. Whether anything happens next is the owning dispatcher's business.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -141,8 +146,15 @@ class TimeAdvanceResult(BaseModel):
     interrupted: bool = False
     interruption: Interruption | None = None
 
-    processed_event_ids: list[uuid.UUID] = Field(default_factory=list)
-    """Scheduled events resolved during this advance, in the order they came due."""
+    due_event_ids: list[uuid.UUID] = Field(default_factory=list)
+    """Scheduled events the clock reached during this advance, in the order they came due.
+
+    Reached, not run. This field was called `processed_event_ids` and it was a claim time
+    had no standing to make: advancing the clock past a `caravan.arrives` does not make a
+    caravan arrive, and Time has no idea what would. Every id here names work that is now
+    DUE and still owed, and it stays discoverable -- and stays in this list on the next
+    advance -- until its owner executes it and acknowledges it.
+    """
 
     @model_validator(mode="after")
     def _internally_consistent(self) -> Self:

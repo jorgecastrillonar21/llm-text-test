@@ -23,6 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
+from app.domain.character_position import ActorKind, PositionKind
 from app.domain.enums import Language, MemoryKind, MessageRole
 from app.domain.relationships import AXIS_MAX, AXIS_MIN
 from app.domain.resolution import (
@@ -176,13 +177,12 @@ class GameSession(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     player_name: Mapped[str] = mapped_column(String(200), nullable=False)
     player_description: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    # Free text, and the one piece of duplicated authority the WorldState audit found.
-    # Where the player is is a property of a character, and there is no CharacterState
-    # yet -- so this string stays, is resolved against the spatial graph by name when it
-    # happens to match (`spatial_context.resolve_scene_location`), and moves to
-    # CharacterState when that arrives. Deliberately not replaced with a second position
-    # system in the meantime: two half-authoritative answers are worse than one honest
-    # string. See docs/world-state.md, "Duplicated authority".
+    # DEPRECATED, and no longer authoritative for anything. Free text the player typed
+    # when the session began; `character_positions` is where the answer to "where is
+    # the player?" now lives, by id. This column is read exactly once -- at session
+    # creation, to seed that position when the string happens to name a place
+    # unambiguously -- and is otherwise presentation only. Nothing resolves a scene
+    # from it, and nothing may: see docs/world-state.md, "Duplicated authority".
     current_location: Mapped[str] = mapped_column(String(300), default="", nullable=False)
     # Rolling recap of turns older than the recent-message window. Phase 2 fills this.
     summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -542,13 +542,18 @@ class ScheduledEvent(Base):
     """Something due at a future point on the session clock.
 
     Fictional scheduling: nothing here runs on its own, and nothing fires while the
-    application is closed. Pending rows are only ever looked at during an explicit
-    time advance. See `app.domain.world_time.scheduling`.
+    application is closed. Unresolved rows are only ever looked at during an explicit
+    time advance, which moves them to `due` and does not execute them -- what a due
+    event means is its owner's business, not Time's. See
+    `app.domain.world_time.scheduling`.
     """
 
     __tablename__ = "scheduled_events"
     __table_args__ = (
-        # The only query this table has: what is still pending, due by when.
+        # The queries this table has, both covered by the same three columns: what is
+        # still owed and due by when (the advance), and what is due and unanswered (the
+        # dispatcher). The name predates the `due` status and is kept because renaming an
+        # index is a migration that buys nothing.
         Index("ix_scheduled_events_pending", "session_id", "status", "due_at"),
         CheckConstraint("due_at >= 0", name="ck_scheduled_events_due_at_nonnegative"),
     )
@@ -826,6 +831,116 @@ class LocationConnectionState(Base):
         String(20), default=LocationAccessibility.OPEN, nullable=False
     )
     traversal_modifier: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class CharacterPositionRow(Base):
+    """Where one actor is, in one session. The canonical spatial-presence row.
+
+    See `app.domain.character_position`. One row per (session, actor kind, actor),
+    enforced -- two rows would be two answers to "where is the player?", which is the
+    exact failure this table was added to end.
+
+    # A union stored flat
+
+    The domain model is a four-shape discriminated union, and this is the one table it
+    is stored in: a `kind` discriminator plus the columns each shape needs, nullable
+    because no shape needs all of them. `character_position.read_position` is the only
+    thing that turns these columns back into a position, and it refuses a row whose
+    columns do not match its own kind rather than handing back a half-position.
+
+    Four narrow tables would express the same thing with constraints instead of a
+    parser, at the cost of a four-way union on every read of "where is everyone" -- for
+    a table with one row per actor per save.
+
+    # `actor_id` has no foreign key, on purpose
+
+    It points at `characters.id` when `actor_kind` is `character`, and at the session's
+    own id when it is `player`, because this build has no player character row to point
+    at. A column that can address two tables cannot constrain either -- the same
+    reasoning as `location_states.owner_entity_id` -- so the check lives in the
+    application, which resolves the id against the session's world before writing.
+
+    # The geography references are RESTRICT
+
+    A position whose location was deleted is a broken position, not a degraded one, and
+    cascading it away would silently lose where somebody was. Same reasoning as
+    `location_connections`' endpoints.
+    """
+
+    __tablename__ = "character_positions"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "actor_kind", "actor_id", name="uq_character_positions_actor"
+        ),
+        # "Who is here" -- the reverse lookup a scene wants, and the reason
+        # `LocationState` does not keep an occupants list. One index instead of a
+        # duplicated field that would immediately disagree with this table.
+        Index("ix_character_positions_session_location", "session_id", "location_id"),
+        CheckConstraint(
+            "departed_at IS NULL OR departed_at >= 0",
+            name="ck_character_positions_departed_nonnegative",
+        ),
+        CheckConstraint(
+            "expected_arrival_at IS NULL OR departed_at IS NULL "
+            "OR expected_arrival_at >= departed_at",
+            name="ck_character_positions_arrival_after_departure",
+        ),
+        CheckConstraint(
+            "origin_location_id IS NULL OR destination_location_id IS NULL "
+            "OR origin_location_id <> destination_location_id",
+            name="ck_character_positions_transit_distinct_ends",
+        ),
+        # The shape rules, as far as SQL can state them: `at_location` has a location
+        # and `in_transit` has a whole journey. What SQL cannot state -- that the other
+        # shapes' columns are all null -- is `read_position`'s job, and it is checked on
+        # every read rather than only on write.
+        CheckConstraint(
+            "kind <> 'at_location' OR location_id IS NOT NULL",
+            name="ck_character_positions_at_location_has_location",
+        ),
+        CheckConstraint(
+            "kind <> 'in_transit' OR (origin_location_id IS NOT NULL "
+            "AND destination_location_id IS NOT NULL AND connection_id IS NOT NULL "
+            "AND departed_at IS NOT NULL AND expected_arrival_at IS NOT NULL)",
+            name="ck_character_positions_transit_is_complete",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    actor_kind: Mapped[ActorKind] = mapped_column(String(20), nullable=False)
+    actor_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+
+    kind: Mapped[PositionKind] = mapped_column(String(20), nullable=False)
+
+    location_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="RESTRICT"), nullable=True
+    )
+    zone_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_zones.id", ondelete="RESTRICT"), nullable=True
+    )
+
+    origin_location_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="RESTRICT"), nullable=True
+    )
+    destination_location_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_definitions.id", ondelete="RESTRICT"), nullable=True
+    )
+    connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("location_connections.id", ondelete="RESTRICT"), nullable=True
+    )
+    # Session elapsed minutes, on the same clock as `scheduled_events.due_at`.
+    # BigInteger for the reason `game_sessions.elapsed_minutes` is one.
+    departed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expected_arrival_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

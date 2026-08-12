@@ -14,8 +14,10 @@ apps/api/app/
 │   ├── world_time/       the simulation clock, calendar projection, scheduling
 │   ├── world_facts/      what is objectively true: values, properties, policy,
 │   │                     authority, mutations, world-rules compatibility
-│   ├── world_locations/  where things are: definitions, containment, connections,
+│   ├── world_locations/  where places are: definitions, containment, connections,
 │   │                     per-session state, creation policy
+│   ├── character_position/ where an *actor* is: the four spatial shapes, and the
+│   │                     canonical answer to "where is the player?"
 │   ├── world_situations/ what the world is doing: ongoing processes, their lifecycle,
 │   │                     participants, causal parentage, progression arithmetic
 │   ├── resolution/       how the world is allowed to change: commands, the context a
@@ -41,6 +43,7 @@ apps/api/app/
 │   ├── time_service.py   the only writer of the simulation clock
 │   ├── state_service.py  the only writer of world facts and spatial state
 │   ├── spatial_service.py  the spatial graph, materialisation, place creation
+│   ├── position_service.py  the only writer of where an actor is
 │   ├── spatial_context.py  deterministic, scene-sized geography for the prompt
 │   ├── situation_service.py  starting, reading and progressing ongoing processes
 │   ├── situation_context.py  deterministic, scene-sized relevance for the prompt
@@ -164,7 +167,8 @@ each one is exactly as wide as its job:
 | `TurnPersistencePort` | session/world lookups and every turn write |
 | `TurnUnitOfWorkPort` | `commit()` |
 | `SessionClockPort` | the simulation clock and its scheduled events |
-| `SpatialPort` | reading and growing the spatial graph, and per-session state |
+| `CharacterPositionPort` | reading and writing where an actor is, and nothing else |
+| `SpatialPort` | reading and growing the spatial graph, per-session state, positions |
 | `SituationPort` | reading and writing ongoing processes |
 | `StateStorePort` | facts, space and situations together — what one batch may touch |
 | `HistoryReaderPort` | reads over `game_events` |
@@ -196,7 +200,11 @@ See [world-state.md](world-state.md).
 `SessionClockPort` is deliberately outside that composite. A turn *reads* the clock and
 never moves it, so `advance_time` gets a port that reaches the clock, the scheduled
 events and the audit trail, and cannot touch the transcript or the relationships. The
-same adapter satisfies it, since both use cases run in one request's transaction.
+same adapter satisfies it, since both use cases run in one request's transaction. It
+carries the seam between reaching an event and executing it: `advance_time` marks what
+the clock passed `due` and stops, and `complete_scheduled_event` is a separate call the
+system that owns the work makes afterwards, in the same transaction as whatever the work
+changed. See [DUE is not PROCESSED](world-state-time.md#due-is-not-processed).
 
 Limits (`RECENT_MESSAGE_LIMIT`, `MEMORY_LIMIT`, `CHARACTER_LIMIT`) stay in the
 application: how much history is worth sending is policy, not storage. Ordering is
@@ -274,6 +282,16 @@ silently papered over.
   `ON DELETE SET NULL`, because losing a container must not delete what was inside it;
   the acyclicity no database can enforce lives in `world_locations.hierarchy`. See
   [world-state-locations.md](world-state-locations.md).
+- **`character_positions`** is the canonical answer to where an actor is: one row per
+  `(session_id, actor_kind, actor_id)`, enforced by a unique constraint, holding one of
+  four shapes — at a location, in transit, offstage, or unlocated. It is deliberately on
+  the actor's side of the relationship: `location_states` keeps no occupant list, because
+  two places could then both claim the same person and nothing would say which is right.
+  Location and connection ids are foreign keys validated against geography the session can
+  actually see, so a position cannot name somewhere that does not exist for it.
+  `game_sessions.current_location` survives as a free-text presentation field and seeds the
+  first position once at session creation; nothing reads it as authority afterwards. See
+  [world-state.md](world-state.md#where-the-player-is).
 - **`resolutions`** is one row per verdict: the disposition, the resolver and its version,
   the revision before and after, and the idempotency key. `(session_id, idempotency_key)`
   is **unique in the database**, not checked in Python — two concurrent retries of one

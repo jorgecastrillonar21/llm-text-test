@@ -25,17 +25,20 @@ prompt that a model will then be held to.
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from pydantic import BaseModel, ConfigDict
 
 from app.application.persistence import SpatialReaderPort
+from app.application.position_service import player_position
 from app.application.spatial_service import SpatialGraph, load_spatial_graph
 from app.application.story_context import (
     ConnectedPlaceContext,
     PlaceContext,
     SpatialContext,
 )
+from app.domain.character_position import scene_location_id
 from app.domain.errors import NotFoundError
 from app.domain.world_locations import (
     LocationConnection,
@@ -44,6 +47,8 @@ from app.domain.world_locations import (
     get_ancestors,
     get_children,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_ADJACENT = 8
 """How many exits reach the prompt. A crossroads has four; a city square with eight
@@ -54,39 +59,6 @@ MAX_ZONES = 6
 MAX_ANCESTORS = 4
 """Enough for `World > Region > City > District`. Beyond that the outer containers stop
 shaping a scene and start being trivia."""
-
-
-def resolve_scene_location(graph: SpatialGraph, current_location: str) -> LocationDefinition | None:
-    """Match a session's free-text location to a place in the graph, or give up.
-
-    # This is a bridge, and it is meant to be removed
-
-    There is no canonical position in this system yet. `GameSession.current_location`
-    is a string the player typed when the session began, and `CharacterState` --
-    which will own where anyone actually is -- does not exist. Until it does, this is
-    the only way the scene knows which place it is in.
-
-    Matching is exact, case-insensitive, whitespace-trimmed, and **refuses ambiguity**:
-    two locations named "Market Street" resolve to nothing rather than to whichever the
-    query returned first. No fuzzy matching, no substring search, no "closest name" --
-    those turn a missing match into a *wrong* one, and a wrong match hands the director
-    the exits of somewhere else entirely.
-
-    Names are not identity anywhere else in this system, and they are not identity
-    here either: nothing is stored from this, nothing is written by it, and a failed
-    match costs the prompt one optional section. When `CharacterPosition` arrives it
-    supplies a real id and this function is deleted.
-    """
-    wanted = current_location.strip().casefold()
-    if not wanted:
-        return None
-
-    matches = [
-        definition for definition in graph.index if definition.name.strip().casefold() == wanted
-    ]
-    if len(matches) != 1:
-        return None
-    return matches[0]
 
 
 class ScenePlacement(BaseModel):
@@ -105,39 +77,51 @@ class ScenePlacement(BaseModel):
 
 
 async def resolve_scene(
-    reader: SpatialReaderPort,
-    *,
-    session_id: uuid.UUID,
-    world_id: uuid.UUID,
-    current_location: str,
+    reader: SpatialReaderPort, *, session_id: uuid.UUID, world_id: uuid.UUID
 ) -> ScenePlacement:
     """Load the session's geography and work out which place the scene is in.
 
-    `current` is None when the world has no geography or the session's location string
-    matches nothing -- which is most sessions today. The graph is still returned: a
-    caller may have use for it even when the scene is nowhere in particular.
+    The place comes from the player's canonical position -- by id, through
+    `position_service` -- and nothing here matches a name against anything. That is the
+    correction: a name match could resolve to the wrong room and hand a director its
+    exits as canon, whereas an id either names a place this session can see or does not.
+
+    `current` is None when the world has no geography, when nobody has written a
+    position, or when the player is `in_transit` or `offstage` -- see
+    `scene_location_id`, which returns None for those on purpose. The graph is still
+    returned: a caller may have use for it even when the scene is nowhere in particular.
+
+    A position pointing at a place this session cannot see is *reported*, not silently
+    dropped. Writes go through `position_service.set_position`, which validates every
+    id, so reaching this branch means something bypassed it.
     """
     graph = await load_spatial_graph(reader, session_id=session_id, world_id=world_id)
-    return ScenePlacement(graph=graph, current=resolve_scene_location(graph, current_location))
+    location_id = scene_location_id(await player_position(reader, session_id=session_id))
+    if location_id is None:
+        return ScenePlacement(graph=graph, current=None)
+
+    current = graph.index.get(location_id)
+    if current is None:
+        logger.warning(
+            "Session %s has a canonical position at location %s, which is not in its "
+            "visible geography. Building the scene without a place.",
+            session_id,
+            location_id,
+        )
+    return ScenePlacement(graph=graph, current=current)
 
 
 async def build_scene_spatial_context(
-    reader: SpatialReaderPort,
-    *,
-    session_id: uuid.UUID,
-    world_id: uuid.UUID,
-    current_location: str,
+    reader: SpatialReaderPort, *, session_id: uuid.UUID, world_id: uuid.UUID
 ) -> SpatialContext | None:
     """The spatial block for a turn, or None when the scene has no known place.
 
-    None rather than an empty context: a world with no geography, or a session whose
-    location string matches nothing, should produce *no* spatial section rather than an
-    empty one. An empty heading tells a model the game tracks places and has none,
-    which reads worse than silence.
+    None rather than an empty context: a world with no geography, or a player nobody has
+    placed, should produce *no* spatial section rather than an empty one. An empty
+    heading tells a model the game tracks places and has none, which reads worse than
+    silence.
     """
-    placement = await resolve_scene(
-        reader, session_id=session_id, world_id=world_id, current_location=current_location
-    )
+    placement = await resolve_scene(reader, session_id=session_id, world_id=world_id)
     return await assemble_scene_context(reader, placement)
 
 

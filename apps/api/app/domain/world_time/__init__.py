@@ -38,6 +38,7 @@ from app.domain.world_time.calendar import (
 from app.domain.world_time.clock import DurationMinutes, ElapsedMinutes, TimeState
 from app.domain.world_time.scheduling import (
     TERMINAL_STATUSES,
+    UNRESOLVED_STATUSES,
     ScheduledEventStatus,
     require_transition,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "DEFAULT_INITIAL_DATETIME",
     "STANDARD_CALENDAR",
     "TERMINAL_STATUSES",
+    "UNRESOLVED_STATUSES",
     "Calendar",
     "CalendarMonth",
     "DurationMinutes",

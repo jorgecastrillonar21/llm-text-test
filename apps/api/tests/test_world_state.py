@@ -217,12 +217,12 @@ async def test_setting_an_existing_fact_replaces_it_in_place_and_restamps_when(
     store = SqlAlchemyTurnGateway(db_session)
     batch = StateMutationBatch(
         authority=FactAuthority.ENGINE,
-        mutations=[SetFact(subject=subject, property="system.location", value="the tavern")],
+        mutations=[SetFact(subject=subject, property="system.hp", value=12)],
     )
     await apply_state_change(
         store, session_id=session.id, batch=batch, cause=cause_from_resolution()
     )
-    first = await store.get_fact(session.id, subject, "system.location")
+    first = await store.get_fact(session.id, subject, "system.hp")
     assert first is not None
     assert first.current_value_since == 0
 
@@ -237,15 +237,15 @@ async def test_setting_an_existing_fact_replaces_it_in_place_and_restamps_when(
         session_id=session.id,
         batch=StateMutationBatch(
             authority=FactAuthority.ENGINE,
-            mutations=[SetFact(subject=subject, property="system.location", value="the docks")],
+            mutations=[SetFact(subject=subject, property="system.hp", value=8)],
         ),
         cause=cause_from_resolution(),
     )
 
-    second = await store.get_fact(session.id, subject, "system.location")
+    second = await store.get_fact(session.id, subject, "system.hp")
     assert second is not None
     assert second.id == first.id, "the fact's identity is subject+property, not its value"
-    assert second.value == "the docks"
+    assert second.value == 8
     assert second.current_value_since == 480
     assert second.created_at == first.created_at
     assert len(await _fact_rows(db_session, session.id)) == 1

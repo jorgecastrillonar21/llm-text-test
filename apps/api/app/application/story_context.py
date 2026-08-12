@@ -64,7 +64,17 @@ class SessionContext(BaseModel):
 
     id: uuid.UUID
     title: str
+
     current_location: str
+    """The name of the place the player is canonically at, or empty.
+
+    Derived from `CharacterPosition`, never from `GameSession.current_location` -- the
+    string a player typed at session creation is legacy presentation and is deliberately
+    not what a prompt is built from. Empty when the position is `in_transit`,
+    `offstage`, `unlocated`, or points somewhere this session cannot see; the templates
+    degrade to the world's setting rather than asserting a place that is not canon.
+    """
+
     summary: str
     turn_index: int
 

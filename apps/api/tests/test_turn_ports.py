@@ -21,6 +21,7 @@ from app.application.contracts import (
     WorldEvent,
 )
 from app.application.persistence import (
+    ActorPosition,
     CharacterRecord,
     MemoryRecord,
     NewEvent,
@@ -39,6 +40,7 @@ from app.application.persistence import (
 )
 from app.application.story_context import StoryContext
 from app.application.turn_service import execute_turn
+from app.domain.character_position import ActorKind
 from app.domain.enums import Language, MemoryKind
 from app.domain.errors import NotFoundError, ValidationError
 from app.domain.relationships import RelationshipVector
@@ -243,6 +245,22 @@ class FakeTurnGateway:
         self, session_id: uuid.UUID, connection_id: uuid.UUID
     ) -> LocationConnectionState | None:
         return None
+
+    # -- position reads ---------------------------------------------------------
+    #
+    # Nobody has written one, which the application reads as `Unlocated`. `None` rather
+    # than a fabricated `Unlocated` on purpose: an adapter that invented one would make
+    # "unwritten" and "deliberately unknown" the same answer.
+
+    async def get_character_position(
+        self, session_id: uuid.UUID, *, actor_kind: ActorKind, actor_id: uuid.UUID
+    ) -> ActorPosition | None:
+        return None
+
+    async def load_character_positions(
+        self, session_id: uuid.UUID, *, location_id: uuid.UUID | None = None, limit: int
+    ) -> list[ActorPosition]:
+        return []
 
     # -- situation reads --------------------------------------------------------
     #

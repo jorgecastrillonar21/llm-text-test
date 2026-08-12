@@ -87,18 +87,13 @@ async def build_story_context(
     facts = await reader.load_facts(session.id, limit=FACT_LIMIT)
     history = await _load_history(reader, session=session)
 
-    # Resolved once and used twice: the spatial block walks the graph, and situation
+    # Resolved once and used three times: the spatial block walks the graph, situation
     # relevance needs the current place and its containers to know what is happening
-    # *here*. See `spatial_context.resolve_scene_location` for why a location string is
-    # the input, and why that is temporary.
-    placement = await resolve_scene(
-        reader,
-        session_id=session.id,
-        world_id=world.id,
-        current_location=session.current_location,
-    )
-    # None when the world has no geography, or when the session's location string
-    # matches nothing in it -- which is most sessions today.
+    # *here*, and the session block takes its location name from the same answer. The
+    # place comes from the player's canonical position, by id.
+    placement = await resolve_scene(reader, session_id=session.id, world_id=world.id)
+    # None when the world has no geography, when nobody has written a position, or when
+    # the player is in transit or offstage.
     space = await assemble_scene_context(reader, placement)
 
     # None when nothing relevant is under way, which is also most turns.
@@ -120,7 +115,10 @@ async def build_story_context(
         session=SessionContext(
             id=session.id,
             title=session.title,
-            current_location=session.current_location,
+            # The canonical place's name, not the string on the session. A prompt that
+            # said "The Broken Crown" because somebody typed it, while the position said
+            # otherwise, would be the two-authorities bug wearing a nicer label.
+            current_location="" if placement.current is None else placement.current.name,
             summary=session.summary,
             turn_index=session.turn_index,
         ),

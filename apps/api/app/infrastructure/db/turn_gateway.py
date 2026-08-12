@@ -16,11 +16,12 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import ColumnElement, Select, func, or_, select, update
+from sqlalchemy import ColumnElement, Select, func, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 
 from app.application.persistence import (
+    ActorPosition,
     CharacterRecord,
     ConnectionStateWrite,
     LocationStateWrite,
@@ -43,6 +44,13 @@ from app.application.persistence import (
     StoredMessage,
     TranscriptMessage,
     WorldSnapshot,
+)
+from app.domain.character_position import (
+    ActorKind,
+    AtLocation,
+    InTransit,
+    PositionKind,
+    read_position,
 )
 from app.domain.errors import NotFoundError
 from app.domain.relationships import RelationshipVector
@@ -72,7 +80,11 @@ from app.domain.world_situations import (
     SituationStatus,
     StartSituation,
 )
-from app.domain.world_time import FictionalDateTime, ScheduledEventStatus
+from app.domain.world_time import (
+    UNRESOLVED_STATUSES,
+    FictionalDateTime,
+    ScheduledEventStatus,
+)
 from app.infrastructure.db import models
 
 
@@ -203,6 +215,31 @@ def _to_connection_state(row: models.LocationConnectionState) -> LocationConnect
     )
 
 
+def _to_actor_position(row: models.CharacterPositionRow) -> ActorPosition:
+    """A flat row, parsed back into one of the four position shapes.
+
+    Through `read_position` rather than by reading columns directly, because that is
+    where a row that cannot be a position fails. The check constraints on the table say
+    the same thing in SQL, and both exist: the constraints stop a bad row being written
+    here, `read_position` stops one written by hand or by an older build being believed.
+    """
+    return ActorPosition(
+        session_id=row.session_id,
+        actor_kind=row.actor_kind,
+        actor_id=row.actor_id,
+        position=read_position(
+            kind=row.kind,
+            location_id=row.location_id,
+            zone_id=row.zone_id,
+            origin_location_id=row.origin_location_id,
+            destination_location_id=row.destination_location_id,
+            connection_id=row.connection_id,
+            departed_at=row.departed_at,
+            expected_arrival_at=row.expected_arrival_at,
+        ),
+    )
+
+
 def _visible_to(
     session_id: uuid.UUID | None, column: InstrumentedAttribute[uuid.UUID | None]
 ) -> ColumnElement[bool]:
@@ -220,6 +257,31 @@ def _visible_to(
     if session_id is None:
         return column.is_(None)
     return or_(column.is_(None), column == session_id)
+
+
+def _in_session_world(
+    session_id: uuid.UUID | None, column: InstrumentedAttribute[uuid.UUID]
+) -> ColumnElement[bool]:
+    """The other half of visibility, for the reads that fetch one row by its id.
+
+    `load_locations` and `load_connections` are given a world explicitly. The singular
+    getters are given only an id, and an id is enough to reach *another world's*
+    template geography: shared rows are visible to every session of their own world,
+    and `origin_session_id IS NULL` does not say which world that is. Without this, a
+    uuid from another world resolves here and every caller that asked "can this session
+    see this place?" -- a position being written, a fact naming a location -- is told
+    yes.
+
+    `None` means a template-only read with no session to take a world from, and keeps
+    the older behaviour rather than inventing a world to filter on.
+    """
+    if session_id is None:
+        return true()
+    return column == (
+        select(models.GameSession.world_id)
+        .where(models.GameSession.id == session_id)
+        .scalar_subquery()
+    )
 
 
 def _to_situation(row: models.Situation) -> Situation:
@@ -660,7 +722,11 @@ class SqlAlchemyTurnGateway:
                 select(models.ScheduledEvent)
                 .where(
                     models.ScheduledEvent.session_id == session_id,
-                    models.ScheduledEvent.status == ScheduledEventStatus.PENDING,
+                    # PENDING *and* DUE: work the clock reached on an earlier advance and
+                    # nobody has executed yet is still owed, and must keep coming back.
+                    models.ScheduledEvent.status.in_(
+                        [status.value for status in UNRESOLVED_STATUSES]
+                    ),
                     models.ScheduledEvent.due_at <= through,
                 )
                 # Chronological, then by insertion, so two events due in the same
@@ -818,6 +884,7 @@ class SqlAlchemyTurnGateway:
                 select(models.LocationDefinition).where(
                     models.LocationDefinition.id == location_id,
                     _visible_to(session_id, models.LocationDefinition.origin_session_id),
+                    _in_session_world(session_id, models.LocationDefinition.world_id),
                 )
             )
         ).scalar_one_or_none()
@@ -850,6 +917,7 @@ class SqlAlchemyTurnGateway:
                 select(models.LocationConnection).where(
                     models.LocationConnection.id == connection_id,
                     _visible_to(session_id, models.LocationConnection.origin_session_id),
+                    _in_session_world(session_id, models.LocationConnection.world_id),
                 )
             )
         ).scalar_one_or_none()
@@ -979,6 +1047,90 @@ class SqlAlchemyTurnGateway:
         row.condition = state.condition
         row.accessibility = state.accessibility
         row.traversal_modifier = state.traversal_modifier
+        await self._db.flush()
+        return row.id
+
+    # -- CharacterPositionPort --------------------------------------------------
+
+    async def _find_position(
+        self, session_id: uuid.UUID, actor_kind: ActorKind, actor_id: uuid.UUID
+    ) -> models.CharacterPositionRow | None:
+        return (
+            await self._db.execute(
+                select(models.CharacterPositionRow).where(
+                    models.CharacterPositionRow.session_id == session_id,
+                    models.CharacterPositionRow.actor_kind == actor_kind,
+                    models.CharacterPositionRow.actor_id == actor_id,
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def get_character_position(
+        self, session_id: uuid.UUID, *, actor_kind: ActorKind, actor_id: uuid.UUID
+    ) -> ActorPosition | None:
+        row = await self._find_position(session_id, actor_kind, actor_id)
+        return None if row is None else _to_actor_position(row)
+
+    async def load_character_positions(
+        self, session_id: uuid.UUID, *, location_id: uuid.UUID | None = None, limit: int
+    ) -> list[ActorPosition]:
+        criteria: list[ColumnElement[bool]] = [models.CharacterPositionRow.session_id == session_id]
+        if location_id is not None:
+            # `kind` as well as the column, because `location_id` alone would be enough
+            # today and would stop being enough the moment a future shape borrows the
+            # column. "Who is here" means `at_location` and only that.
+            criteria.append(models.CharacterPositionRow.kind == PositionKind.AT_LOCATION)
+            criteria.append(models.CharacterPositionRow.location_id == location_id)
+        rows = (
+            await self._db.execute(
+                select(models.CharacterPositionRow)
+                .where(*criteria)
+                # The player first, then characters by id: a total order, so two reads
+                # of one session agree and a truncating caller keeps the actor the
+                # scene is actually about.
+                .order_by(
+                    models.CharacterPositionRow.actor_kind.asc(),
+                    models.CharacterPositionRow.actor_id.asc(),
+                )
+                .limit(limit)
+            )
+        ).scalars()
+        return [_to_actor_position(row) for row in rows]
+
+    async def set_character_position(self, position: ActorPosition) -> uuid.UUID:
+        row = await self._find_position(position.session_id, position.actor_kind, position.actor_id)
+        if row is None:
+            row = models.CharacterPositionRow(
+                session_id=position.session_id,
+                actor_kind=position.actor_kind,
+                actor_id=position.actor_id,
+            )
+            self._db.add(row)
+        # Every column of the union is cleared and then only this shape's are written.
+        # A position is replaced whole -- see `ActorPosition` -- and a stale
+        # `origin_location_id` left behind after a transit ended would be a row that
+        # violates its own check constraint and a journey that outlived itself.
+        shape = position.position
+        row.kind = shape.kind
+        row.location_id = None
+        row.zone_id = None
+        row.origin_location_id = None
+        row.destination_location_id = None
+        row.connection_id = None
+        row.departed_at = None
+        row.expected_arrival_at = None
+        match shape:
+            case AtLocation():
+                row.location_id = shape.location_id
+                row.zone_id = shape.zone_id
+            case InTransit():
+                row.origin_location_id = shape.origin_location_id
+                row.destination_location_id = shape.destination_location_id
+                row.connection_id = shape.connection_id
+                row.departed_at = shape.departed_at
+                row.expected_arrival_at = shape.expected_arrival_at
+            case _:
+                pass  # Offstage and Unlocated have nothing to write.
         await self._db.flush()
         return row.id
 

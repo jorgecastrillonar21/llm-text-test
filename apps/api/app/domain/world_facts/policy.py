@@ -84,9 +84,6 @@ KNOWN_PROPERTIES: dict[str, PropertyDefinition] = {
     SYSTEM_ALIVE: PropertyDefinition(
         policy=FactPolicy.SYSTEM, summary="Whether the subject is objectively alive."
     ),
-    "system.location": PropertyDefinition(
-        policy=FactPolicy.SYSTEM, summary="Where the subject objectively is."
-    ),
     "system.hp": PropertyDefinition(
         policy=FactPolicy.SYSTEM, summary="Reserved for a future health system."
     ),
@@ -127,6 +124,10 @@ KNOWN_PROPERTIES: dict[str, PropertyDefinition] = {
     # -- owned by a dedicated model. Registered so the obvious spellings are a named
     #    refusal that says where the real answer lives, rather than landing in SYSTEM
     #    and being writable by an engine that should be updating the other table.
+    "system.location": PropertyDefinition(
+        policy=FactPolicy.DEDICATED,
+        summary="CharacterPosition owns this. See app.domain.character_position.",
+    ),
     "system.location_condition": PropertyDefinition(
         policy=FactPolicy.DEDICATED, summary="LocationState.condition owns this."
     ),

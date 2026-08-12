@@ -380,10 +380,7 @@ async def _validate(
             continue
 
         if isinstance(mutation, StartSituation):
-            # Nothing to pre-check: `start_situation` validates the parent, the
-            # location and the participants at the moment it writes, and it has to --
-            # a batch may start a war and then a siege inside it, and the parent does
-            # not exist until the first one lands.
+            await _validate_situation_start(store, session_id=session_id, mutation=mutation)
             checked.append((mutation, None))
             continue
 
@@ -392,7 +389,12 @@ async def _validate(
             checked.append((mutation, None))
             continue
 
-        _require_resolvable_subject(mutation.subject, known_character_ids)
+        await _require_resolvable_subject(
+            store,
+            session_id=session_id,
+            subject=mutation.subject,
+            known_character_ids=known_character_ids,
+        )
         require_permitted(
             batch.authority,
             resolve_policy(mutation.property),
@@ -436,6 +438,37 @@ async def _validate_spatial(
         return
     if await store.get_connection(session_id, mutation.connection_id) is None:
         raise NotFoundError("LocationConnection", mutation.connection_id)
+
+
+async def _validate_situation_start(
+    store: StateStorePort,
+    *,
+    session_id: uuid.UUID,
+    mutation: StartSituation,
+) -> None:
+    """A nested situation hangs off a parent that already existed before this batch.
+
+    `StartSituation` carries no id -- the id is minted at write time, deliberately, so
+    that nothing outside this module chooses situation identity. The consequence was
+    documented backwards for a while: a batch cannot start a war and then start a siege
+    *inside* it, because there is no way to write down "the war two mutations ago". The
+    id does not exist until the row does, and a batch has no vocabulary for referring to
+    one of its own results.
+
+    So the V1 contract is the one the data model can actually express. A batch that
+    wants a tree writes the root, commits, and starts the children against the id it
+    got back. A local-reference mechanism would be a mutation scripting language, and
+    no use case has asked for one.
+
+    Checked here rather than only inside `start_situation` so a batch naming a parent
+    that is not there is refused before anything is written, like every other mutation.
+    `start_situation` still re-checks at write time -- it is reachable directly, by
+    session materialisation, and its check covers cycles this one cannot produce.
+    """
+    if mutation.parent_situation_id is None:
+        return
+    if await store.get_situation(session_id, mutation.parent_situation_id) is None:
+        raise NotFoundError("Situation", mutation.parent_situation_id)
 
 
 async def _validate_situation_change(
@@ -611,19 +644,56 @@ async def _apply_connection_update(
     )
 
 
-def _require_resolvable_subject(subject: FactSubject, known_character_ids: set[uuid.UUID]) -> None:
-    """A fact must be about something that exists.
+async def _require_resolvable_subject(
+    store: StateStorePort,
+    *,
+    session_id: uuid.UUID,
+    subject: FactSubject,
+    known_character_ids: set[uuid.UUID],
+) -> None:
+    """A fact must be about something that exists, and that this session can see.
 
-    Characters are the only entity this application can currently resolve, so they are
-    the only ones checked. Locations are checked separately by the proposal reviewer,
-    which has the session in hand; factions have no table yet and their ids are
-    accepted on trust. That is recorded here rather than silently tolerated, because an
-    unverifiable id is a fact that may be about nothing.
+    Every door into a state change comes through here. The proposal reviewer checks
+    location subjects too, and keeps doing so -- it can reject one claim and let the
+    turn continue, which is worth more than a refusal -- but it only guards the Story
+    Director. Resolution, ADMIN, ENGINE and the dev router reach `stage_state_change`
+    without passing it, and until now every one of those could write a fact about a
+    location id that named nothing.
+
+    Locations are read session-scoped, the same way `_validate_spatial` reads them:
+    another session's generated geography is not "somewhere I may not write about", it
+    is invisible, and "not visible" and "not there" have to be the same answer.
+
+    FACTION and OTHER have no owning domain yet. Rather than accept a UUID that nothing
+    can check while claiming every fact refers to something real, V1 refuses them at
+    this boundary. `FactSubjectType` keeps the members -- they are the vocabulary
+    Factions will need -- and the refusal is deleted when the table that resolves them
+    exists. No caller writes one today.
     """
-    if subject.type is not FactSubjectType.CHARACTER:
+    if subject.type is FactSubjectType.WORLD:
+        # The session's own world, and the subject model refuses to carry an id for it,
+        # so there is nothing here that could dangle.
         return
-    if subject.id not in known_character_ids:
-        raise NotFoundError("Character", subject.id)
+
+    if subject.type is FactSubjectType.CHARACTER:
+        if subject.id not in known_character_ids:
+            raise NotFoundError("Character", subject.id)
+        return
+
+    if subject.type is FactSubjectType.LOCATION:
+        # `subject.id` cannot be None here -- the subject model requires one for every
+        # type but WORLD -- but it is narrowed rather than asserted, so the type checker
+        # is satisfied without a runtime claim that could only ever be redundant.
+        location_id = subject.id
+        if location_id is None or await store.get_location(session_id, location_id) is None:
+            raise NotFoundError("Location", location_id)
+        return
+
+    raise ValidationError(
+        f"A {subject.type.value!r} fact subject cannot be verified: nothing in this "
+        "system resolves one yet, and a fact about an id that names nothing is worse "
+        "than no fact. Use a world fact until the owning domain exists."
+    )
 
 
 def _require_not_owned_elsewhere(subject: FactSubject, canonical_property: str) -> None:

@@ -40,7 +40,12 @@ from app.application.persistence import ScheduledEventRecord
 from app.application.resolution_service import ResolutionRequest, resolve
 from app.application.state_consistency import ConsistencyReport, check_state_consistency
 from app.application.state_service import StateChangeResult, apply_state_change
-from app.application.time_service import advance_time, cancel_scheduled_event, schedule_event
+from app.application.time_service import (
+    advance_time,
+    cancel_scheduled_event,
+    load_due_work,
+    schedule_event,
+)
 from app.application.world_state_service import (
     CurrentWorldSnapshot,
     SnapshotScope,
@@ -61,6 +66,10 @@ async def advance_session_time(
 
     The result reports what actually happened, which may be less than was asked for:
     a scheduled event that interrupts player action stops the advance where it is.
+
+    `due_event_ids` names the scheduled work the clock reached. It is *reached*, not run
+    -- nothing here executes a scheduled event, and the ids stay answerable through
+    `GET .../scheduled-events/due` until something does.
     """
     return await advance_time(clock, session_id=session_id, request=payload)
 
@@ -90,12 +99,36 @@ async def create_scheduled_event(
     return stored
 
 
+@router.get(
+    "/sessions/{session_id}/scheduled-events/due",
+    response_model=list[ScheduledEventRecord],
+)
+async def read_due_work(session_id: uuid.UUID, clock: SessionClock) -> list[ScheduledEventRecord]:
+    """Scheduled work the clock has reached and nobody has executed.
+
+    The dispatcher's read, exposed because no dispatcher exists yet. Advancing time no
+    longer consumes these -- it marks them due and leaves them here, which is the only
+    honest thing Time can do with a `caravan.arrives` it has no way to bring about.
+
+    A list that keeps growing is the symptom to look for: it means something is being
+    scheduled that nothing owns. Answering an entry means executing its work through
+    whatever service owns that event type and acknowledging it in the same transaction;
+    `situation.progress` does that through the progression endpoint below.
+    """
+    return await load_due_work(clock, session_id=session_id)
+
+
 @router.delete(
     "/scheduled-events/{event_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def cancel_event(event_id: uuid.UUID, clock: SessionClock) -> None:
-    """Call off a pending event. Cancelling one that already fired is a 422."""
+    """Call off an event that will not happen after all.
+
+    Works on pending and due events alike: deciding that work the clock reached is moot
+    is a legitimate verdict, and a different one from having carried it out. Cancelling
+    something already processed or already cancelled is a 422.
+    """
     await cancel_scheduled_event(clock, event_id=event_id)
 
 
@@ -185,6 +218,15 @@ async def progress_session_situation(
     this twice without moving the clock replays the first resolution rather than
     evaluating the same interval again. That is the honest behaviour: the second call is
     asking about an interval that has already been resolved.
+
+    # Answering due scheduled work
+
+    This is the owner seam for `situation.progress`. A time advance that walks past one
+    marks it DUE and stops there -- Time cannot progress a siege. Pass
+    `completes_scheduled_event_id` to act as the dispatcher: the progression runs, its
+    mutations are staged, and only then is the event marked PROCESSED, all inside one
+    transaction. Without it the progression still happens and the scheduled event stays
+    due, which is the right answer for a person poking at a situation by hand.
     """
     session = await store.get_session(session_id)
     if session is None:
@@ -201,6 +243,7 @@ async def progress_session_situation(
             # endpoint is for testing.
             source_type=ResolutionSourceType.ADMIN,
             source_id=situation_id,
+            completes_scheduled_event_id=payload.completes_scheduled_event_id,
         ),
     )
 
@@ -210,5 +253,6 @@ async def progress_session_situation(
         replayed=result.replayed,
         created_situation_ids=result.created_situation_ids,
         scheduled_event_ids=result.scheduled_event_ids,
+        completed_scheduled_event_id=result.completed_scheduled_event_id,
         narrative_context=dict(result.outcome.narrative_context) if result.outcome else {},
     )

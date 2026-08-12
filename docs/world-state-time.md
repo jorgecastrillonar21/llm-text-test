@@ -154,7 +154,7 @@ TimeAdvanceResult:
   ended_at: 29172
   interrupted: true
   interruption: { event_id: ..., event_type: fire_in_the_stables, at: 29172 }
-  processed_event_ids: [...]
+  due_event_ids: [...]              # reached, not executed — see below
 ```
 
 `advanced_minutes` may be less than requested and never more. The future duration
@@ -191,7 +191,7 @@ ScheduledEvent:
   due_at: 29400          # absolute session time, never a delay
   type: string
   payload: {}            # small, and genuinely arbitrary for now
-  status: pending | processed | cancelled
+  status: pending | due | processed | cancelled
   interrupt_player_action: false
 ```
 
@@ -202,28 +202,75 @@ immediately, so what lands in the row is `current_elapsed_minutes + 4320` rather
 Advancing time looks at what is due in the span, not at every minute of it:
 
 ```text
-current_time → target_time → pending events due by then → process in order → maybe stop
+current_time → target_time → pending events due by then → mark DUE in order → maybe stop
 ```
 
 Advancing six months costs the same as advancing six minutes. There is no per-minute
 loop and there must never be one.
 
-An event still pending but already behind the clock is processed at the current time,
+An event still pending but already behind the clock becomes due at the current time,
 never by rewinding to its `due_at`. Late is a better failure than lost.
 
 **Interruption.** If an advance is `interruptible` and a due event has
-`interrupt_player_action`, the clock stops at that event's minute; the event is still
-processed, and everything scheduled after it stays pending for the next advance. A
-non-interruptible advance — an authored "three months later" — runs straight past.
+`interrupt_player_action`, the clock stops at that event's minute; everything scheduled
+after it stays pending for the next advance. A non-interruptible advance — an authored
+"three months later" — runs straight past.
+
+### DUE is not PROCESSED
+
+The four statuses are `pending`, `due`, `processed` and `cancelled`, and the middle two
+mean different things:
+
+```text
+pending     scheduled, the clock has not reached it
+due         the clock reached it, and nobody has answered it yet
+processed   the work this event owned was actually carried out
+cancelled   it never will be
+```
+
+**Time owns chronology and nothing else.** `advance_time` marks the events it walks past
+`DUE` and returns their ids. It cannot progress a situation, land a caravan or open a
+shop, and it does not know which service could. Reaching an event and executing one used
+to be the same line of code, which meant every advance quietly recorded work as finished
+that no code had done — and removed it from the pending query, so nobody could find it
+afterwards.
+
+The seam is:
+
+```text
+advance toward target
+      ↓
+return the due work, stopping at an interrupting event
+      ↓
+the owning dispatcher executes it        ← not Time's, and not Time's business
+      ↓
+complete_scheduled_event                 ← only now is it PROCESSED
+      ↓
+advance again
+```
+
+`load_due_work` is the dispatcher's read: what the clock has reached and nobody has
+answered. `complete_scheduled_event` is refused unless the event is `DUE` — a pending
+event has not been reached, and a processed one has already been done, which is what
+stops a retried dispatch executing the same fictional moment twice. It is called
+*after* the work, in the same transaction as whatever the work changed; acknowledging
+first and executing afterwards is exactly how the previous design managed to mark
+processed what a crash then made sure never happened.
+
+An interrupting event that nobody answers stops the clock at its minute every time, for
+as long as it is owed. That is not a deadlock to design around — it is the honest
+answer: the world cannot get past something that is supposed to happen and has not.
+`cancel_scheduled_event` is how to say it never will.
+
+Terminal is terminal. `processed` and `cancelled` never return to `pending` or `due`,
+and `require_transition` enforces it in the domain. There are no retries, queues,
+workers or cron: this is fictional scheduling, not infrastructure scheduling.
 
 **Nothing in the game schedules anything yet.** No shop closes, no caravan arrives, no
-rent falls due. Those are domain features and they are deliberately not built; what
-exists is the generic infrastructure they will use, plus dev endpoints and tests that
+rent falls due, and there is no World Simulation Scheduler dispatching due work. Those
+are domain features and they are deliberately not built; what exists is the generic
+infrastructure and the seam they will consume, plus dev endpoints and tests that
 exercise it.
-
-Statuses are `pending`, `processed`, `cancelled`, and a resolved event never returns to
-pending. There are no retries, queues, workers or cron: this is fictional scheduling,
-not infrastructure scheduling.
 
 ## Time is global to a session
 
@@ -321,13 +368,22 @@ unrecognised value switches them off rather than on.
 ```text
 POST   /api/v1/dev/sessions/{id}/advance-time
 POST   /api/v1/dev/sessions/{id}/scheduled-events
+GET    /api/v1/dev/sessions/{id}/scheduled-events/due
 DELETE /api/v1/dev/scheduled-events/{id}
 ```
 
-They are not a back door. Both go through the same application service any future
+They are not a back door. All of them go through the same application service any future
 caller will use: a paused world still refuses, the never-backward rule still holds,
-scheduled events still resolve, and the advance is still audited. The only privilege
+scheduled events still become due, and the advance is still audited. The only privilege
 is the `debug` reason, which every world accepts.
+
+The `due` read is the dispatcher's read, exposed because no dispatcher exists yet. A due
+list that keeps growing is the symptom to look for: it means something is being scheduled
+that nothing owns. `situation.progress` is the one type with an owner today, and it is
+answered through `POST /api/v1/dev/sessions/{id}/situations/{sid}/progress`, which
+executes the progression and acknowledges the event in the same transaction. `DELETE`
+works on pending and due events alike — deciding that work the clock reached is moot is a
+legitimate verdict, and a different one from having carried it out.
 
 ## What the Story Director sees
 
@@ -352,9 +408,10 @@ and hour are the strings the backend derived.
 ## Explicitly not built
 
 The complete `WorldState`; a fantasy-calendar engine or editor; weather; travel;
-combat duration; NPC schedules or autonomy; quest deadlines beyond generic scheduling;
-buffs, debuffs, poison or sleep mechanics; the seeded game RNG; real-time
-synchronisation; background simulation while the application is closed.
+combat duration; NPC schedules or autonomy; the World Simulation Scheduler that will
+dispatch due work; quest deadlines beyond generic scheduling; buffs, debuffs, poison or
+sleep mechanics; the seeded game RNG; real-time synchronisation; background simulation
+while the application is closed.
 
 Each has an extension point rather than an implementation, and the difference is
 deliberate.

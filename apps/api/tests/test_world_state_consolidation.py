@@ -27,6 +27,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.context_builder import FACT_LIMIT, build_story_context
+from app.application.position_service import materialize_initial_position
 from app.application.situation_service import materialize_initial_situations
 from app.application.spatial_service import materialize_initial_spatial_state
 from app.application.state_consistency import (
@@ -124,10 +125,10 @@ async def _initialise(
 ) -> models.GameSession:
     """A session, seeded exactly the way `POST /sessions` seeds one.
 
-    Facts, then geography, then situations, in that order and in one transaction --
-    the same three calls `api.v1.sessions.create_session` makes. Duplicated here on
-    purpose: a test that seeded a session some other way would prove things about a
-    world no player can ever start.
+    Facts, then geography, then situations, then the player's position, in that order
+    and in one transaction -- the same four calls `api.v1.sessions.create_session`
+    makes. Duplicated here on purpose: a test that seeded a session some other way would
+    prove things about a world no player can ever start.
     """
     data: dict[str, object] = {"world_id": world.id, "title": "Run", "player_name": "Rin"}
     data.update(overrides)
@@ -138,6 +139,7 @@ async def _initialise(
     await materialize_initial_facts(store, session_id=session.id)
     await materialize_initial_spatial_state(store, session_id=session.id)
     await materialize_initial_situations(store, session_id=session.id)
+    await materialize_initial_position(store, session_id=session.id)
     return session
 
 

@@ -35,6 +35,7 @@ from typing import Any
 
 from app.application.persistence import (
     NewScheduledEvent,
+    ScheduledEventRecord,
     SessionClockPort,
 )
 from app.domain.errors import NotFoundError, ValidationError
@@ -59,6 +60,11 @@ audit row wearing history's clothes, and it made a session's history mostly the 
 narrating its own bookkeeping. See docs/event-resolution.md.
 """
 
+MAX_DUE_WORK = 100
+"""Cap on one read of the due backlog. A dispatcher works through what it is handed and
+asks again; an unbounded read of a schedule nobody has been servicing is a way to turn a
+neglected session into a slow query."""
+
 
 async def stage_time_advance(
     clock: SessionClockPort,
@@ -74,6 +80,32 @@ async def stage_time_advance(
 
     For callers whose unit of work is larger than this -- a resolution, which also
     writes its own record, its events and its mutations, and commits once at the end.
+
+    # What this does to the events it walks past
+
+    It marks them DUE and hands back their ids. That is the whole of it. Time owns
+    chronology and nothing else: it cannot progress a Situation, land a caravan or open
+    a shop, and it does not know which service could. Reaching a scheduled event and
+    executing one used to be the same line of code, which meant every advance quietly
+    recorded work as finished that no code had done, and removed it from the pending
+    query so nobody could find it afterwards.
+
+    The seam is now:
+
+        advance toward target
+              |
+        return the due work, and stop at an interrupting event
+              |
+        the owning dispatcher executes it        <- not here, and not Time's business
+              |
+        `complete_scheduled_event`               <- only now is it PROCESSED
+              |
+        advance again
+
+    An interrupting event that nobody answers stops the clock at its minute every time,
+    for as long as it is owed. That is not a deadlock to design around, it is the
+    honest answer: the world cannot get past something that is supposed to happen and
+    has not. `cancel_scheduled_event` is the way to say it never will.
     """
     session = await clock.get_session(session_id)
     if session is None:
@@ -91,23 +123,29 @@ async def stage_time_advance(
 
     due = await clock.load_due_scheduled_events(session_id, through=target.elapsed_minutes)
 
-    processed: list[uuid.UUID] = []
+    surfaced: list[uuid.UUID] = []
     interruption: Interruption | None = None
     ended_at = target.elapsed_minutes
 
     for event in due:
-        # An event whose minute is already behind the clock resolves *now*, not by
+        # An event whose minute is already behind the clock comes due *now*, not by
         # rewinding to when it was meant to happen. Time never runs backward, so a
         # schedule written into the past is late rather than lost.
         at = max(started_at, event.due_at)
 
-        require_transition(event.status, ScheduledEventStatus.PROCESSED)
-        await clock.set_scheduled_event_status(event.id, ScheduledEventStatus.PROCESSED)
-        processed.append(event.id)
+        if event.status is ScheduledEventStatus.PENDING:
+            require_transition(event.status, ScheduledEventStatus.DUE)
+            await clock.set_scheduled_event_status(event.id, ScheduledEventStatus.DUE)
+        # Already DUE from an earlier advance that nobody has answered yet. Surfaced
+        # again rather than skipped: owed work does not stop being owed because the
+        # clock has already walked past it once.
+        surfaced.append(event.id)
 
         if request.interruptible and event.interrupt_player_action:
-            # The event itself still happened -- it is what cut the advance short.
-            # Everything scheduled after it stays pending for the next advance.
+            # Stop at the instant, and leave everything scheduled after it untouched --
+            # its minute has not arrived. The event that stopped us is DUE, not done:
+            # the caller now knows what is waiting there, and an owner has to deal with
+            # it before the clock will get past this point.
             interruption = Interruption(event_id=event.id, event_type=event.type, at=at)
             ended_at = at
             break
@@ -119,7 +157,7 @@ async def stage_time_advance(
         ended_at=ended_at,
         interrupted=interruption is not None,
         interruption=interruption,
-        processed_event_ids=processed,
+        due_event_ids=surfaced,
     )
 
     if result.advanced_minutes:
@@ -187,11 +225,65 @@ async def schedule_event(
     return event_id
 
 
-async def cancel_scheduled_event(clock: SessionClockPort, *, event_id: uuid.UUID) -> None:
-    """Call off something that has not happened yet.
+async def load_due_work(
+    clock: SessionClockPort, *, session_id: uuid.UUID, limit: int = MAX_DUE_WORK
+) -> list[ScheduledEventRecord]:
+    """Scheduled events the clock has reached and nobody has answered.
 
-    Cancelling an event that already fired is refused rather than ignored: the
-    fictional moment it describes is part of the story now.
+    The dispatcher's read. Whatever eventually owns `situation.progress`, `caravan.arrives`
+    or a shop closing asks this what is owed, executes the ones it recognises, and
+    acknowledges each through `complete_scheduled_event`. Until then they stay here --
+    that is the point of the DUE status, and the reason an unhandled event is a visible
+    backlog rather than a silently completed row.
+    """
+    return await clock.load_scheduled_events(
+        session_id, statuses=frozenset({ScheduledEventStatus.DUE}), limit=limit
+    )
+
+
+async def stage_scheduled_event_completion(
+    clock: SessionClockPort, *, session_id: uuid.UUID, event_id: uuid.UUID
+) -> None:
+    """Record that the work a due event owned has actually been carried out.
+
+    Called *after* the owner did the thing, inside the same transaction that wrote
+    whatever the thing changed. That ordering is the entire correction: acknowledging
+    first and executing afterwards is how the previous design managed to mark work
+    processed that a crash then made sure never happened.
+
+    Refused unless the event is DUE. A pending event has not been reached yet, and a
+    processed one has already been done -- which is what stops a retried dispatch from
+    executing the same fictional moment twice. Scoped to the session so one save cannot
+    acknowledge another's schedule.
+    """
+    event = await clock.get_scheduled_event(event_id)
+    if event is None or event.session_id != session_id:
+        raise NotFoundError("ScheduledEvent", event_id)
+
+    require_transition(event.status, ScheduledEventStatus.PROCESSED)
+    await clock.set_scheduled_event_status(event_id, ScheduledEventStatus.PROCESSED)
+
+
+async def complete_scheduled_event(
+    clock: SessionClockPort, *, session_id: uuid.UUID, event_id: uuid.UUID
+) -> None:
+    """`stage_scheduled_event_completion`, then commit.
+
+    For a dispatcher whose whole unit of work this is. One that also writes state goes
+    through the staged form so the acknowledgement and the change it acknowledges land
+    together or not at all.
+    """
+    await stage_scheduled_event_completion(clock, session_id=session_id, event_id=event_id)
+    await clock.commit()
+
+
+async def cancel_scheduled_event(clock: SessionClockPort, *, event_id: uuid.UUID) -> None:
+    """Call off something that will not happen after all.
+
+    A different verdict from completing it, and deliberately available for due work as
+    well as pending: an owner that looks at `siege.progress` and finds the siege already
+    lifted is neither carrying it out nor pretending it did. Cancelling something already
+    resolved is refused rather than ignored.
     """
     event = await clock.get_scheduled_event(event_id)
     if event is None:

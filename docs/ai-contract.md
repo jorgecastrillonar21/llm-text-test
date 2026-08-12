@@ -46,7 +46,7 @@ no database session.
 | `world` | name, description, genre, setting, **language** | — |
 | `world_rules` | the world's rules, projected and flattened | — |
 | `player` | name, description | — |
-| `session` | title, current location, summary, turn index | — |
+| `session` | title, current location *(from the canonical position)*, summary, turn index | — |
 | `time` | fictional date, hour, part of day, elapsed since start | — |
 | `relevant_characters` | full profiles incl. goals and secrets | 12 |
 | `recent_messages` | transcript, oldest-first | 20 |
@@ -132,8 +132,9 @@ every other retrieval decision.
 ### Geography in the context
 
 `space` is a `SpatialContext` — where the scene is, what is inside it, what contains it,
-and every way out — or `None` when the world has no geography or the session's location
-matches nothing in it. It renders as:
+and every way out — or `None` when the player's canonical position does not put them
+anywhere: unlocated, offstage, or in transit between two places. The scene is found by id
+from `character_positions`, never by matching a name. It renders as:
 
 ```text
 # Where this is happening  (authoritative: this is the geography)
@@ -306,9 +307,16 @@ reason       : string
 ```
 
 A *proposal*, and nothing more. The model never writes a fact: each one is reviewed
-against the property's policy, the model's authority, what is already established, and
-the world's rules, and most are refused. `TurnResponse` reports `facts_established` and
-`facts_rejected` so a turn's outcome is visible without reading the log.
+against the property's policy, the model's authority, whether the subject resolves to
+something real, what is already established, and the world's rules, and most are refused.
+`TurnResponse` reports `facts_established` and `facts_rejected` so a turn's outcome is
+visible without reading the log.
+
+`faction` and `other` are in the enum because `FactSubjectType` is the vocabulary those
+domains will need, and both are refused today: nothing in this system resolves one, and a
+fact about an id that names nothing is worse than no fact. `location` is accepted and the
+id must be a place this session can actually see. See
+[world-state-facts.md](world-state-facts.md#a-subject-must-name-something-that-exists).
 
 This is where the model's authority is at its narrowest by design. **The Story Director
 has the lowest authority over mechanical state of anything in the system**: it reaches

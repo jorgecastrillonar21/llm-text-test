@@ -22,6 +22,8 @@ from app.application.persistence import (
 from app.application.time_service import (
     advance_time,
     cancel_scheduled_event,
+    complete_scheduled_event,
+    load_due_work,
     schedule_event,
 )
 from app.domain.enums import Language
@@ -32,6 +34,7 @@ from app.domain.world_state import WORLD_STATE_VERSION
 from app.domain.world_time import (
     DEFAULT_INITIAL_DATETIME,
     STANDARD_CALENDAR,
+    UNRESOLVED_STATUSES,
     Calendar,
     CalendarMonth,
     FictionalDateTime,
@@ -258,9 +261,24 @@ def test_being_interrupted_and_having_no_interruption_is_a_contradiction() -> No
 # ---------------------------------------------------------------------------
 
 
-def test_a_pending_event_can_be_processed_or_cancelled() -> None:
-    require_transition(ScheduledEventStatus.PENDING, ScheduledEventStatus.PROCESSED)
+def test_a_pending_event_becomes_due_or_is_called_off() -> None:
+    require_transition(ScheduledEventStatus.PENDING, ScheduledEventStatus.DUE)
     require_transition(ScheduledEventStatus.PENDING, ScheduledEventStatus.CANCELLED)
+
+
+def test_reaching_an_event_is_not_doing_it() -> None:
+    """The whole correction, in one assertion.
+
+    PROCESSED means an owner executed the work. There is no path from "not reached yet"
+    to "carried out", because nothing between those two states did anything.
+    """
+    with pytest.raises(ValidationError, match="cannot become processed"):
+        require_transition(ScheduledEventStatus.PENDING, ScheduledEventStatus.PROCESSED)
+
+
+def test_a_due_event_can_be_completed_or_called_off() -> None:
+    require_transition(ScheduledEventStatus.DUE, ScheduledEventStatus.PROCESSED)
+    require_transition(ScheduledEventStatus.DUE, ScheduledEventStatus.CANCELLED)
 
 
 @pytest.mark.parametrize(
@@ -271,9 +289,15 @@ def test_a_resolved_event_never_moves_again(resolved: ScheduledEventStatus) -> N
         require_transition(resolved, ScheduledEventStatus.PROCESSED)
 
 
-def test_nothing_can_be_put_back_to_pending() -> None:
-    with pytest.raises(ValidationError, match="not a resolution"):
-        require_transition(ScheduledEventStatus.PENDING, ScheduledEventStatus.PENDING)
+@pytest.mark.parametrize("current", [ScheduledEventStatus.PENDING, ScheduledEventStatus.DUE])
+def test_nothing_can_be_put_back_to_pending(current: ScheduledEventStatus) -> None:
+    with pytest.raises(ValidationError, match="cannot become pending"):
+        require_transition(current, ScheduledEventStatus.PENDING)
+
+
+def test_the_clock_cannot_reach_the_same_event_twice() -> None:
+    with pytest.raises(ValidationError, match="cannot become due"):
+        require_transition(ScheduledEventStatus.DUE, ScheduledEventStatus.DUE)
 
 
 # ---------------------------------------------------------------------------
@@ -357,15 +381,31 @@ class FakeSessionClock:
     async def load_due_scheduled_events(
         self, session_id: uuid.UUID, *, through: int
     ) -> list[ScheduledEventRecord]:
+        # Unresolved, not merely pending: work the last advance surfaced and nobody has
+        # executed is still owed, and the adapter's query says the same thing.
         due = [
             event
             for event in self.scheduled
             if event.session_id == session_id
-            and event.status is ScheduledEventStatus.PENDING
+            and event.status in UNRESOLVED_STATUSES
             and event.due_at <= through
         ]
         # Stable sort: ties keep insertion order, as the port's contract requires.
         return sorted(due, key=lambda event: event.due_at)
+
+    async def load_scheduled_events(
+        self,
+        session_id: uuid.UUID,
+        *,
+        statuses: frozenset[ScheduledEventStatus] | None = None,
+        limit: int,
+    ) -> list[ScheduledEventRecord]:
+        matching = [
+            event
+            for event in self.scheduled
+            if event.session_id == session_id and (statuses is None or event.status in statuses)
+        ]
+        return sorted(matching, key=lambda event: (event.due_at, event.id))[:limit]
 
     async def set_scheduled_event_status(
         self, event_id: uuid.UUID, status: ScheduledEventStatus
@@ -487,7 +527,7 @@ async def test_an_advance_writes_no_history_of_its_own() -> None:
     assert clock.events == []
 
 
-async def test_events_due_inside_the_span_are_processed_in_chronological_order() -> None:
+async def test_events_due_inside_the_span_come_due_in_chronological_order() -> None:
     clock = FakeSessionClock(elapsed_minutes=0)
     late = clock.given_scheduled(due_at=300, event_type="caravan_arrives")
     early = clock.given_scheduled(due_at=100, event_type="shop_closes")
@@ -495,9 +535,91 @@ async def test_events_due_inside_the_span_are_processed_in_chronological_order()
 
     result = await advance_time(clock, session_id=SESSION_ID, request=_request(480))
 
-    assert result.processed_event_ids == [early, late]
+    assert result.due_event_ids == [early, late]
     assert clock.status_of(outside) is ScheduledEventStatus.PENDING
     assert result.ended_at == 480
+
+
+async def test_walking_past_an_event_does_not_execute_it() -> None:
+    """Time owns chronology. It cannot land a caravan, and it no longer claims to.
+
+    The old advance marked everything it reached PROCESSED, which recorded work as
+    finished that no code had done and removed it from the pending query, so nothing
+    could find it afterwards.
+    """
+    clock = FakeSessionClock(elapsed_minutes=0)
+    caravan = clock.given_scheduled(due_at=100, event_type="caravan_arrives")
+
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+
+    assert clock.status_of(caravan) is ScheduledEventStatus.DUE
+
+
+async def test_due_work_stays_discoverable_until_someone_answers_it() -> None:
+    clock = FakeSessionClock(elapsed_minutes=0)
+    caravan = clock.given_scheduled(due_at=100, event_type="caravan_arrives")
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+
+    owed = await load_due_work(clock, session_id=SESSION_ID)
+
+    assert [event.id for event in owed] == [caravan]
+
+
+async def test_owed_work_is_surfaced_again_by_the_next_advance() -> None:
+    """Owed work does not stop being owed because the clock has walked past it once."""
+    clock = FakeSessionClock(elapsed_minutes=0)
+    caravan = clock.given_scheduled(due_at=100, event_type="caravan_arrives")
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+
+    again = await advance_time(clock, session_id=SESSION_ID, request=_request(60))
+
+    assert again.due_event_ids == [caravan]
+    assert clock.status_of(caravan) is ScheduledEventStatus.DUE
+
+
+async def test_answering_due_work_takes_it_off_the_backlog() -> None:
+    clock = FakeSessionClock(elapsed_minutes=0)
+    caravan = clock.given_scheduled(due_at=100, event_type="caravan_arrives")
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+
+    await complete_scheduled_event(clock, session_id=SESSION_ID, event_id=caravan)
+
+    assert clock.status_of(caravan) is ScheduledEventStatus.PROCESSED
+    assert await load_due_work(clock, session_id=SESSION_ID) == []
+    # And a later advance does not surface it a second time.
+    later = await advance_time(clock, session_id=SESSION_ID, request=_request(60))
+    assert later.due_event_ids == []
+
+
+async def test_a_retried_dispatch_cannot_execute_the_same_event_twice() -> None:
+    clock = FakeSessionClock(elapsed_minutes=0)
+    caravan = clock.given_scheduled(due_at=100, event_type="caravan_arrives")
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+    await complete_scheduled_event(clock, session_id=SESSION_ID, event_id=caravan)
+
+    with pytest.raises(ValidationError, match="already resolved"):
+        await complete_scheduled_event(clock, session_id=SESSION_ID, event_id=caravan)
+
+
+async def test_work_the_clock_has_not_reached_cannot_be_acknowledged() -> None:
+    clock = FakeSessionClock(elapsed_minutes=0)
+    caravan = clock.given_scheduled(due_at=900, event_type="caravan_arrives")
+
+    with pytest.raises(ValidationError, match="cannot become processed"):
+        await complete_scheduled_event(clock, session_id=SESSION_ID, event_id=caravan)
+
+    assert clock.status_of(caravan) is ScheduledEventStatus.PENDING
+
+
+async def test_one_session_cannot_acknowledge_anothers_schedule() -> None:
+    clock = FakeSessionClock(elapsed_minutes=0)
+    caravan = clock.given_scheduled(due_at=100, event_type="caravan_arrives")
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+
+    with pytest.raises(NotFoundError):
+        await complete_scheduled_event(clock, session_id=uuid.uuid4(), event_id=caravan)
+
+    assert clock.status_of(caravan) is ScheduledEventStatus.DUE
 
 
 async def test_an_interrupting_event_stops_the_advance_where_it_happens() -> None:
@@ -516,8 +638,42 @@ async def test_an_interrupting_event_stops_the_advance_where_it_happens() -> Non
         event_id=alarm, event_type="fire_in_the_stables", at=192
     )
     assert clock.session.elapsed_minutes == 192
-    # It still happened -- being the interruption is not the same as being skipped.
-    assert clock.status_of(alarm) is ScheduledEventStatus.PROCESSED
+    # Reached, not run. Being what stopped the clock is not the same as having been
+    # dealt with: something still has to put out the fire.
+    assert clock.status_of(alarm) is ScheduledEventStatus.DUE
+
+
+async def test_an_unanswered_interruption_keeps_stopping_the_clock() -> None:
+    """The honest answer, not a deadlock to design around.
+
+    A world cannot get past something that is supposed to happen and has not. The way
+    out is to deal with the fire or to decide it never happened -- both explicit.
+    """
+    clock = FakeSessionClock(elapsed_minutes=0)
+    alarm = clock.given_scheduled(due_at=192, event_type="fire_in_the_stables", interrupts=True)
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+
+    stalled = await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+    assert stalled.advanced_minutes == 0
+    assert stalled.interrupted is True
+
+    await complete_scheduled_event(clock, session_id=SESSION_ID, event_id=alarm)
+
+    freed = await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+    assert freed.advanced_minutes == 480
+    assert freed.interrupted is False
+
+
+async def test_calling_off_an_interruption_also_frees_the_clock() -> None:
+    clock = FakeSessionClock(elapsed_minutes=0)
+    alarm = clock.given_scheduled(due_at=192, event_type="fire_in_the_stables", interrupts=True)
+    await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+
+    await cancel_scheduled_event(clock, event_id=alarm)
+
+    freed = await advance_time(clock, session_id=SESSION_ID, request=_request(480))
+    assert freed.advanced_minutes == 480
+    assert freed.due_event_ids == []
 
 
 async def test_events_scheduled_after_an_interruption_stay_pending() -> None:
@@ -542,7 +698,8 @@ async def test_a_non_interruptible_skip_runs_straight_past_an_interrupting_event
 
     assert result.interrupted is False
     assert result.advanced_minutes == 480
-    assert clock.status_of(alarm) is ScheduledEventStatus.PROCESSED
+    # Not interrupted by it, but still owed it: skipping past a knock does not answer it.
+    assert clock.status_of(alarm) is ScheduledEventStatus.DUE
 
 
 async def test_an_event_already_behind_the_clock_resolves_now_rather_than_rewinding() -> None:
@@ -555,9 +712,9 @@ async def test_an_event_already_behind_the_clock_resolves_now_rather_than_rewind
     assert result.interruption.at == 1000
     assert result.ended_at == 1000
     assert result.advanced_minutes == 0
-    # The event that interrupted is consumed either way -- a late event is late, not
-    # lost, and firing it once is the point.
-    assert clock.status_of(result.processed_event_ids[0]) is ScheduledEventStatus.PROCESSED
+    # A late event is late, not lost: it comes due now rather than dragging the clock
+    # back to the minute it was written for.
+    assert clock.status_of(result.due_event_ids[0]) is ScheduledEventStatus.DUE
 
 
 async def test_scheduling_converts_a_delay_into_an_absolute_due_time() -> None:
@@ -594,10 +751,22 @@ async def test_a_pending_event_can_be_called_off() -> None:
     assert clock.status_of(event_id) is ScheduledEventStatus.CANCELLED
 
 
-async def test_an_event_that_already_fired_cannot_be_cancelled() -> None:
+async def test_due_work_can_still_be_called_off() -> None:
+    """An owner that finds the siege already lifted is not carrying it out."""
     clock = FakeSessionClock(elapsed_minutes=0)
     event_id = clock.given_scheduled(due_at=10, event_type="shop_closes")
     await advance_time(clock, session_id=SESSION_ID, request=_request(60))
+
+    await cancel_scheduled_event(clock, event_id=event_id)
+
+    assert clock.status_of(event_id) is ScheduledEventStatus.CANCELLED
+
+
+async def test_an_event_that_was_carried_out_cannot_be_cancelled() -> None:
+    clock = FakeSessionClock(elapsed_minutes=0)
+    event_id = clock.given_scheduled(due_at=10, event_type="shop_closes")
+    await advance_time(clock, session_id=SESSION_ID, request=_request(60))
+    await complete_scheduled_event(clock, session_id=SESSION_ID, event_id=event_id)
 
     with pytest.raises(ValidationError, match="already resolved"):
         await cancel_scheduled_event(clock, event_id=event_id)
