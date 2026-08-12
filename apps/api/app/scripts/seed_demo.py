@@ -10,18 +10,41 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import TypedDict
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.domain.enums import Language
+from app.domain.world_facts import WORLD_SUBJECT, FactSubject, FactSubjectType, SetFact
+from app.domain.world_locations import (
+    ConnectionCategory,
+    LocationCategory,
+    LocationScale,
+)
+from app.domain.world_rules import WorldRulesPreset, build_preset
+from app.domain.world_situations import (
+    SituationCategory,
+    SituationScope,
+    SituationStatus,
+    StartSituation,
+)
+from app.domain.world_time import FictionalDateTime
 from app.infrastructure.db import models
 from app.infrastructure.db.engine import create_engine, create_session_factory, session_scope
 
 logger = logging.getLogger(__name__)
 
 DEMO_WORLD_NAME = "The Fractured Crown"
+
+# Written explicitly rather than left to the column default, so the seed exercises the
+# same path the API uses. Shonen suits the genre string and keeps the demo playable --
+# constant trouble, rarely fatal -- and it makes the danger/lethality split visible in
+# the one world people actually run: danger 75 against lethality 30.
+DEMO_WORLD_PRESET = WorldRulesPreset.SHONEN
+DEMO_WORLD_START = FictionalDateTime(year=842, month=10, day=3, hour=18, minute=20)
 
 
 class SeedCharacter(TypedDict):
@@ -79,6 +102,259 @@ CHARACTERS: list[SeedCharacter] = [
 ]
 
 
+def _initial_facts(elena_id: uuid.UUID, kael_id: uuid.UUID) -> list[SetFact]:
+    """What is already true in the demo world before anyone plays it.
+
+    Deliberately small, and deliberately the two kinds: facts about the world that the
+    director must not contradict, and quiet character detail it may build on. Nothing
+    mechanical -- `system.alive` is not seeded, because a fact's absence is not the
+    same as false and "nothing has happened to Elena yet" is exactly the absent case.
+    """
+    return [
+        SetFact(
+            subject=WORLD_SUBJECT,
+            property="world.political_status",
+            value="contested; the crown has no undisputed heir",
+            importance=4,
+        ),
+        SetFact(
+            subject=WORLD_SUBJECT,
+            property="world.condition",
+            value="the wards around the capital are thinning",
+            importance=4,
+        ),
+        SetFact(
+            subject=FactSubject(type=FactSubjectType.CHARACTER, id=elena_id),
+            property="narrative.birthplace",
+            value="the capital's lower district",
+            importance=1,
+        ),
+        SetFact(
+            subject=FactSubject(type=FactSubjectType.CHARACTER, id=kael_id),
+            property="narrative.birthplace",
+            value="a farming village eight days south",
+            importance=1,
+        ),
+    ]
+
+
+DEMO_START_LOCATION = "The Broken Crown"
+"""Where a demo session begins.
+
+Passed as `SessionCreate.current_location` and spelled to match this location's name
+exactly, because session creation resolves that string to an id *once* to seed the
+player's canonical position. Get it wrong and the demo session starts `unlocated` --
+which is the correct behaviour for an unmatched name, and would make the demo scene
+placeless. See `app.application.position_service.materialize_initial_position`."""
+
+
+async def _seed_geography(db: AsyncSession, world_id: uuid.UUID) -> tuple[list[str], uuid.UUID]:
+    """A small template graph: a district, three places in it, and the ways between.
+
+    Deliberately shallow and deliberately incomplete. It exists to exercise the model
+    -- containment, a one-way drop, a blocked crossing a session can later reopen, a
+    tavern with zones -- not to be a map of a city. Lazy granularity is the rule: the
+    cellar is a location because it can be entered and can hold state; the fireplace is
+    a zone because it is somewhere to stand.
+
+    Returns the names for the console summary, and the district's id, which the seeded
+    situations need: a hazard centred on the Lantern Quarter has to name it.
+
+    Written directly rather than through the API for the same reason the facts are:
+    world, characters and geography go in as one transaction, and the authoring
+    endpoints create a world before it has anywhere in it.
+    """
+    quarter = models.LocationDefinition(
+        world_id=world_id,
+        name="The Lantern Quarter",
+        description="Narrow streets under failing wardlight, north of the palace approach.",
+        category=LocationCategory.AREA,
+        subtype="city_district",
+        scale=LocationScale.DISTRICT,
+        importance=4,
+    )
+    db.add(quarter)
+    await db.flush()
+
+    tavern = models.LocationDefinition(
+        world_id=world_id,
+        name=DEMO_START_LOCATION,
+        description="A tavern named for a joke nobody finds funny this year.",
+        category=LocationCategory.STRUCTURE,
+        subtype="tavern",
+        scale=LocationScale.BUILDING,
+        parent_location_id=quarter.id,
+        importance=4,
+    )
+    street = models.LocationDefinition(
+        world_id=world_id,
+        name="Market Street",
+        description="Half the stalls are shuttered; the other half are pretending not to be.",
+        category=LocationCategory.TRANSIT,
+        subtype="street",
+        scale=LocationScale.SITE,
+        parent_location_id=quarter.id,
+        importance=3,
+    )
+    db.add_all([tavern, street])
+    await db.flush()
+
+    # A location rather than a zone: it can be entered, it can be flooded or sealed, and
+    # a scene can happen in it. The fireplace below is a zone, because it is somewhere
+    # to stand. See docs/world-state-locations.md.
+    cellar = models.LocationDefinition(
+        world_id=world_id,
+        name="The Broken Crown cellar",
+        description="Cold, dry, and further under the street than it has any right to be.",
+        category=LocationCategory.INTERIOR,
+        subtype="cellar",
+        scale=LocationScale.ROOM,
+        parent_location_id=tavern.id,
+        importance=2,
+    )
+    db.add(cellar)
+    await db.flush()
+
+    db.add_all(
+        [
+            models.LocationZone(
+                location_id=tavern.id, name="the bar", category="counter", importance=3
+            ),
+            models.LocationZone(
+                location_id=tavern.id, name="the fireplace", category="seating", importance=2
+            ),
+            models.LocationZone(
+                location_id=tavern.id, name="the back tables", category="seating", importance=2
+            ),
+        ]
+    )
+
+    db.add_all(
+        [
+            # Containment does not imply a route, so the door is written down. Without
+            # this row the tavern would be inside the quarter and unreachable from it.
+            models.LocationConnection(
+                world_id=world_id,
+                from_location_id=street.id,
+                to_location_id=tavern.id,
+                bidirectional=True,
+                category=ConnectionCategory.PASSAGE,
+                subtype="door",
+                base_travel_minutes=0,
+                importance=4,
+            ),
+            models.LocationConnection(
+                world_id=world_id,
+                from_location_id=tavern.id,
+                to_location_id=cellar.id,
+                bidirectional=True,
+                category=ConnectionCategory.VERTICAL,
+                subtype="stairs",
+                base_travel_minutes=1,
+                importance=2,
+            ),
+            # One-way on purpose, so the demo world contains something the model must
+            # not quietly reverse: you can drop into the cellar from the street, and you
+            # cannot climb back out that way.
+            models.LocationConnection(
+                world_id=world_id,
+                from_location_id=street.id,
+                to_location_id=cellar.id,
+                bidirectional=False,
+                category=ConnectionCategory.VERTICAL,
+                subtype="coal_chute",
+                base_travel_minutes=1,
+                importance=1,
+            ),
+        ]
+    )
+    await db.flush()
+    return [quarter.name, street.name, tavern.name, cellar.name], quarter.id
+
+
+def _initial_situations(quarter_id: uuid.UUID) -> list[StartSituation]:
+    """What this world already has under way before anyone plays it.
+
+    Three, chosen to exercise the parts of the model that are easy to get wrong rather
+    than to be a plot:
+
+    * **The failing wards** are a hazard with real danger and rising momentum, centred
+      on a place -- the ordinary case, and the one the spatial relevance band selects.
+    * **The contested succession** is political, regional and going nowhere: `dormant`
+      with zero momentum, which is a different thing from resolved and reaches context
+      anyway. It is the case a status column collapses if `dormant` does not exist.
+    * **The lamplighters' strike** is `planned` and tagged `secret`: it objectively
+      exists, and the player-facing context will not mention it. That tag is the whole
+      of the current hidden-situation story, and it is a convention rather than a
+      knowledge model -- see docs/world-state-situations.md.
+
+    A template, like `initial_facts`: each session materialises its own copies with its
+    own ids and diverges immediately. None carries a `source_event_id`, which is the
+    documented seed exception -- nothing happened to start these, the world began this
+    way.
+    """
+    return [
+        StartSituation(
+            category=SituationCategory.HAZARD,
+            subtype="ward_failure",
+            title="The failing wards",
+            description=(
+                "The wardlight over the Lantern Quarter has been thinning for a season. "
+                "Nobody official will say why, and the people who would know have stopped "
+                "being seen."
+            ),
+            status=SituationStatus.ACTIVE,
+            intensity=45,
+            threat=55,
+            momentum=15,
+            importance=4,
+            scope=SituationScope.LOCAL,
+            primary_location_id=quarter_id,
+            tags=("magic", "public"),
+            reason="The world begins with the wards already failing.",
+        ),
+        StartSituation(
+            category=SituationCategory.POLITICAL,
+            subtype="succession_crisis",
+            title="The contested succession",
+            description=(
+                "Two claims, both plausible, neither pressed. Everyone in the capital has "
+                "decided which side they were always on and nobody has moved."
+            ),
+            # Real, and going nowhere. Momentum zero and `dormant` are saying different
+            # things: the first is that nothing is currently driving it, the second that
+            # it is not the kind of process that drifts.
+            status=SituationStatus.DORMANT,
+            intensity=30,
+            threat=40,
+            momentum=0,
+            importance=4,
+            scope=SituationScope.REGIONAL,
+            tags=("political",),
+            reason="The world begins with the throne already contested.",
+        ),
+        StartSituation(
+            category=SituationCategory.SOCIAL,
+            subtype="strike",
+            title="The lamplighters' quiet refusal",
+            description=(
+                "The guild has stopped replacing the dead lamps in the Quarter. They have "
+                "not announced it and will not, and the dark is spreading a street at a time."
+            ),
+            status=SituationStatus.PLANNED,
+            intensity=10,
+            threat=15,
+            momentum=10,
+            importance=3,
+            scope=SituationScope.LOCAL,
+            primary_location_id=quarter_id,
+            # Objectively real; deliberately not narrated. See the docstring.
+            tags=("secret", "public"),
+            reason="The world begins with the strike already being organised.",
+        ),
+    ]
+
+
 async def seed() -> None:
     settings = get_settings()
     engine = create_engine(settings)
@@ -105,16 +381,45 @@ async def seed() -> None:
                     "in the capital is deciding which side they were always on."
                 ),
                 language=Language.EN,
+                rules_json=build_preset(DEMO_WORLD_PRESET).model_dump(mode="json"),
+                # An evening in autumn, so a new session starts somewhere with a mood
+                # rather than at the default first morning of year one.
+                initial_datetime=DEMO_WORLD_START.model_dump(mode="json"),
             )
             db.add(world)
             await db.flush()
 
-            for data in CHARACTERS:
-                db.add(models.Character(world_id=world.id, **data))
+            characters = {
+                data["name"]: models.Character(world_id=world.id, **data) for data in CHARACTERS
+            }
+            db.add_all(characters.values())
+            await db.flush()
+
+            # Written after the characters exist, because a template fact about Elena
+            # needs her id and there is deliberately no way to name a subject any other
+            # way. Every session made from this world starts with copies of these and
+            # diverges from there; nothing a session does writes back here.
+            world.initial_facts = [
+                fact.model_dump(mode="json")
+                for fact in _initial_facts(characters["Elena"].id, characters["Kael"].id)
+            ]
+            await db.flush()
+
+            places, quarter_id = await _seed_geography(db, world.id)
+
+            # After the geography, because a seeded situation names a location and the
+            # place has to have an id before the hazard centred on it can point at it.
+            world.initial_situations = [
+                situation.model_dump(mode="json") for situation in _initial_situations(quarter_id)
+            ]
             await db.flush()
 
             print(f"Created demo world: {world.id}")
+            print(f"Rules: {DEMO_WORLD_PRESET.value}")
             print(f"Characters: {', '.join(c['name'] for c in CHARACTERS)}")
+            print(f"Initial facts: {len(world.initial_facts)}")
+            print(f"Locations: {', '.join(places)}")
+            print(f"Initial situations: {len(world.initial_situations)}")
     finally:
         await engine.dispose()
 

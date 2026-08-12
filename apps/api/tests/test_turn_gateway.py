@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.application.persistence import NewEvent, NewMemory, NewMessage
 from app.domain.enums import MemoryKind, MessageRole
 from app.domain.relationships import RelationshipVector
+from app.domain.resolution import EventCategory
 from app.infrastructure.db import models
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
 
@@ -145,11 +146,26 @@ async def test_turn_index_and_events_are_persisted(
     _, _, session = await _world_with_session(db_session, make_world, make_character)
     gateway = SqlAlchemyTurnGateway(db_session)
 
-    await gateway.add_event(
-        NewEvent(session_id=session.id, turn_index=1, type="arrival", description="Rin arrived.")
+    event_id = await gateway.add_event(
+        NewEvent(
+            session_id=session.id,
+            turn_index=1,
+            occurred_at=0,
+            category=EventCategory.ACTION,
+            subtype="arrival",
+            summary="Rin arrived.",
+            importance=2,
+        )
     )
     await gateway.set_turn_index(session.id, 7)
     await gateway.commit()
 
     reloaded = await gateway.get_session(session.id)
     assert reloaded is not None and reloaded.turn_index == 7
+
+    # The adapter assigns the sequence, because only it can see what the session
+    # already has -- the caller passes a fictional minute and nothing else.
+    stored = await gateway.get_event(session.id, event_id)
+    assert stored is not None
+    assert stored.subtype == "arrival"
+    assert stored.sequence == 1

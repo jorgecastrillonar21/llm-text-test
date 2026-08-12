@@ -3,12 +3,22 @@ import { useNavigate } from 'react-router';
 import { useI18n } from '@/i18n/useI18n';
 import { useCreateWorld } from '@/api/hooks';
 import { Button, Card, Field, TextArea, TextInput } from '@/components/ui';
-import type { Language } from '@/api/types';
+import { WORLD_RULES_PRESETS, type Language, type WorldRulesPreset } from '@/api/types';
+import type { MessageKey } from '@/i18n/messages';
 
 const LANGUAGE_OPTIONS: { value: Language; label: string }[] = [
   { value: 'en', label: 'English' },
   { value: 'es', label: 'Español' },
 ];
+
+const PRESET_LABELS: Record<WorldRulesPreset, MessageKey> = {
+  balanced: 'rules.preset.balanced',
+  cozy_fantasy: 'rules.preset.cozyFantasy',
+  shonen: 'rules.preset.shonen',
+  dark_fantasy: 'rules.preset.darkFantasy',
+  simulationist: 'rules.preset.simulationist',
+  isekai_power_fantasy: 'rules.preset.isekaiPowerFantasy',
+};
 
 export function CreateWorldForm({ onDone }: { onDone: () => void }) {
   const { t, locale } = useI18n();
@@ -22,6 +32,9 @@ export function CreateWorldForm({ onDone }: { onDone: () => void }) {
   // Default the story language to the interface language: it is the best guess,
   // and it is fixed once the world is created.
   const [language, setLanguage] = useState<Language>(locale);
+  // The preset only seeds the rules document; nothing downstream remembers which
+  // one was picked. Balanced matches the backend default.
+  const [preset, setPreset] = useState<WorldRulesPreset>('balanced');
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -32,6 +45,7 @@ export function CreateWorldForm({ onDone }: { onDone: () => void }) {
       setting: setting.trim(),
       description: description.trim(),
       language,
+      rules_preset: preset,
     });
     onDone();
     navigate(`/worlds/${world.id}`);
@@ -63,6 +77,23 @@ export function CreateWorldForm({ onDone }: { onDone: () => void }) {
               {LANGUAGE_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
+                </option>
+              ))}
+            </select>
+          )}
+        </Field>
+
+        <Field label={t('world.form.preset')} hint={t('world.form.presetHelp')}>
+          {(id) => (
+            <select
+              id={id}
+              value={preset}
+              onChange={(e) => setPreset(e.target.value as WorldRulesPreset)}
+              className="w-full rounded-lg border border-ink-700 bg-ink-850 px-3 py-2.5 text-base text-ink-50 focus:border-arcane-400 focus:outline-none"
+            >
+              {WORLD_RULES_PRESETS.map((option) => (
+                <option key={option} value={option}>
+                  {t(PRESET_LABELS[option])}
                 </option>
               ))}
             </select>

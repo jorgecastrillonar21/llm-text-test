@@ -14,6 +14,8 @@ const SESSION = {
   current_location: 'the market',
   summary: '',
   turn_index: 0,
+  elapsed_minutes: 29022,
+  state_revision: 0,
   created_at: '',
   updated_at: '',
   world: {
@@ -23,8 +25,18 @@ const SESSION = {
     genre: 'fantasy',
     setting: '',
     language: 'en',
+    initial_datetime: { year: 842, month: 5, day: 13, hour: 13, minute: 0 },
     created_at: '',
     updated_at: '',
+  },
+  time: {
+    elapsed_minutes: 29022,
+    display: {
+      date: '2 June, 842',
+      time: '16:42',
+      period: 'afternoon',
+      elapsed: '20 days, 3 hours',
+    },
   },
 };
 
@@ -68,6 +80,35 @@ function installFetch(handler: (url: string) => Response | Promise<Response>) {
   );
 }
 
+/** Like `installFetch`, but records the body of every POST to `/turns`. */
+function installFetchRecordingTurns(handler: (url: string) => Response | Promise<Response>) {
+  const bodies: Record<string, unknown>[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url.includes('/turns') && typeof init?.body === 'string') {
+        bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+      }
+      return handler(url);
+    }),
+  );
+  return bodies;
+}
+
+/**
+ * The nth recorded turn body.
+ *
+ * Indexed access is `T | undefined` under `noUncheckedIndexedAccess`, and the two
+ * honest options are a non-null assertion or this. A missing body means the component
+ * posted fewer turns than the test expected, which is a real failure worth naming.
+ */
+function posted(bodies: Record<string, unknown>[], index: number): Record<string, unknown> {
+  const body = bodies[index];
+  if (body === undefined) throw new Error(`no turn was posted at index ${index}`);
+  return body;
+}
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -104,6 +145,50 @@ describe('SessionPage', () => {
 
     expect(await screen.findByText('Run 1')).toBeInTheDocument();
     expect(await screen.findByText('The market is loud.')).toBeInTheDocument();
+  });
+
+  it('shows the fictional date and hour alongside the turn count', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    const clock = await screen.findByLabelText('Time in the story');
+    expect(clock).toHaveTextContent('2 June, 842');
+    expect(clock).toHaveTextContent('16:42');
+    // The period is a fixed vocabulary, so it is translated rather than passed through.
+    expect(clock).toHaveTextContent('afternoon');
+    // Turn count and fictional time are both present and measure different things.
+    expect(screen.getByText('Turn 0')).toBeInTheDocument();
+  });
+
+  it('never shows the raw minute counter', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    await screen.findByLabelText('Time in the story');
+    expect(screen.queryByText(/29022/)).not.toBeInTheDocument();
+  });
+
+  it('shows where the scene is and how many times the world has changed', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    const readout = await screen.findByLabelText('World state');
+    expect(readout).toHaveTextContent('the market');
+    // A session that has never been played sits at revision 0, and the turn count is
+    // shown separately: the two counters measure different things and neither is
+    // derived from the other.
+    expect(readout).toHaveTextContent('state 0');
+    expect(screen.getByText('Turn 0')).toBeInTheDocument();
+  });
+
+  it('offers no way to edit the world it is showing', async () => {
+    installFetch((url) => routeTo(baseRoutes(), url));
+    renderSession();
+
+    const readout = await screen.findByLabelText('World state');
+    // The readout is inert on purpose. What is true changes through a resolution and a
+    // typed mutation; a control here would be a way around every rule those enforce.
+    expect(readout.querySelectorAll('input, button, select, textarea')).toHaveLength(0);
   });
 
   it('sends an action and shows the returned suggestions', async () => {
@@ -172,6 +257,52 @@ describe('SessionPage', () => {
     // The turn was a server-side no-op, so the user is told nothing was saved.
     expect(alert).toHaveTextContent(/nothing was saved/i);
     expect(screen.getByRole('button', { name: /retry/i })).toBeEnabled();
+  });
+
+  it('retries a failed turn under the id it already had', async () => {
+    const user = userEvent.setup();
+    const bodies = installFetchRecordingTurns((url) =>
+      url.includes('/turns')
+        ? json({ error: 'story_generation_failed', detail: 'boom', retryable: true }, 502)
+        : routeTo(baseRoutes(), url),
+    );
+    renderSession();
+
+    await screen.findByText('Run 1');
+    await user.type(screen.getByPlaceholderText(/type anything/i), 'I greet Elena');
+    await user.click(screen.getByRole('button', { name: /send/i }));
+
+    await screen.findByRole('alert');
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+
+    // The retry is the same submission, so it carries the same name. A new id here
+    // would let a turn that actually succeeded be played a second time.
+    expect(posted(bodies, 0).client_action_id).toBeTruthy();
+    expect(posted(bodies, 1).client_action_id).toBe(posted(bodies, 0).client_action_id);
+    expect(posted(bodies, 1).action).toBe('I greet Elena');
+  });
+
+  it('gives a genuinely new action a new id', async () => {
+    const user = userEvent.setup();
+    const bodies = installFetchRecordingTurns((url) =>
+      url.includes('/turns') ? json(TURN_RESPONSE) : routeTo(baseRoutes(), url),
+    );
+    renderSession();
+
+    await screen.findByText('Run 1');
+    const input = screen.getByPlaceholderText(/type anything/i);
+    await user.type(input, 'I greet Elena');
+    await user.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(bodies).toHaveLength(1));
+
+    await user.type(input, 'I draw my sword');
+    await user.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+
+    // The other half of the rule: reusing an id here would make the second action a
+    // replay of the first, and the player would act into silence.
+    expect(posted(bodies, 1).client_action_id).not.toBe(posted(bodies, 0).client_action_id);
   });
 
   it('reports an unreachable backend distinctly from a rejected request', async () => {

@@ -8,18 +8,23 @@ import type {
   Message,
   SessionCreate,
   SessionDetail,
+  SituationListRead,
   TurnResponse,
+  TurnSubmission,
   World,
   WorldCreate,
+  WorldRules,
 } from './types';
 
 export const queryKeys = {
   worlds: ['worlds'] as const,
   world: (id: string) => ['worlds', id] as const,
+  worldRules: (id: string) => ['worlds', id, 'rules'] as const,
   characters: (worldId: string) => ['worlds', worldId, 'characters'] as const,
   sessions: (worldId?: string) => ['sessions', worldId ?? 'all'] as const,
   session: (id: string) => ['sessions', id] as const,
   messages: (id: string) => ['sessions', id, 'messages'] as const,
+  situations: (id: string) => ['sessions', id, 'situations'] as const,
   aiStatus: ['ai-status'] as const,
 };
 
@@ -31,6 +36,17 @@ export function useWorld(id: string) {
   return useQuery({
     queryKey: queryKeys.world(id),
     queryFn: () => api.get<World>(`/api/v1/worlds/${id}`),
+  });
+}
+
+export function useWorldRules(id: string) {
+  return useQuery({
+    queryKey: queryKeys.worldRules(id),
+    // Its own endpoint because the document is ~3 KB and the world list would
+    // otherwise carry a copy per row. Rules never change after creation, so this
+    // is fetched once and kept.
+    queryFn: () => api.get<WorldRules>(`/api/v1/worlds/${id}/rules`),
+    staleTime: Infinity,
   });
 }
 
@@ -88,15 +104,52 @@ export function useMessages(sessionId: string) {
   });
 }
 
+/**
+ * What the world currently has under way in this session.
+ *
+ * Live processes only. A session's concluded situations accumulate forever and are
+ * history rather than status; the backend's `live_only` default is what this relies on.
+ */
+export function useSituations(sessionId: string) {
+  return useQuery({
+    queryKey: queryKeys.situations(sessionId),
+    queryFn: () =>
+      api.get<SituationListRead>(`/api/v1/sessions/${sessionId}/situations`),
+  });
+}
+
+/**
+ * A fresh name for a fresh submission.
+ *
+ * Called once, where the player acts — never inside the request. A new id per attempt
+ * would make every retry a new turn on the server, which is exactly the duplicate the
+ * id exists to prevent.
+ *
+ * `randomUUID` needs a secure context; the fallback keeps a plain-HTTP LAN session (a
+ * phone pointed at a laptop, which is how this application is meant to be played)
+ * idempotent rather than silently unprotected.
+ */
+export function newClientActionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `a-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 export function useSubmitTurn(sessionId: string) {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (action: string) =>
-      api.post<TurnResponse>(`/api/v1/sessions/${sessionId}/turns`, { action }),
+    mutationFn: ({ action, clientActionId }: TurnSubmission) =>
+      api.post<TurnResponse>(`/api/v1/sessions/${sessionId}/turns`, {
+        action,
+        client_action_id: clientActionId,
+      }),
     onSuccess: () => {
       // A failed turn is a no-op server-side, so only success invalidates.
       client.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
       client.invalidateQueries({ queryKey: queryKeys.session(sessionId) });
+      // A turn can start a process, and a turn's own state changes can move one.
+      client.invalidateQueries({ queryKey: queryKeys.situations(sessionId) });
     },
   });
 }

@@ -7,6 +7,7 @@ import uuid
 from httpx import ASGITransport, AsyncClient
 
 from app.application.contracts import DialogueLine, TurnGeneration
+from app.application.ports import TurnGenerationResult
 from app.domain.errors import StoryGenerationError
 from tests.conftest import FailingStoryGenerator
 
@@ -222,8 +223,8 @@ class ScriptedStoryGenerator:
     def __init__(self, generation: TurnGeneration) -> None:
         self._generation = generation
 
-    async def generate_turn(self, context: object) -> TurnGeneration:
-        return self._generation
+    async def generate_turn(self, context: object) -> TurnGenerationResult:
+        return TurnGenerationResult(generation=self._generation)
 
     async def status(self) -> object:  # pragma: no cover - not exercised
         raise NotImplementedError

@@ -64,6 +64,14 @@ Autogenerate compares `Base.metadata` against the live database — **always rea
 generated migration before committing it**. SQLite cannot `ALTER` most things in place,
 so `render_as_batch=True` is enabled; batch mode rewrites the table.
 
+"Rewrites the table" means copy, `DROP TABLE`, rename — and a DROP fires every
+`ON DELETE CASCADE` aimed at that table. `migrations/env.py` therefore runs migrations
+with `PRAGMA foreign_keys=OFF` and checks `PRAGMA foreign_key_check` afterwards. Without
+that, altering a column on `worlds` deletes every character, session, message and memory
+in the database, and the migration reports success. If you write a migration that touches
+a table other rows point at, extend `tests/test_migrations.py` to migrate a *populated*
+database and assert the rows are still there — that is the only check that catches this.
+
 Models use `UtcDateTime`, so generated migrations reference
 `app.infrastructure.db.types`. The migration template imports it for you.
 
@@ -95,6 +103,112 @@ from `Base.metadata`. The Alembic migration itself is verified separately by
 
 `tests/conftest.py` exposes `FailingStoryGenerator` for provider-failure paths, and
 `make_story_context` for exercising providers directly.
+
+### Development-only endpoints
+
+`/api/v1/dev/*` is mounted only when `APP_ENV` is `development` or `test` — an
+allowlist, so a typo leaves developer tooling off rather than quietly switching it on.
+It exists because nothing in the game moves time or changes state yet:
+
+```text
+POST   /api/v1/dev/sessions/{id}/advance-time
+POST   /api/v1/dev/sessions/{id}/scheduled-events
+GET    /api/v1/dev/sessions/{id}/scheduled-events/due
+DELETE /api/v1/dev/scheduled-events/{id}
+POST   /api/v1/dev/sessions/{id}/world-state/changes
+GET    /api/v1/dev/sessions/{id}/world-state
+GET    /api/v1/dev/sessions/{id}/world-state/check
+POST   /api/v1/dev/sessions/{id}/situations/{situation_id}/progress
+GET    /api/v1/dev/llm/performance
+GET    /api/v1/dev/sessions/{id}/llm-performance
+```
+
+The due-events endpoint is the seam nothing consumes yet. Advancing time marks what the
+clock reached `due` and stops there — it does not execute it — so this is how to see what
+the world is owed and has not been given. Until a dispatcher exists, an interrupting
+event that nobody answers keeps stopping the clock at its minute, which is the honest
+answer rather than a bug. See
+[DUE is not PROCESSED](world-state-time.md#due-is-not-processed).
+
+The mutation endpoint carries spatial and situation mutations too -- `update_location_state`,
+`update_connection_state`, `start_situation`, `update_situation` and `resolve_situation`
+travel in the same batch as fact changes, so one event can raise a siege's intensity,
+collapse a gate, block the crossing and start a food crisis together or not at all.
+Authoring geography is a different act and lives on the ordinary API under `/worlds`; see
+[world-state-locations.md](world-state-locations.md#http-surface).
+
+The progression endpoint runs one situation from where it was last evaluated to where the
+session clock now is. The interval is not yours to choose, so advance the clock first:
+
+```bash
+curl -X POST .../dev/sessions/$S/advance-time -d '{"requested_minutes":360,"reason":"debug"}'
+curl -X POST .../dev/sessions/$S/situations/$I/progress -d '{}'
+```
+
+It is the only caller the progression boundary has until a SimulationEngine exists; see
+[world-state-situations.md](world-state-situations.md#progression).
+
+### Inspecting what happened
+
+Every change the dev endpoints make goes through the resolution pipeline, so both of them
+leave a trail you can read back on the ordinary API:
+
+```bash
+curl ".../sessions/$S/resolutions?limit=20"
+```
+
+```bash
+curl ".../sessions/$S/events?min_importance=3&limit=20"
+```
+
+`resolutions` is the mechanical trail — the disposition, the resolver and its version, the
+revision before and after. `events` is world history, and most resolutions produce none:
+progressing a siege by six hours is a real state change and not a thing the story
+remembers. Both are read-only, and there is deliberately no write counterpart to either;
+see [event-resolution.md](event-resolution.md#http-surface).
+
+Retrying an action is safe by construction. A turn is keyed by its `client_action_id` and a
+due scheduled event by its own id, so re-sending one resolves it once and replays the
+stored result — no second model call, no duplicate events, no clock advanced twice.
+
+None of them is a shortcut. Each goes through the same application service a real caller
+will use, so a paused world still refuses to advance and a state change is still checked
+against the property's policy, the world's rules and the session's revision. `admin`
+authority does not bypass the world's rules, and `story_director` sent to the mutation
+endpoint still reaches `OPEN` properties and nothing else. See
+[world-state-facts.md](world-state-facts.md).
+
+### Why that turn was slow
+
+```bash
+curl ".../dev/sessions/$S/llm-performance"
+```
+
+returns the recent generations for one session, the per-turn latency split, and a summary.
+The question it answers first is which half of the wait was the model:
+
+```text
+llm.turn session=... turn=1 total_ms=100139.2 story_ms=100082.6 app_ms=56.6 llm_calls=1
+```
+
+`GET /api/v1/dev/llm/performance` is the same thing across the whole process. Both are
+in-memory, bounded by `LLM_METRICS_BUFFER_SIZE`, lost on restart, and return **no prompts
+and no generated text** — token counts and durations only.
+
+The same records are logged, one line per generation, under `app.llm.performance`. They
+come out at WARNING when a call is slower than `LLM_SLOW_CALL_THRESHOLD_MS`, when it ended
+on its output budget, or when the prompt filled 90% of `OLLAMA_NUM_CTX`.
+
+To collect a full baseline rather than read one turn — cold-versus-warm load cost, prompt
+growth across turns, tokens per second — use the harness, against a throwaway database and
+a spare port so a running dev server is left alone:
+
+```bash
+.venv/Scripts/python.exe -m app.scripts.llm_baseline --api-url http://127.0.0.1:8011 --turns 3
+```
+
+[llm-performance-baseline.md](llm-performance-baseline.md#running-it) has the full
+procedure and the numbers Epic 1 measured.
 
 ### E2E
 

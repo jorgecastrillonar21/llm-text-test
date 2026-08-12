@@ -8,18 +8,60 @@ that boundary earns its keep: external AI systems and the database.
 ```text
 apps/api/app/
 ├── domain/           pure Python: enums, relationship rules, errors. No I/O, no ORM.
+│   ├── world_state/      the root: WorldStateV1, its version, its revision. Four
+│   │                     fields, and none of them a collection.
+│   ├── world_rules/      WorldRulesV1, its enums, presets, versioned parsing
+│   ├── world_time/       the simulation clock, calendar projection, scheduling
+│   ├── world_facts/      what is objectively true: values, properties, policy,
+│   │                     authority, mutations, world-rules compatibility
+│   ├── world_locations/  where places are: definitions, containment, connections,
+│   │                     per-session state, creation policy
+│   ├── character_position/ where an *actor* is: the four spatial shapes, and the
+│   │                     canonical answer to "where is the player?"
+│   ├── world_situations/ what the world is doing: ongoing processes, their lifecycle,
+│   │                     participants, causal parentage, progression arithmetic
+│   ├── resolution/       how the world is allowed to change: commands, the context a
+│   │                     resolver may see, outcomes, dispositions, event significance
+│   ├── vocabulary.py     the shared shape rules for subtypes, tags and metadata bags
+│   ├── state_mutations.py  the one batch that carries fact, spatial and situation changes
+│   └── situation_progression.py  what one progression pass decided, before it is written
 ├── application/      use cases, the AI contract, ports. Depends on domain only.
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
+│   ├── llm_metrics.py    what a generation cost: provider-neutral counts, durations,
+│   │                     derived rates, and the typed purpose it was called for
+│   ├── generation_policy.py  the output budget and context window per purpose, resolved
+│   │                     once so no adapter invents its own
 │   ├── ports.py          StoryGeneratorPort, ImageGeneratorPort (Protocols)
 │   ├── persistence.py    read/write DTOs + the persistence ports
 │   ├── context_builder.py  all retrieval policy, in one place
-│   └── turn_service.py   the turn use case
+│   ├── rules_projection.py WorldRules → the compact AI-facing view
+│   ├── world_state_service.py  composes the root and the four domains into one
+│   │                     read-only snapshot, at a requested scope
+│   ├── state_consistency.py  the cross-domain checks no single domain can make
+│   ├── turn_service.py   the turn use case
+│   ├── resolution_service.py  the one path from a Command to a committed change
+│   ├── resolvers.py      the registry: command kind → the resolver that calculates it
+│   ├── event_service.py  significance policy, sequencing, append-only event writes
+│   ├── narration_service.py  prose for an outcome that is already committed
+│   ├── time_service.py   the only writer of the simulation clock
+│   ├── state_service.py  the only writer of world facts and spatial state
+│   ├── spatial_service.py  the spatial graph, materialisation, place creation
+│   ├── position_service.py  the only writer of where an actor is
+│   ├── spatial_context.py  deterministic, scene-sized geography for the prompt
+│   ├── situation_service.py  starting, reading and progressing ongoing processes
+│   ├── situation_context.py  deterministic, scene-sized relevance for the prompt
+│   ├── fact_proposals.py reviewing what the Story Director claims is true
+│   ├── location_proposals.py reviewing the places it says the story found
+│   └── situation_proposals.py reviewing the processes it says began
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
-│   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
+│   ├── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
+│   ├── story/ollama.py     the only module that knows Ollama's JSON, including its
+│   │                     nanosecond durations and its `num_predict`/`num_ctx` options
+│   └── metrics/recorder.py  one log line per generation plus a bounded ring buffer
 ├── api/              HTTP adapter and composition: routers, DTOs, errors, DI
 ├── prompts/          version-controlled prompt files
-└── scripts/          seed_demo
+└── scripts/          seed_demo, llm_baseline
 ```
 
 Dependencies point inwards: `api → application → domain`. `infrastructure` implements
@@ -122,19 +164,54 @@ documents that requirement; the adapter satisfies it with a flush, and
 
 ## Persistence ports
 
-The turn use case reaches storage through three Protocols in
-`application/persistence.py`:
+Every use case reaches storage through a Protocol in `application/persistence.py`, and
+each one is exactly as wide as its job:
 
 | Port | Responsibility |
 |---|---|
 | `StoryContextReaderPort` | the reads that feed context assembly |
+| `WorldStateReaderPort` | every read a composed snapshot needs, and no write at all |
 | `TurnPersistencePort` | session/world lookups and every turn write |
 | `TurnUnitOfWorkPort` | `commit()` |
+| `SessionClockPort` | the simulation clock and its scheduled events |
+| `CharacterPositionPort` | reading and writing where an actor is, and nothing else |
+| `SpatialPort` | reading and growing the spatial graph, per-session state, positions |
+| `SituationPort` | reading and writing ongoing processes |
+| `StateStorePort` | facts, space and situations together — what one batch may touch |
+| `HistoryReaderPort` | reads over `game_events` |
+| `EventWriterPort` | `HistoryReaderPort` plus `add_event` — append, and nothing else |
+| `ResolutionReaderPort` | reads over `resolutions`, the mechanical trail |
+| `ResolutionStorePort` | everything one resolution may touch, behind one transaction |
+| `NarrationStorePort` | history, the resolution being narrated, and `commit()` |
 
-`TurnGatewayPort` composes all three. `build_story_context` takes only the reader —
-functions declare the narrowest port they need — while `execute_turn` takes the
-composite, because one transaction genuinely spans all three and splitting it into
-three arguments that must be the same object helps nobody.
+`TurnGatewayPort` composes `StoryContextReaderPort`, `TurnPersistencePort` and
+`ResolutionStorePort`. `build_story_context` takes only the reader — functions declare
+the narrowest port they need — while `execute_turn` takes the composite, because one
+transaction genuinely spans all three and splitting it into three arguments that must be
+the same object helps nobody.
+
+`EventWriterPort` has no update and no delete, in the Protocol and in the adapter. That
+absence is the enforcement of event immutability: a caller cannot rewrite history through
+a port that offers no verb for it. `NarrationStorePort` is narrow for the same reason in
+the opposite direction — narration runs after the resolution's transaction has closed, so
+it can read the verdict and write a message, and it cannot write a fact, an event, a
+mutation or the clock. See [event-resolution.md](event-resolution.md).
+
+`WorldStateReaderPort` is the mirror image: it can read all four state domains plus the
+clock and history, and it cannot write or commit anything. A snapshot is a projection, and
+a reader that could also mutate would invite the "read the world, fix it up, hand it back"
+shortcut the whole decomposition exists to prevent. Its base order matches
+`StoryContextReaderPort`'s, because both have to linearize when combined with a write port.
+See [world-state.md](world-state.md).
+
+`SessionClockPort` is deliberately outside that composite. A turn *reads* the clock and
+never moves it, so `advance_time` gets a port that reaches the clock, the scheduled
+events and the audit trail, and cannot touch the transcript or the relationships. The
+same adapter satisfies it, since both use cases run in one request's transaction. It
+carries the seam between reaching an event and executing it: `advance_time` marks what
+the clock passed `due` and stops, and `complete_scheduled_event` is a separate call the
+system that owns the work makes afterwards, in the same transaction as whatever the work
+changed. See [DUE is not PROCESSED](world-state-time.md#due-is-not-processed).
 
 Limits (`RECENT_MESSAGE_LIMIT`, `MEMORY_LIMIT`, `CHARACTER_LIMIT`) stay in the
 application: how much history is worth sending is policy, not storage. Ordering is
@@ -161,11 +238,80 @@ silently papered over.
   datetimes on write and returns timezone-aware UTC on read — SQLite has no native
   timezone support and would otherwise hand back naive values that break comparisons.
 - **Pragmas** per connection: `foreign_keys=ON`, `journal_mode=WAL`,
-  `synchronous=NORMAL`.
+  `synchronous=NORMAL`. Migrations are the one exception and run with `foreign_keys=OFF`:
+  SQLite cannot alter a column in place, so Alembic's batch mode rebuilds the table by
+  dropping it, and with enforcement on that DROP cascades away every child row. See
+  [world-state-time.md](world-state-time.md#persistence).
 - **Indexes** follow real access patterns: `(session_id, turn_index)` for transcripts,
   `(session_id, importance, created_at)` for memory retrieval.
 - **Check constraints** enforce `importance BETWEEN 1 AND 5` and the `-100..100`
   relationship range at the database level, in addition to application clamping.
+- **`worlds.rules_json`** stores a whole `WorldRulesV1` document in one JSON column
+  rather than a table per section. It is static configuration with no independent
+  lifecycle and no queries of its own, so relational decomposition would buy nothing and
+  cost every read a join. It is never treated as an arbitrary dictionary: everything in
+  and out goes through `parse_world_rules`, and a corrupt row fails loudly instead of
+  defaulting. See [world-rules.md](world-rules.md#persistence).
+- **`game_sessions.elapsed_minutes`** is the authoritative simulation clock, and the
+  only stored temporal value: the date, the hour and the part of the day are projected
+  from it on every read, so there is nothing that can disagree with it. `game_events`
+  carry `occurred_at` alongside `turn_index` and an `event_sequence` that is unique per
+  session, because everything in a turn usually shares a fictional minute and ordering
+  needs a real tiebreak. See [world-state-time.md](world-state-time.md).
+- **`world_facts`** holds one current value per subject and property, enforced by *two*
+  partial unique indexes split on `subject_id IS NULL`. A single index would not
+  constrain world-scoped facts at all, because SQL treats two NULLs as distinct — the
+  invariant would hold for characters and silently fail for the world. `kind` is
+  deliberately outside the key: including it would let one subject and property exist
+  once as `world_truth` and once as `gameplay_flag` with opposite values.
+  `source_event_id` is `ON DELETE SET NULL`, because provenance can decay and truth
+  cannot. See [world-state-facts.md](world-state-facts.md).
+- **`game_sessions` is the persisted `WorldState` root**, and it is four columns wide:
+  `world_state_version`, `session_id`, `state_revision` and `elapsed_minutes`. There is no
+  serialized world document. Facts, geography, situations, schedule and history each keep
+  their own tables, because each has its own indexes, lifecycle, foreign keys, invariants
+  and mutation paths — putting them in one JSON blob would rewrite the whole world to move
+  one lantern. `state_revision` is a third counter alongside `turn_index` and
+  `elapsed_minutes`, moving once per committed batch of state changes and never backwards;
+  none of the three can be computed from another. `world_state_version` is read on load and
+  an unknown value fails loudly rather than being coerced. See
+  [world-state.md](world-state.md).
+- **`worlds.initial_facts`** stores a world's starting facts as `SetFact` documents,
+  copied into each new session and never written back to during play.
+- **The five spatial tables** split along one line: `location_definitions`,
+  `location_connections` and `location_zones` belong to the *world* and are shared by
+  every save of it; `location_states` and `location_connection_states` belong to a
+  *session* and are not. Ten sessions read one Broken Crown and each keeps its own answer
+  to whether it is still standing. `origin_session_id` marks geography that gameplay
+  invented inside one save, and visibility is "template, or mine" -- a disjunction no
+  foreign key expresses, so every spatial query filters on it and the gateway is the only
+  place that filter is written. Containment is one nullable self-referencing column with
+  `ON DELETE SET NULL`, because losing a container must not delete what was inside it;
+  the acyclicity no database can enforce lives in `world_locations.hierarchy`. See
+  [world-state-locations.md](world-state-locations.md).
+- **`character_positions`** is the canonical answer to where an actor is: one row per
+  `(session_id, actor_kind, actor_id)`, enforced by a unique constraint, holding one of
+  four shapes — at a location, in transit, offstage, or unlocated. It is deliberately on
+  the actor's side of the relationship: `location_states` keeps no occupant list, because
+  two places could then both claim the same person and nothing would say which is right.
+  Location and connection ids are foreign keys validated against geography the session can
+  actually see, so a position cannot name somewhere that does not exist for it.
+  `game_sessions.current_location` survives as a free-text presentation field and seeds the
+  first position once at session creation; nothing reads it as authority afterwards. See
+  [world-state.md](world-state.md#where-the-player-is).
+- **`resolutions`** is one row per verdict: the disposition, the resolver and its version,
+  the revision before and after, and the idempotency key. `(session_id, idempotency_key)`
+  is **unique in the database**, not checked in Python — two concurrent retries of one
+  submission have to race and lose, and a check-then-insert would let both through.
+  Narration is deliberately not stored here; `messages.resolution_id` points back instead,
+  so regenerating a paragraph cannot disturb the mechanical audit trail.
+- **`game_events`** is significant history, not a log: `subtype` is an open string,
+  `category` is a closed enum because retrieval filters on it, and per-subtype policy
+  decides what is persisted at all and clamps proposed importance into a band. There is no
+  update path and no delete path anywhere — a correction is a new event pointing at the old
+  one with `caused_by_event_id`. `resolution_id` groups the events one verdict produced;
+  `(session_id, event_sequence)` is unique, which is what makes ordering total when a whole
+  turn shares one fictional minute. See [event-resolution.md](event-resolution.md).
 
 ## AI provider boundaries
 
@@ -180,6 +326,20 @@ mutable state.
 **Failures are visible.** When `STORY_PROVIDER=ollama`, a broken Ollama produces a 502
 naming the cause; it never falls back to the mock. Silent fallback would make a
 misconfiguration look like a working game with disappointing prose.
+
+**Generation options are resolved, not scattered.** `GenerationPolicy` in the application
+layer maps a typed `GenerationPurpose` to a `LlmGenerationBudget` (max output tokens,
+context window), and the adapter translates that into Ollama's `num_predict` and
+`num_ctx`. No `"num_predict": 256` appears anywhere in `infrastructure/`, and the
+application never learns that Ollama calls it that.
+
+**Performance measurement crosses the port in both directions.**
+`StoryGeneratorPort.generate_turn` returns a `TurnGenerationResult` carrying the
+`TurnGeneration` the game uses and an `LlmGenerationMetrics` nothing in the game reads.
+The adapter converts Ollama's response JSON into that provider-neutral record — the
+application never parses provider JSON, and the domain never sees a provider type at all.
+The mock returns deterministic metrics flagged `provider="mock"`, so the whole suite runs
+without an AI runtime. See [llm-performance-baseline.md](llm-performance-baseline.md).
 
 ## Design decisions
 

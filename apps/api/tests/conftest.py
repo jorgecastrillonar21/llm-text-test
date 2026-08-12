@@ -11,14 +11,18 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.ports import StoryGeneratorPort
+from app.application.rules_projection import project_world_rules
 from app.application.story_context import (
     PlayerContext,
     SessionContext,
     StoryContext,
+    TimeContext,
     WorldContext,
 )
 from app.config import ImageProvider, Settings, StoryProvider
 from app.domain.enums import Language
+from app.domain.world_rules import default_world_rules
+from app.domain.world_time import TimeOfDay
 from app.infrastructure.db.base import Base
 from app.infrastructure.db.engine import create_engine, create_session_factory
 from app.infrastructure.db.models import Character, World
@@ -80,9 +84,18 @@ def make_story_context():
                 setting="a town",
                 language=Language.EN,
             ),
+            world_rules=project_world_rules(default_world_rules()),
             player=PlayerContext(name="Rin", description=""),
             session=SessionContext(
                 id=uuid.uuid4(), title="s", current_location="", summary="", turn_index=0
+            ),
+            # Spelled out rather than projected, so the fixture states what a session
+            # at minute zero of a default world actually looks like.
+            time=TimeContext(
+                calendar_date="1 January, 1",
+                clock="08:00",
+                period=TimeOfDay.MORNING,
+                elapsed_since_start="0 minutes",
             ),
             player_action=action,
         )
@@ -132,6 +145,9 @@ class FailingStoryGenerator:
         self._error = error
 
     async def generate_turn(self, context: object) -> object:
+        raise self._error
+
+    async def narrate_outcome(self, context: object) -> object:
         raise self._error
 
     async def status(self) -> object:  # pragma: no cover - not exercised

@@ -5,6 +5,9 @@ dist-ssr/
 .vite/
 *.local
 .eslintcache
+# tsc's incremental cache. Machine-local and rewritten by every typecheck, so
+# tracking it means every build dirties the tree and every commit carries noise.
+*.tsbuildinfo
 
 # Playwright
 test-results/

@@ -189,6 +189,14 @@ It triggers on pushes to `master` and on pull requests. The push filter previous
 
 - [Architecture](docs/architecture.md) — modules, ports, request and turn lifecycles
 - [AI contract](docs/ai-contract.md) — `StoryContext`, `TurnGeneration`, semantics
+- [World rules](docs/world-rules.md) — how a universe is configured, and the presets
+- [WorldState](docs/world-state.md) — the root, the decomposition, snapshots, revisions
+- [Simulation time](docs/world-state-time.md) — the fictional clock, calendar, scheduling
+- [World facts](docs/world-state-facts.md) — objective truth, authority, state changes
+- [Locations](docs/world-state-locations.md) — places, containment, connections, spatial state
+- [Situations](docs/world-state-situations.md) — ongoing processes, lifecycle, progression
+- [Event / Resolution](docs/event-resolution.md) — how the world changes, and what it records
+- [LLM performance](docs/llm-performance-baseline.md) — token budgets, context window, keep-alive, and the measured baseline
 - [Development](docs/development.md) — workflows, migrations, testing, contract sync
 - [Mobile access](docs/mobile-access.md) — LAN, PWA, HTTPS, security
 - [Roadmap](docs/roadmap.md) — what comes next

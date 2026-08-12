@@ -11,10 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import register_exception_handlers
 from app.api.schemas import HealthResponse
+from app.api.v1 import dev
 from app.api.v1.router import api_router
 from app.config import Settings, get_settings
 from app.infrastructure.db.engine import create_engine, create_session_factory, verify_schema
 from app.infrastructure.images.factory import build_image_generator
+from app.infrastructure.metrics import InMemoryLlmMetricsRecorder
 from app.infrastructure.story.factory import build_story_generator
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_factory = create_session_factory(engine)
     app.state.story_generator = build_story_generator(settings)
     app.state.image_generator = build_image_generator(settings)
+    # One per application, because its buffer is the process's recent history. Built in
+    # lifespan alongside the providers rather than per request: a recorder rebuilt for
+    # each call would have nothing to remember.
+    app.state.llm_metrics_recorder = InMemoryLlmMetricsRecorder(
+        buffer_size=settings.llm_metrics_buffer_size,
+        slow_call_threshold_ms=settings.llm_slow_call_threshold_ms,
+    )
 
     if not await verify_schema(engine):
         logger.warning(
@@ -70,6 +79,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     register_exception_handlers(app)
     app.include_router(api_router)
+
+    # Mounted per application instance rather than folded into `api_router`, which is
+    # a module-level singleton: conditionally including a route into it would leak
+    # into every app built afterwards in the same process.
+    if resolved.dev_endpoints_enabled:
+        app.include_router(dev.router, prefix="/api/v1")
 
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health() -> HealthResponse:

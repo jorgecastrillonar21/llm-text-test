@@ -11,7 +11,9 @@ from app.api.schemas import ErrorResponse
 from app.domain.errors import (
     ImageGenerationError,
     NotFoundError,
+    StaleStateError,
     StoryGenerationError,
+    UnsupportedWorldStateVersionError,
     ValidationError,
 )
 
@@ -31,6 +33,28 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content=ErrorResponse(error="invalid_request", detail=str(exc)).model_dump(),
+        )
+
+    @app.exception_handler(StaleStateError)
+    async def _stale(_: Request, exc: StaleStateError) -> JSONResponse:
+        # 409, not 422: the request was fine, the world simply moved underneath it.
+        # The useful next step is re-read and retry, which is what a conflict means.
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=ErrorResponse(error="stale_state", detail=str(exc)).model_dump(),
+        )
+
+    @app.exception_handler(UnsupportedWorldStateVersionError)
+    async def _unreadable_state(_: Request, exc: UnsupportedWorldStateVersionError) -> JSONResponse:
+        # 500, not 422: the caller asked for a session this build cannot read, and the
+        # problem is the stored row rather than the request. Logged at error level
+        # because it means a newer build wrote this database.
+        logger.error("Unreadable WorldState version: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=ErrorResponse(
+                error="unsupported_world_state_version", detail=str(exc)
+            ).model_dump(),
         )
 
     @app.exception_handler(StoryGenerationError)

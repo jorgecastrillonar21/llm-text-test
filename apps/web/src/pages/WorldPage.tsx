@@ -5,6 +5,7 @@ import { useCharacters, useSessions, useWorld } from '@/api/hooks';
 import { Button, Card, EmptyState, Spinner } from '@/components/ui';
 import { CreateCharacterForm } from '@/features/characters/CreateCharacterForm';
 import { StartSessionForm } from '@/features/sessions/StartSessionForm';
+import { RulesSummary } from '@/features/worlds/RulesSummary';
 
 export function WorldPage() {
   const { worldId = '' } = useParams();
@@ -47,6 +48,8 @@ export function WorldPage() {
           <p className="prose-narration text-sm text-ink-200">{world.data.description}</p>
         ) : null}
       </header>
+
+      <RulesSummary worldId={worldId} />
 
       <section className="flex flex-col gap-3">
         <div className="flex items-center justify-between gap-4">

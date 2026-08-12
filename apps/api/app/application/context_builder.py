@@ -12,6 +12,7 @@ retrieval replaces the memory read in Phase 3; see docs/ai-contract.md.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 from app.application.persistence import (
     CharacterRecord,
@@ -20,21 +21,54 @@ from app.application.persistence import (
     TranscriptMessage,
     WorldSnapshot,
 )
+from app.application.rules_projection import project_world_rules
+from app.application.situation_context import build_situations_context
+from app.application.spatial_context import assemble_scene_context, resolve_scene
 from app.application.story_context import (
     CharacterContext,
+    EventContext,
+    FactContext,
+    HistoryContext,
     MemoryContext,
     MessageContext,
+    OutcomeContext,
     PlayerContext,
     RelationshipContext,
     SessionContext,
     StoryContext,
+    TimeContext,
     WorldContext,
+    WorldFactsContext,
 )
 from app.domain.enums import MessageRole
+from app.domain.resolution import GameEvent, Resolution, ResolutionOutcome
+from app.domain.world_facts import FactSubjectType, WorldFact
+from app.domain.world_time import describe_duration, project_time
 
 RECENT_MESSAGE_LIMIT = 20
 MEMORY_LIMIT = 30
 CHARACTER_LIMIT = 12
+
+FACT_LIMIT = 40
+"""How many established facts reach the prompt at all. A long session accumulates far
+more than this; the prompt has a budget and importance is what spends it."""
+
+CRITICAL_IMPORTANCE = 4
+"""At or above this, a fact is presented as something the scene must not contradict.
+Below it, as colour. The line is drawn here rather than in the domain because it is a
+prompt-shaping decision, and the domain's 1..5 scale has no opinion about prompts."""
+
+LANDMARK_IMPORTANCE = 4
+LANDMARK_EVENT_LIMIT = 8
+"""The heaviest events of the session, however long ago. Small on purpose: this band
+never expires, so every entry is a permanent charge against the prompt budget for the
+rest of the session."""
+
+RECENT_EVENT_IMPORTANCE = 2
+RECENT_EVENT_LIMIT = 12
+"""What has happened lately. Importance 1 is deliberately excluded: those are the
+events the policy kept because they might matter to a later system, not because a
+narrator needs them, and they are also the most numerous."""
 
 
 async def build_story_context(
@@ -50,24 +84,49 @@ async def build_story_context(
     messages = await reader.load_recent_messages(session.id, limit=RECENT_MESSAGE_LIMIT)
     memories = await reader.load_memories(session.id, limit=MEMORY_LIMIT)
     relationships = await reader.load_relationships(session.id)
+    facts = await reader.load_facts(session.id, limit=FACT_LIMIT)
+    history = await _load_history(reader, session=session)
+
+    # Resolved once and used three times: the spatial block walks the graph, situation
+    # relevance needs the current place and its containers to know what is happening
+    # *here*, and the session block takes its location name from the same answer. The
+    # place comes from the player's canonical position, by id.
+    placement = await resolve_scene(reader, session_id=session.id, world_id=world.id)
+    # None when the world has no geography, when nobody has written a position, or when
+    # the player is in transit or offstage.
+    space = await assemble_scene_context(reader, placement)
+
+    # None when nothing relevant is under way, which is also most turns.
+    situations = await build_situations_context(
+        reader,
+        session_id=session.id,
+        elapsed_minutes=session.elapsed_minutes,
+        location_index=placement.graph.index,
+        current_location=placement.current,
+        present_character_ids=[character.id for character in characters],
+    )
 
     return StoryContext(
-        world=WorldContext(
-            id=world.id,
-            name=world.name,
-            description=world.description,
-            genre=world.genre,
-            setting=world.setting,
-            language=world.language,
-        ),
+        world=_to_world_context(world),
+        # Projected, not passed whole: the director gets the rules that shape a turn,
+        # not the sections reserved for future deterministic systems.
+        world_rules=project_world_rules(world.rules),
         player=PlayerContext(name=session.player_name, description=session.player_description),
         session=SessionContext(
             id=session.id,
             title=session.title,
-            current_location=session.current_location,
+            # The canonical place's name, not the string on the session. A prompt that
+            # said "The Broken Crown" because somebody typed it, while the position said
+            # otherwise, would be the two-authorities bug wearing a nicer label.
+            current_location="" if placement.current is None else placement.current.name,
             summary=session.summary,
             turn_index=session.turn_index,
         ),
+        time=_to_time_context(session, world),
+        space=space,
+        situations=situations,
+        world_facts=_to_facts_context(facts, names, world.name),
+        history=history,
         relevant_characters=[_to_character_context(record) for record in characters],
         recent_messages=[_to_message_context(message, names) for message in messages],
         relevant_memories=[
@@ -82,16 +141,187 @@ async def build_story_context(
         relationships=[
             RelationshipContext(
                 character_id=relationship.character_id,
-                character_name=names.get(relationship.character_id, "Unknown"),
+                character_name=names[relationship.character_id],
                 trust=relationship.trust,
                 affection=relationship.affection,
                 respect=relationship.respect,
                 fear=relationship.fear,
             )
+            # Only for characters the context actually describes. This was the one read
+            # here whose size followed the campaign rather than a limit: a session
+            # accumulates a relationship row per character it ever met, and a long one in
+            # a large world would have sent hundreds of vectors attached to names the
+            # prompt never introduced. `CHARACTER_LIMIT` now bounds this too.
             for relationship in relationships
+            if relationship.character_id in names
         ],
         player_action=player_action,
     )
+
+
+def build_outcome_context(
+    *,
+    session: SessionSnapshot,
+    world: WorldSnapshot,
+    resolution: Resolution,
+    events: Sequence[GameEvent],
+    outcome: ResolutionOutcome | None = None,
+) -> OutcomeContext:
+    """The context for narrating something the game has already committed.
+
+    Synchronous, and that is the shape of the job: everything here was read by the
+    caller inside the transaction that committed the outcome, or read back from the
+    record afterwards. There is no retrieval policy to apply because there is nothing
+    left to decide -- a narrator that needed the world's facts, its geography and its
+    relationships to describe one outcome would be deciding what the outcome was.
+
+    `outcome` is the resolver's own account, present when narration follows resolution
+    in the same request and absent when a stored resolution is narrated later. Absent is
+    not a degraded case: the disposition, the reason and what history recorded are the
+    parts that are *authoritative*, and they come from the database either way.
+    """
+    return OutcomeContext(
+        world=_to_world_context(world),
+        player=PlayerContext(name=session.player_name, description=session.player_description),
+        # The clock as it stands now, not as it stood when the outcome was resolved.
+        # Narration describes a moment the story has already reached.
+        time=_to_time_context(session, world),
+        disposition=resolution.disposition,
+        reason_code=resolution.reason_code,
+        resolver=resolution.resolver_name,
+        events=[_to_event_context(event, session) for event in events],
+        detail=dict(outcome.narrative_context) if outcome is not None else {},
+    )
+
+
+def _to_world_context(world: WorldSnapshot) -> WorldContext:
+    return WorldContext(
+        id=world.id,
+        name=world.name,
+        description=world.description,
+        genre=world.genre,
+        setting=world.setting,
+        language=world.language,
+    )
+
+
+def _to_time_context(session: SessionSnapshot, world: WorldSnapshot) -> TimeContext:
+    """Derived on every read from the one number that is stored. There is no cached
+    "current date" anywhere for this to disagree with."""
+    now = project_time(session.elapsed_minutes, initial=world.initial_datetime)
+    return TimeContext(
+        calendar_date=now.calendar_date,
+        clock=now.clock,
+        period=now.period,
+        elapsed_since_start=now.elapsed_since_start,
+    )
+
+
+async def _load_history(
+    reader: StoryContextReaderPort, *, session: SessionSnapshot
+) -> HistoryContext:
+    """The bounded slice of history the director is shown.
+
+    Two reads, not one: "the eight heaviest things that ever happened" and "the twelve
+    most recent things that mattered" are different questions, and a single ordering
+    cannot answer both. Sorting by importance buries what just happened under year one;
+    sorting by recency loses the war the story is about the moment a quiet evening
+    produces twelve events.
+
+    Bounded by construction -- at most `LANDMARK_EVENT_LIMIT + RECENT_EVENT_LIMIT` rows
+    reach the prompt no matter how long the session runs, and no query here is unbounded
+    even before the limit applies. Deliberately not implemented: any form of semantic or
+    embedding-based event retrieval. That is a Phase 3 concern; this is importance and
+    recency, and it is meant to stay legible.
+    """
+    landmarks = await reader.load_events(
+        session.id, min_importance=LANDMARK_IMPORTANCE, limit=LANDMARK_EVENT_LIMIT
+    )
+    recent = await reader.load_events(
+        session.id, min_importance=RECENT_EVENT_IMPORTANCE, limit=RECENT_EVENT_LIMIT
+    )
+    landmark_ids = {event.id for event in landmarks}
+    return HistoryContext(
+        # Reversed: the port returns most recent first because that is what retrieval
+        # wants, and a prompt reads forwards because that is what a story does.
+        landmarks=[_to_event_context(event, session) for event in reversed(landmarks)],
+        recent=[
+            _to_event_context(event, session)
+            for event in reversed(recent)
+            if event.id not in landmark_ids
+        ],
+    )
+
+
+def _to_event_context(event: GameEvent, session: SessionSnapshot) -> EventContext:
+    return EventContext(
+        summary=event.summary,
+        kind=event.subtype or event.category.value,
+        when=_when(event.occurred_at, session.elapsed_minutes),
+    )
+
+
+def _when(occurred_at: int, now: int) -> str:
+    """`"3 hours, 20 minutes ago"`. Relative, because that is what a scene needs.
+
+    An absolute minute would be the honest number and the useless one: the director is
+    given the fictional date and clock for *now* and nothing to subtract from it, and a
+    model asked to do that arithmetic gets it wrong in a way that reads as a continuity
+    error. Clamped at zero -- an event from the future is a bug elsewhere, and phrasing
+    it as "in 40 minutes" would launder that bug into the prose.
+    """
+    elapsed = max(0, now - occurred_at)
+    if elapsed == 0:
+        return "just now"
+    return f"{describe_duration(elapsed)} ago"
+
+
+def _to_facts_context(
+    facts: list[WorldFact], names: dict[uuid.UUID, str], world_name: str
+) -> WorldFactsContext:
+    """Split the loaded facts by importance and give each one a readable subject.
+
+    Gameplay flags are included: `palace_secret_discovered` is not a sentence anyone in
+    the world would say, but a director that does not know the secret is out will write
+    a scene where it is still a secret.
+    """
+    critical: list[FactContext] = []
+    relevant: list[FactContext] = []
+    for fact in facts:
+        entry = FactContext(
+            subject=_subject_label(fact, names, world_name),
+            property=fact.property,
+            value=_render_value(fact.value),
+        )
+        bucket = critical if fact.importance >= CRITICAL_IMPORTANCE else relevant
+        bucket.append(entry)
+    return WorldFactsContext(critical=critical, relevant=relevant)
+
+
+def _subject_label(fact: WorldFact, names: dict[uuid.UUID, str], world_name: str) -> str:
+    """A name a sentence could use.
+
+    Falls back to the subject type when an id resolves to nothing -- a character the
+    context did not load, or an entity type with no table yet. Never the bare uuid: an
+    id the model cannot use is an id it should not be shown.
+    """
+    if fact.subject.type is FactSubjectType.WORLD:
+        return world_name
+    if fact.subject.id is not None and fact.subject.id in names:
+        return names[fact.subject.id]
+    return f"an unnamed {fact.subject.type.value}"
+
+
+def _render_value(value: object) -> str:
+    if isinstance(value, bool):  # Before the list branch, and before str(): bool is int.
+        return "yes" if value else "no"
+    if value is None:
+        return "none"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "nothing"
+    if isinstance(value, dict):
+        return ", ".join(f"{key}: {item}" for key, item in value.items())
+    return str(value)
 
 
 def _to_character_context(record: CharacterRecord) -> CharacterContext:
