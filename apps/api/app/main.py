@@ -16,6 +16,7 @@ from app.api.v1.router import api_router
 from app.config import Settings, get_settings
 from app.infrastructure.db.engine import create_engine, create_session_factory, verify_schema
 from app.infrastructure.images.factory import build_image_generator
+from app.infrastructure.metrics import InMemoryLlmMetricsRecorder
 from app.infrastructure.story.factory import build_story_generator
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_factory = create_session_factory(engine)
     app.state.story_generator = build_story_generator(settings)
     app.state.image_generator = build_image_generator(settings)
+    # One per application, because its buffer is the process's recent history. Built in
+    # lifespan alongside the providers rather than per request: a recorder rebuilt for
+    # each call would have nothing to remember.
+    app.state.llm_metrics_recorder = InMemoryLlmMetricsRecorder(
+        buffer_size=settings.llm_metrics_buffer_size,
+        slow_call_threshold_ms=settings.llm_slow_call_threshold_ms,
+    )
 
     if not await verify_schema(engine):
         logger.warning(

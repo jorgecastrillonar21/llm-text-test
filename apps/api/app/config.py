@@ -49,7 +49,39 @@ class Settings(BaseSettings):
     # system prompt and the world/character definitions -- without reporting it.
     # A full context at the current retrieval caps measures ~6.7k tokens, so 4096
     # silently discards roughly two thirds of it and every world reads the same.
+    #
+    # This is also the *context window* in the provider-neutral sense: it is the number
+    # `prompt_context_utilization` is measured against. Raising it costs memory and, on
+    # a machine where that pushes layers off the GPU, throughput -- so it is set here
+    # rather than defaulted to whatever the model claims to support.
     ollama_num_ctx: int = Field(default=8192, ge=512)
+
+    # How long Ollama keeps the model resident after a request. Empty means "send
+    # nothing and let Ollama use its own default", which is 5 minutes at the time of
+    # writing -- long enough for a turn, short enough that a player who steps away pays
+    # the load cost again on their next action. `30m` suits an active playthrough; `-1`
+    # keeps it resident indefinitely and is a real memory commitment, not a free speedup.
+    # Watch `load_ms` in the metrics to see whether this is costing you anything.
+    ollama_keep_alive: str = ""
+
+    # Output budgets, in tokens. See app/application/generation_policy.py for why these
+    # differ: a turn is a structured JSON document and a narration is one paragraph.
+    story_max_output_tokens: int = Field(default=1024, gt=0)
+    narration_max_output_tokens: int = Field(default=320, gt=0)
+
+    # Streaming exists in the Ollama adapter and is off by default. Its only benefit in
+    # this build is `time_to_first_token_ms`, because output is schema-constrained JSON
+    # that nothing can usefully display half-decoded. Turning it on changes the transport
+    # of the main path, so it stays opt-in until something consumes the chunks.
+    ollama_streaming_enabled: bool = False
+
+    # Above this, a generation is logged as slow. Diagnostic only: nothing in the game
+    # behaves differently, and a slow call is still a completed call.
+    llm_slow_call_threshold_ms: float = Field(default=30_000.0, gt=0)
+
+    # How many recent generation records the in-process diagnostics buffer keeps. Small
+    # on purpose -- this is a developer's recent history, not a metrics store.
+    llm_metrics_buffer_size: int = Field(default=200, ge=1, le=5_000)
 
     image_provider: ImageProvider = ImageProvider.DISABLED
     comfyui_base_url: str = "http://127.0.0.1:8188"

@@ -38,6 +38,7 @@ from app.application.persistence import (
     TranscriptMessage,
     WorldSnapshot,
 )
+from app.application.ports import TurnGenerationResult
 from app.application.story_context import StoryContext
 from app.application.turn_service import execute_turn
 from app.domain.character_position import ActorKind
@@ -587,9 +588,9 @@ class RecordingGenerator:
         self._generation = generation
         self.seen: StoryContext | None = None
 
-    async def generate_turn(self, context: StoryContext) -> TurnGeneration:
+    async def generate_turn(self, context: StoryContext) -> TurnGenerationResult:
         self.seen = context
-        return self._generation
+        return TurnGenerationResult(generation=self._generation)
 
     async def status(self) -> object:  # pragma: no cover - not exercised
         raise NotImplementedError
@@ -598,7 +599,7 @@ class RecordingGenerator:
 class ExplodingGenerator:
     name = "exploding"
 
-    async def generate_turn(self, context: StoryContext) -> TurnGeneration:
+    async def generate_turn(self, context: StoryContext) -> TurnGenerationResult:
         raise RuntimeError("provider exploded")
 
     async def status(self) -> object:  # pragma: no cover - not exercised

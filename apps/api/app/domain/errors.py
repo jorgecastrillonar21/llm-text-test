@@ -108,12 +108,38 @@ class StoryGenerationError(DomainError):
     Never raised to hide a configuration problem: the message always names the
     concrete cause so a misconfigured Ollama is visible rather than silently
     downgraded to the mock provider.
+
+    It also carries enough to be *measured*. A failure that took ninety seconds to
+    time out is a different operational fact from one that was refused in twelve
+    milliseconds, and an epic that starts failing half its calls should show up in the
+    performance record rather than only in the log. The fields are plain scalars on
+    purpose: the domain describes what went wrong, and the application composes that
+    into an `LlmGenerationMetrics` -- it does not learn about metrics to do it.
+
+    No token counts, ever. A failed call generated nothing, and a zero here would
+    average into throughput figures as though the model had produced zero tokens
+    quickly.
     """
 
-    def __init__(self, message: str, *, provider: str, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        retryable: bool = False,
+        model: str | None = None,
+        error_code: str | None = None,
+        elapsed_ms: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.provider = provider
         self.retryable = retryable
+        self.model = model
+        self.error_code = error_code
+        """Short and stable -- `connect_error`, `timeout`, `http_502`, `invalid_json`.
+        Safe to log and to group by, unlike the message, which can quote a response
+        body that may contain part of the prompt."""
+        self.elapsed_ms = elapsed_ms
 
 
 class ImageGenerationError(DomainError):

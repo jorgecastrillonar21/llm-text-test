@@ -11,6 +11,7 @@ without needing a model.
 from __future__ import annotations
 
 import hashlib
+import uuid
 from dataclasses import dataclass
 
 from app.application.contracts import (
@@ -22,7 +23,12 @@ from app.application.contracts import (
     VisualCue,
     WorldEvent,
 )
-from app.application.ports import ProviderStatus
+from app.application.llm_metrics import (
+    GenerationDoneReason,
+    GenerationPurpose,
+    LlmGenerationMetrics,
+)
+from app.application.ports import OutcomeNarrationResult, ProviderStatus, TurnGenerationResult
 from app.application.story_context import CharacterContext, OutcomeContext, StoryContext
 from app.domain.enums import Language, MemoryKind
 from app.domain.resolution import EventCategory, ResolutionDisposition
@@ -73,6 +79,17 @@ _HOSTILE = (
     "rob",
     "traicion",
 )
+
+
+def _word_tokens(text: str) -> int:
+    """A stand-in token count, not a tokenizer.
+
+    Whitespace-delimited words, which real tokenizers exceed by roughly a third. It is
+    here so the mock's records have plausibly-shaped numbers rather than zeros; nothing
+    is allowed to treat it as a measurement, which is what `provider_metrics_available`
+    exists to say.
+    """
+    return len(text.split())
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +156,7 @@ class MockStoryGenerator:
 
     name = "mock"
 
-    async def generate_turn(self, context: StoryContext) -> TurnGeneration:
+    async def generate_turn(self, context: StoryContext) -> TurnGenerationResult:
         phrases = _PHRASES[context.world.language]
         action = context.player_action.strip()
         lowered = action.lower()
@@ -200,7 +217,7 @@ class MockStoryGenerator:
             )
 
         who = speaker.name if speaker else context.world.name
-        return TurnGeneration(
+        generation = TurnGeneration(
             narration=narration,
             dialogue=dialogue,
             suggested_actions=[
@@ -213,8 +230,16 @@ class MockStoryGenerator:
             world_events=events,
             visual_cue=VisualCue(generate=False, reason="Mock provider does not request images."),
         )
+        return TurnGenerationResult(
+            generation=generation,
+            metrics=self._metrics(
+                GenerationPurpose.STORY_TURN,
+                session_id=context.session.id,
+                generated_tokens=_word_tokens(narration),
+            ),
+        )
 
-    async def narrate_outcome(self, context: OutcomeContext) -> OutcomeNarration:
+    async def narrate_outcome(self, context: OutcomeContext) -> OutcomeNarrationResult:
         """One sentence per disposition, plus whatever history kept.
 
         Rule-based like everything else here, and it honours the three dispositions
@@ -236,13 +261,50 @@ class MockStoryGenerator:
                     summaries="; ".join(event.summary for event in context.events)
                 )
             )
-        return OutcomeNarration(narration=" ".join(sentences))
+        narration = " ".join(sentences)
+        return OutcomeNarrationResult(
+            narration=OutcomeNarration(narration=narration),
+            metrics=self._metrics(
+                GenerationPurpose.OUTCOME_NARRATION,
+                session_id=None,
+                generated_tokens=_word_tokens(narration),
+            ),
+        )
 
     async def status(self) -> ProviderStatus:
         return ProviderStatus(
             provider=self.name,
             state="ready",
             detail="Deterministic mock provider. No AI runtime is used.",
+        )
+
+    def _metrics(
+        self,
+        purpose: GenerationPurpose,
+        *,
+        session_id: uuid.UUID | None,
+        generated_tokens: int,
+    ) -> LlmGenerationMetrics:
+        """Metrics that are honest about being a mock's.
+
+        `provider_metrics_available=False` is the load-bearing field: everything else here
+        is derived from string lengths, and a consumer that averaged these into a
+        performance baseline would be reporting how fast Python concatenates strings. The
+        flag lets the diagnostics endpoint and the baseline script exclude them, and lets
+        a developer looking at a suspiciously fast number see immediately why.
+
+        Deterministic, because that is the whole contract of this provider: same context,
+        same turn, same numbers. No timings are reported at all rather than reported as
+        zero -- zero milliseconds is a measurement, and this is the absence of one.
+        """
+        return LlmGenerationMetrics(
+            provider=self.name,
+            model="mock",
+            purpose=purpose,
+            session_id=session_id,
+            provider_metrics_available=False,
+            generated_tokens=generated_tokens,
+            done_reason=GenerationDoneReason.STOP,
         )
 
     def _pick_speaker(self, context: StoryContext) -> CharacterContext | None:

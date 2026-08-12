@@ -28,6 +28,10 @@ apps/api/app/
 ├── application/      use cases, the AI contract, ports. Depends on domain only.
 │   ├── contracts.py      TurnGeneration and friends — what a model may return
 │   ├── story_context.py  StoryContext — what a model is allowed to see
+│   ├── llm_metrics.py    what a generation cost: provider-neutral counts, durations,
+│   │                     derived rates, and the typed purpose it was called for
+│   ├── generation_policy.py  the output budget and context window per purpose, resolved
+│   │                     once so no adapter invents its own
 │   ├── ports.py          StoryGeneratorPort, ImageGeneratorPort (Protocols)
 │   ├── persistence.py    read/write DTOs + the persistence ports
 │   ├── context_builder.py  all retrieval policy, in one place
@@ -51,10 +55,13 @@ apps/api/app/
 │   ├── location_proposals.py reviewing the places it says the story found
 │   └── situation_proposals.py reviewing the processes it says began
 ├── infrastructure/   adapters: SQLAlchemy models, Ollama, ComfyUI, prompt loading
-│   └── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
+│   ├── db/turn_gateway.py  SQLAlchemy implementation of the persistence ports
+│   ├── story/ollama.py     the only module that knows Ollama's JSON, including its
+│   │                     nanosecond durations and its `num_predict`/`num_ctx` options
+│   └── metrics/recorder.py  one log line per generation plus a bounded ring buffer
 ├── api/              HTTP adapter and composition: routers, DTOs, errors, DI
 ├── prompts/          version-controlled prompt files
-└── scripts/          seed_demo
+└── scripts/          seed_demo, llm_baseline
 ```
 
 Dependencies point inwards: `api → application → domain`. `infrastructure` implements
@@ -319,6 +326,20 @@ mutable state.
 **Failures are visible.** When `STORY_PROVIDER=ollama`, a broken Ollama produces a 502
 naming the cause; it never falls back to the mock. Silent fallback would make a
 misconfiguration look like a working game with disappointing prose.
+
+**Generation options are resolved, not scattered.** `GenerationPolicy` in the application
+layer maps a typed `GenerationPurpose` to a `LlmGenerationBudget` (max output tokens,
+context window), and the adapter translates that into Ollama's `num_predict` and
+`num_ctx`. No `"num_predict": 256` appears anywhere in `infrastructure/`, and the
+application never learns that Ollama calls it that.
+
+**Performance measurement crosses the port in both directions.**
+`StoryGeneratorPort.generate_turn` returns a `TurnGenerationResult` carrying the
+`TurnGeneration` the game uses and an `LlmGenerationMetrics` nothing in the game reads.
+The adapter converts Ollama's response JSON into that provider-neutral record — the
+application never parses provider JSON, and the domain never sees a provider type at all.
+The mock returns deterministic metrics flagged `provider="mock"`, so the whole suite runs
+without an AI runtime. See [llm-performance-baseline.md](llm-performance-baseline.md).
 
 ## Design decisions
 

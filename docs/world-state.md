@@ -203,6 +203,19 @@ narrative memory: nothing in the prompt has any use for a resolver version. A
 `ScheduledEvent` is not a fact: "the roof collapses in ninety minutes" is a commitment,
 and it is false right up until it isn't.
 
+And one more that is none of the above:
+
+```text
+PROCESS TELEMETRY     what a generation cost     LlmGenerationMetrics (no table)
+```
+
+`LlmGenerationMetrics` is superficially the nearest thing to a `GameEvent` — append-only,
+timestamped, session-scoped — and it has no authority whatsoever. It records that the
+machine took 99 seconds and read 5409 tokens; nothing about the world changed because of
+it. It **never moves the revision**, is never written as a `GameEvent` or a memory, is
+never persisted at all (a bounded in-process buffer and a log line), and never enters
+`StoryContext`. See [llm-performance-baseline.md](llm-performance-baseline.md#metrics-are-not-game-state).
+
 ## Three counters, none derived from another
 
 ```text

@@ -156,14 +156,41 @@ true:
 Deliberately absent, still: Character Foundation, `CharacterSheet`, the travel engine, the
 World Simulation Scheduler, NPC autonomy, factions, knowledge and perception.
 
+## Phase 1.13 — LLM runtime baseline and output budgeting ✅
+
+The last of the World Foundation work, and the only phase that adds no gameplay. Local
+generation was the slowest thing here by three orders of magnitude and nothing measured it,
+so "the turn was slow" had no next question. Now every generation reports what it read,
+what it wrote, how long each part took, whether it hit its budget and why it was called at
+all — as a provider-neutral record the adapter builds and the game never reads.
+
+Output is bounded in **tokens** by an explicit `GenerationPolicy` per typed purpose, so no
+`num_predict` is hidden in infrastructure code. Turn latency is split into model time and
+application time at the use-case boundary. Metrics are deliberately *not* game state: no
+table, no migration, no revision bump, and never sent back to a model.
+
+The measurement that matters is prompt size, because it is the thing later foundations can
+break. Over 16 turns it went 5414 → 6430 tokens, and — the part that matters — the slope
+fell from ~104 tokens/turn to ~30 at turn 10, where the transcript cap begins evicting. The
+prompt tracks the caps rather than the campaign, and the rule going forward is that a new
+foundation must earn its way into `StoryContext` with a bounded projection or stay out.
+
+It also produced an uncomfortable number worth keeping: on a 4 GB laptop GPU that fits 43%
+of a 7B model, a turn takes 66–218 seconds — median 137 over a long run — of which the
+application layer accounts for 31–93 **milliseconds**. See
+[llm-performance-baseline.md](llm-performance-baseline.md#epic-1-baseline-measured).
+
+Deliberately absent: any optimization made without a measurement, a metrics database,
+distributed telemetry, GPU inspection, automatic model selection, and UI streaming.
+
 ## Phase 2 — Narrative quality
 
 The highest-value work. The system runs; the writing is what makes it worth playing.
 
 - Rolling session summaries so `session.summary` stops being empty and old turns still
   matter.
-- Token/context budgeting — measure the real prompt size and trim by value rather than
-  by fixed counts.
+- Token/context budgeting — the real prompt size is now measured (Phase 1.13); what
+  remains is trimming by *value* rather than by the fixed per-slice counts.
 - Prompt iteration against saved transcripts; record prompt version per turn.
 - NPC-specific knowledge: what a character has actually witnessed, rather than handing
   every character the whole context.

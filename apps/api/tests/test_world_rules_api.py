@@ -13,7 +13,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.contracts import TurnGeneration
+from app.application.ports import TurnGenerationResult
 from app.application.story_context import StoryContext
 from app.domain.errors import InvalidWorldRulesError
 from app.domain.world_rules import (
@@ -37,7 +37,7 @@ class RecordingStoryGenerator:
         self._inner = MockStoryGenerator()
         self.contexts: list[StoryContext] = []
 
-    async def generate_turn(self, context: StoryContext) -> TurnGeneration:
+    async def generate_turn(self, context: StoryContext) -> TurnGenerationResult:
         self.contexts.append(context)
         return await self._inner.generate_turn(context)
 

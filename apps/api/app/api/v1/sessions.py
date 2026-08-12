@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.api.deps import (
     DbSession,
+    LlmMetrics,
     NarrationStore,
     StoryGen,
     TurnGateway,
@@ -269,7 +270,11 @@ def _requested_subject(
 
 @router.post("/sessions/{session_id}/turns", response_model=TurnResponse)
 async def submit_turn(
-    session_id: uuid.UUID, payload: TurnRequest, gateway: TurnGateway, generator: StoryGen
+    session_id: uuid.UUID,
+    payload: TurnRequest,
+    gateway: TurnGateway,
+    generator: StoryGen,
+    metrics: LlmMetrics,
 ) -> TurnResponse:
     """Run one turn. Atomic: a provider failure rolls the whole turn back.
 
@@ -284,6 +289,7 @@ async def submit_turn(
         action=payload.action,
         generator=generator,
         client_action_id=payload.client_action_id,
+        recorder=metrics,
     )
     return TurnResponse.model_validate(result.model_dump())
 
@@ -349,6 +355,7 @@ async def narrate_resolution_endpoint(
     payload: NarrationRequest,
     store: NarrationStore,
     generator: StoryGen,
+    metrics: LlmMetrics,
 ) -> NarrationResponse:
     """Get -- or retry, or regenerate -- the prose describing a committed resolution.
 
@@ -366,5 +373,6 @@ async def narrate_resolution_endpoint(
         session_id=session_id,
         resolution_id=resolution_id,
         regenerate=payload.regenerate,
+        recorder=metrics,
     )
     return NarrationResponse.model_validate(result.model_dump())

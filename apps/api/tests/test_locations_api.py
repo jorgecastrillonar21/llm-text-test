@@ -14,6 +14,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.application.contracts import TurnGeneration
+from app.application.ports import TurnGenerationResult
 
 
 async def _world(client: AsyncClient, name: str = "W") -> dict:
@@ -54,8 +55,8 @@ class _Generator:
     def __init__(self, generation: TurnGeneration) -> None:
         self._generation = generation
 
-    async def generate_turn(self, context: object) -> TurnGeneration:
-        return self._generation
+    async def generate_turn(self, context: object) -> TurnGenerationResult:
+        return TurnGenerationResult(generation=self._generation)
 
     async def status(self) -> object:  # pragma: no cover - not exercised
         raise NotImplementedError

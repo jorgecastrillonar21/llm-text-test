@@ -1,5 +1,5 @@
 ---
-version: 7
+version: 8
 name: story_director
 ---
 
@@ -162,3 +162,5 @@ Schema keys and enum values (`episodic`, `fact`, ...) always remain in English.
 # Output
 
 Return only an object matching the provided JSON schema. No prose outside it, no markdown fences, no commentary. Use `character_id` values exactly as supplied in the context; use `null` for anyone not in that list.
+
+The whole object has a length budget, and it is spent in order: narration, dialogue, then the lists. Run out and the document is cut off mid-token — not shortened but broken, and the turn fails outright rather than arriving brief. So keep the narration to the moment in front of you and leave the optional lists empty unless this turn genuinely earned an entry. Every rule above that says "most turns produce zero or one" is also what keeps the answer inside its budget.

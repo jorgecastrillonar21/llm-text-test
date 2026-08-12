@@ -196,6 +196,7 @@ It triggers on pushes to `master` and on pull requests. The push filter previous
 - [Locations](docs/world-state-locations.md) — places, containment, connections, spatial state
 - [Situations](docs/world-state-situations.md) — ongoing processes, lifecycle, progression
 - [Event / Resolution](docs/event-resolution.md) — how the world changes, and what it records
+- [LLM performance](docs/llm-performance-baseline.md) — token budgets, context window, keep-alive, and the measured baseline
 - [Development](docs/development.md) — workflows, migrations, testing, contract sync
 - [Mobile access](docs/mobile-access.md) — LAN, PWA, HTTPS, security
 - [Roadmap](docs/roadmap.md) — what comes next

@@ -27,15 +27,23 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Query, status
 
-from app.api.deps import ResolutionStore, SessionClock, WorldStateReader, WorldStateStore
+from app.api.deps import (
+    LlmMetricsReader,
+    ResolutionStore,
+    SessionClock,
+    WorldStateReader,
+    WorldStateStore,
+)
 from app.api.schemas import (
+    LlmPerformanceResponse,
     ResolutionResponse,
     ScheduledEventCreate,
     SituationProgressRequest,
     StateChangeRequest,
 )
+from app.application.llm_metrics import summarize_generations
 from app.application.persistence import ScheduledEventRecord
 from app.application.resolution_service import ResolutionRequest, resolve
 from app.application.state_consistency import ConsistencyReport, check_state_consistency
@@ -56,6 +64,10 @@ from app.domain.resolution import ProgressSituationCommand, ResolutionSourceType
 from app.domain.world_time import TimeAdvanceRequest, TimeAdvanceResult
 
 router = APIRouter(prefix="/dev", tags=["dev"])
+
+LLM_PERFORMANCE_PAGE_LIMIT = 50
+"""Bound on the diagnostics endpoints. Smaller than the buffer, because a response is
+something a human reads and fifty records already covers a long play session."""
 
 
 @router.post("/sessions/{session_id}/advance-time", response_model=TimeAdvanceResult)
@@ -255,4 +267,59 @@ async def progress_session_situation(
         scheduled_event_ids=result.scheduled_event_ids,
         completed_scheduled_event_id=result.completed_scheduled_event_id,
         narrative_context=dict(result.outcome.narrative_context) if result.outcome else {},
+    )
+
+
+@router.get("/llm/performance", response_model=LlmPerformanceResponse)
+async def llm_performance(
+    metrics: LlmMetricsReader,
+    limit: int = Query(default=LLM_PERFORMANCE_PAGE_LIMIT, ge=1, le=LLM_PERFORMANCE_PAGE_LIMIT),
+) -> LlmPerformanceResponse:
+    """Recent LLM generations across the process, most recent first.
+
+    The answer to "why was that turn slow", without a debugger and without a metrics
+    platform. Read `total_ms` against `load_ms`: a large `load_ms` means the model was
+    not resident and the next call will be far faster. Read `prompt_tokens` against
+    `configured_context_window` -- if `prompt_context_utilization` is climbing toward 1.0
+    across a session, the prompt is growing faster than it should be and the retrieval
+    caps in `context_builder` are the place to look. Read `output_budget_reached`: for a
+    schema-constrained turn that means truncated JSON, not a shorter story.
+
+    In-process and bounded, so it resets on restart and holds only the last
+    `LLM_METRICS_BUFFER_SIZE` records. That is the intended lifetime -- this is a
+    developer's recent history, not a metrics store.
+
+    Everything here is a technical record. Nothing in it is part of any world's state,
+    nothing here moved a `state_revision`, and none of it is ever fed back to a model.
+    """
+    records = metrics.recent_generations(limit=limit)
+    return LlmPerformanceResponse(
+        summary=summarize_generations(records),
+        generations=records,
+        turns=metrics.recent_turns(limit=limit),
+    )
+
+
+@router.get("/sessions/{session_id}/llm-performance", response_model=LlmPerformanceResponse)
+async def session_llm_performance(
+    session_id: uuid.UUID,
+    metrics: LlmMetricsReader,
+    limit: int = Query(default=LLM_PERFORMANCE_PAGE_LIMIT, ge=1, le=LLM_PERFORMANCE_PAGE_LIMIT),
+) -> LlmPerformanceResponse:
+    """The same records, narrowed to one save.
+
+    The more useful of the two in practice: prompt growth is a per-session property --
+    it tracks that session's history, geography and facts -- and a process-wide view
+    mixes three campaigns together and hides it.
+
+    Not validated against the session table on purpose. This reads a buffer, not the
+    database; an unknown or deleted session simply has no records, and a 404 here would
+    mean "nothing generated yet" as often as it meant "no such session".
+    """
+    records = metrics.recent_generations(limit=limit, session_id=session_id)
+    return LlmPerformanceResponse(
+        summary=summarize_generations(records),
+        generations=records,
+        turns=metrics.recent_turns(limit=limit, session_id=session_id),
+        session_id=session_id,
     )

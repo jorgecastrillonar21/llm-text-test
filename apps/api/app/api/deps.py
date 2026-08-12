@@ -22,9 +22,10 @@ from app.application.persistence import (
     TurnGatewayPort,
     WorldStateReaderPort,
 )
-from app.application.ports import ImageGeneratorPort, StoryGeneratorPort
+from app.application.ports import ImageGeneratorPort, LlmMetricsRecorderPort, StoryGeneratorPort
 from app.config import Settings
 from app.infrastructure.db.turn_gateway import SqlAlchemyTurnGateway
+from app.infrastructure.metrics import InMemoryLlmMetricsRecorder
 
 
 async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
@@ -154,6 +155,34 @@ def get_image_generator(request: Request) -> ImageGeneratorPort:
     return generator
 
 
+def get_llm_metrics_recorder(request: Request) -> LlmMetricsRecorderPort:
+    """The process-wide performance recorder.
+
+    Application-scoped rather than request-scoped, because the whole point of it is to
+    remember calls across requests.
+    """
+    recorder: LlmMetricsRecorderPort = request.app.state.llm_metrics_recorder
+    return recorder
+
+
+def get_llm_metrics_reader(request: Request) -> InMemoryLlmMetricsRecorder:
+    """The same object, seen concretely, for the diagnostics endpoints.
+
+    The port is deliberately write-only -- reading recent history is not something a use
+    case should be able to do, and a `recent_generations` on `LlmMetricsRecorderPort`
+    would make every future implementation promise to keep a buffer. The dev endpoints
+    are the one caller that needs the concrete type, and they are an infrastructure
+    diagnostic rather than a use case, so they depend on the implementation by name.
+    """
+    recorder = request.app.state.llm_metrics_recorder
+    if not isinstance(recorder, InMemoryLlmMetricsRecorder):
+        raise RuntimeError(
+            "LLM performance diagnostics require the in-memory recorder; "
+            f"this application is using {type(recorder).__name__}."
+        )
+    return recorder
+
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 TurnGateway = Annotated[TurnGatewayPort, Depends(get_turn_gateway)]
 SessionClock = Annotated[SessionClockPort, Depends(get_session_clock)]
@@ -166,3 +195,5 @@ NarrationStore = Annotated[NarrationStorePort, Depends(get_narration_store)]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 StoryGen = Annotated[StoryGeneratorPort, Depends(get_story_generator)]
 ImageGen = Annotated[ImageGeneratorPort, Depends(get_image_generator)]
+LlmMetrics = Annotated[LlmMetricsRecorderPort, Depends(get_llm_metrics_recorder)]
+LlmMetricsReader = Annotated[InMemoryLlmMetricsRecorder, Depends(get_llm_metrics_reader)]

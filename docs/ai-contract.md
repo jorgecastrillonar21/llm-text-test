@@ -58,6 +58,21 @@ no database session.
 Retrieval is pure SQL ordering — deterministic and reproducible. The same context always
 produces the same mock turn, which is what makes the E2E flow assertable.
 
+**Every row in that table has a bound, and that is the contract.** A session accumulates
+state without limit; a prompt must not. Measured over 16 turns, a real prompt goes from
+5414 tokens to 6430 — and the growth rate drops from ~104 tokens/turn to ~30 at turn 10,
+where the 20-message transcript cap starts evicting as much as it adds. The prompt follows
+the caps, not the size of the campaign.
+
+> Adding another game foundation must not automatically append all of its persisted state
+> to `StoryContext`. It gets a bounded, purpose-shaped projection, or it gets nothing.
+
+`StoryContext` deliberately carries no `CurrentWorldSnapshot`, no full location or fact
+table, no scheduled events and no resolution audit trail — those are debug and gameplay
+surfaces, and their growth must never become prompt growth. It also carries **no
+performance data**: metrics from previous generations are never fed back to a model. See
+[llm-performance-baseline.md](llm-performance-baseline.md#context-is-bounded-and-must-stay-bounded).
+
 **Secrets are included deliberately.** The director needs them so an NPC can act on,
 deflect, or lie about a secret. The prompt forbids stating them outright. This is a
 prompt-level guarantee, not an enforced one — a weak model may leak. Treat NPC secrets
@@ -241,6 +256,23 @@ to `/api/chat`, so decoding is schema-constrained. The response is then **valida
 again** with Pydantic: constrained decoding narrows the output, it does not guarantee
 it. A response that parses as JSON but violates the contract raises
 `StoryGenerationError`, which rolls the turn back.
+
+### The output budget
+
+Every generation carries an explicit token ceiling, resolved by `GenerationPolicy` from
+the purpose it was called for and passed to the adapter as a provider-neutral
+`LlmGenerationBudget`:
+
+| Purpose | Setting | Default | Shape of the output |
+|---|---|---|---|
+| `story_turn` | `STORY_MAX_OUTPUT_TOKENS` | 1024 | the whole JSON document above |
+| `outcome_narration` | `NARRATION_MAX_OUTPUT_TOKENS` | 320 | one paragraph of prose |
+
+Because a turn is a JSON *document*, running out of budget does not produce a shorter
+turn — it produces an unclosed object, and the turn fails. The adapter reports that case
+distinctly (`error_code: budget_exhausted`) rather than blaming the model's JSON, and the
+Story Director prompt asks for output that fits. Measured turns use 156–308 tokens against
+the 1024 default. See [llm-performance-baseline.md](llm-performance-baseline.md#the-two-budgets-which-are-not-the-same-thing).
 
 ### Memory candidates
 
@@ -480,7 +512,13 @@ as the same 502 as any other. What is missing is a paragraph, not a turn. See
 | Timeout | yes | `OLLAMA_TIMEOUT_SECONDS` |
 | Model not pulled | no | `ollama pull <model>` |
 | Non-JSON content | yes | that the model may be too small |
+| Truncated by the output budget | yes | `STORY_MAX_OUTPUT_TOKENS` and the budget it hit |
 | Schema violation | yes | the first validation error |
+
+A failed generation is still measured. `LlmGenerationMetrics` records the purpose, the
+provider, the error code and how long the caller waited, and **fabricates nothing**: token
+counts and provider durations that were never reported stay `None` rather than becoming
+zeroes that would drag a summary toward a number nobody measured.
 
 There is **no silent fallback to the mock provider** when `STORY_PROVIDER=ollama`. The
 explicit mock provider is the development mechanism; an automatic downgrade would hide

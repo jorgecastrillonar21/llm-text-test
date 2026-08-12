@@ -11,8 +11,13 @@ import pytest
 from app.config import ImageProvider, Settings, StoryProvider
 from app.domain.errors import StoryGenerationError
 from app.infrastructure.images.factory import build_image_generator
-from app.infrastructure.story.factory import build_story_generator
+from app.infrastructure.story.factory import build_generation_policy, build_story_generator
 from app.infrastructure.story.ollama import OllamaStoryGenerator
+
+
+def _ollama(settings: Settings, client: httpx.AsyncClient) -> OllamaStoryGenerator:
+    """The adapter wired the way the factory wires it, against a stub transport."""
+    return OllamaStoryGenerator(settings, build_generation_policy(settings), client=client)
 
 
 async def test_status_endpoint_reports_mock_and_disabled(app_client: httpx.AsyncClient) -> None:
@@ -51,7 +56,7 @@ async def test_ollama_status_unreachable_names_the_cause() -> None:
         raise httpx.ConnectError("connection refused", request=request)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(refuse))
-    generator = OllamaStoryGenerator(Settings(ollama_model="llama3.1:8b"), client=client)
+    generator = _ollama(Settings(ollama_model="llama3.1:8b"), client)
     status = await generator.status()
     assert status.state == "unreachable"
     assert "ollama serve" in status.detail
@@ -63,7 +68,7 @@ async def test_ollama_status_detects_model_not_installed() -> None:
         return httpx.Response(200, json={"models": [{"name": "qwen2.5:7b"}]})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(tags))
-    generator = OllamaStoryGenerator(Settings(ollama_model="llama3.1:8b"), client=client)
+    generator = _ollama(Settings(ollama_model="llama3.1:8b"), client)
     status = await generator.status()
     assert status.state == "misconfigured"
     assert "ollama pull llama3.1:8b" in status.detail
@@ -75,7 +80,7 @@ async def test_ollama_status_ready_when_model_present() -> None:
         return httpx.Response(200, json={"models": [{"name": "llama3.1:8b"}]})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(tags))
-    generator = OllamaStoryGenerator(Settings(ollama_model="llama3.1:8b"), client=client)
+    generator = _ollama(Settings(ollama_model="llama3.1:8b"), client)
     status = await generator.status()
     assert status.state == "ready"
     await client.aclose()
@@ -88,7 +93,7 @@ async def test_ollama_status_accepts_bare_model_name() -> None:
         return httpx.Response(200, json={"models": [{"name": "llama3.1:latest"}]})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(tags))
-    generator = OllamaStoryGenerator(Settings(ollama_model="llama3.1"), client=client)
+    generator = _ollama(Settings(ollama_model="llama3.1"), client)
     assert (await generator.status()).state == "ready"
     await client.aclose()
 
@@ -98,7 +103,7 @@ async def test_ollama_malformed_json_raises_typed_error(make_story_context) -> N
         return httpx.Response(200, json={"message": {"content": "not json at all"}})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(bad_json))
-    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
+    generator = _ollama(Settings(ollama_model="m"), client)
     with pytest.raises(StoryGenerationError, match="not valid JSON"):
         await generator.generate_turn(make_story_context())
     await client.aclose()
@@ -113,7 +118,7 @@ async def test_ollama_schema_violation_raises_typed_error(make_story_context) ->
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(wrong_shape))
-    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
+    generator = _ollama(Settings(ollama_model="m"), client)
     with pytest.raises(StoryGenerationError, match="did not match the TurnGeneration contract"):
         await generator.generate_turn(make_story_context())
     await client.aclose()
@@ -124,7 +129,7 @@ async def test_ollama_timeout_suggests_a_remedy(make_story_context) -> None:
         raise httpx.ReadTimeout("too slow", request=request)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(timeout))
-    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
+    generator = _ollama(Settings(ollama_model="m"), client)
     with pytest.raises(StoryGenerationError, match="OLLAMA_TIMEOUT_SECONDS"):
         await generator.generate_turn(make_story_context())
     await client.aclose()
@@ -146,10 +151,10 @@ async def test_ollama_valid_response_is_parsed(make_story_context) -> None:
         return httpx.Response(200, json={"message": {"content": payload}})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(ok))
-    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
-    generation = await generator.generate_turn(make_story_context())
-    assert generation.narration == "The door opens."
-    assert len(generation.suggested_actions) == 3
+    generator = _ollama(Settings(ollama_model="m"), client)
+    result = await generator.generate_turn(make_story_context())
+    assert result.generation.narration == "The door opens."
+    assert len(result.generation.suggested_actions) == 3
     await client.aclose()
 
 
@@ -178,9 +183,7 @@ async def test_ollama_sends_an_explicit_num_ctx(make_story_context) -> None:
     and reports nothing, so every world produces interchangeable prose.
     """
     client, seen = _replying()
-    generator = OllamaStoryGenerator(
-        Settings(ollama_model="m", ollama_num_ctx=16384), client=client
-    )
+    generator = _ollama(Settings(ollama_model="m", ollama_num_ctx=16384), client)
 
     await generator.generate_turn(make_story_context())
 
@@ -193,7 +196,7 @@ async def test_ollama_warns_when_the_prompt_did_not_fit(
 ) -> None:
     # Far fewer tokens than the prompt's characters can possibly encode to.
     client, _ = _replying({"prompt_eval_count": 3})
-    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
+    generator = _ollama(Settings(ollama_model="m"), client)
 
     with caplog.at_level(logging.WARNING):
         await generator.generate_turn(make_story_context())
@@ -207,7 +210,7 @@ async def test_ollama_stays_quiet_when_the_whole_prompt_was_evaluated(
 ) -> None:
     """The truncation check must not cry wolf on a prompt that fit."""
     client, _ = _replying({"prompt_eval_count": 100_000})
-    generator = OllamaStoryGenerator(Settings(ollama_model="m"), client=client)
+    generator = _ollama(Settings(ollama_model="m"), client)
 
     with caplog.at_level(logging.WARNING):
         await generator.generate_turn(make_story_context())

@@ -119,6 +119,8 @@ POST   /api/v1/dev/sessions/{id}/world-state/changes
 GET    /api/v1/dev/sessions/{id}/world-state
 GET    /api/v1/dev/sessions/{id}/world-state/check
 POST   /api/v1/dev/sessions/{id}/situations/{situation_id}/progress
+GET    /api/v1/dev/llm/performance
+GET    /api/v1/dev/sessions/{id}/llm-performance
 ```
 
 The due-events endpoint is the seam nothing consumes yet. Advancing time marks what the
@@ -175,6 +177,38 @@ against the property's policy, the world's rules and the session's revision. `ad
 authority does not bypass the world's rules, and `story_director` sent to the mutation
 endpoint still reaches `OPEN` properties and nothing else. See
 [world-state-facts.md](world-state-facts.md).
+
+### Why that turn was slow
+
+```bash
+curl ".../dev/sessions/$S/llm-performance"
+```
+
+returns the recent generations for one session, the per-turn latency split, and a summary.
+The question it answers first is which half of the wait was the model:
+
+```text
+llm.turn session=... turn=1 total_ms=100139.2 story_ms=100082.6 app_ms=56.6 llm_calls=1
+```
+
+`GET /api/v1/dev/llm/performance` is the same thing across the whole process. Both are
+in-memory, bounded by `LLM_METRICS_BUFFER_SIZE`, lost on restart, and return **no prompts
+and no generated text** — token counts and durations only.
+
+The same records are logged, one line per generation, under `app.llm.performance`. They
+come out at WARNING when a call is slower than `LLM_SLOW_CALL_THRESHOLD_MS`, when it ended
+on its output budget, or when the prompt filled 90% of `OLLAMA_NUM_CTX`.
+
+To collect a full baseline rather than read one turn — cold-versus-warm load cost, prompt
+growth across turns, tokens per second — use the harness, against a throwaway database and
+a spare port so a running dev server is left alone:
+
+```bash
+.venv/Scripts/python.exe -m app.scripts.llm_baseline --api-url http://127.0.0.1:8011 --turns 3
+```
+
+[llm-performance-baseline.md](llm-performance-baseline.md#running-it) has the full
+procedure and the numbers Epic 1 measured.
 
 ### E2E
 

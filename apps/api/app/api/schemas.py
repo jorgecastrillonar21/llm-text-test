@@ -8,6 +8,11 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.application.llm_metrics import (
+    LlmGenerationMetrics,
+    LlmPerformanceSummary,
+    TurnPerformanceMetrics,
+)
 from app.application.ports import ProviderState
 from app.application.turn_service import (
     MAX_ACTION_LENGTH,
@@ -678,3 +683,22 @@ class ErrorResponse(BaseModel):
     detail: str
     provider: str | None = None
     retryable: bool = False
+
+
+class LlmPerformanceResponse(BaseModel):
+    """Recent LLM performance, for a developer looking at a slow turn.
+
+    Counts, durations and identifiers only. No prompt, no generated text, no context --
+    a diagnostics endpoint that echoed prompts would be a way to read someone's story
+    through a URL, and it would duplicate the Story Director's prompts into a second
+    place that has to be kept out of logs and out of git.
+
+    Mounted under `/dev`, so it exists only where `Settings.dev_endpoints_enabled` says
+    so and is off by default outside development and test.
+    """
+
+    summary: LlmPerformanceSummary
+    generations: list[LlmGenerationMetrics]
+    turns: list[TurnPerformanceMetrics]
+    session_id: uuid.UUID | None = None
+    """Set when the records were filtered to one session."""

@@ -38,6 +38,7 @@ app.application.persistence, which app.infrastructure implements.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 
 from pydantic import BaseModel
@@ -46,7 +47,13 @@ from app.application.context_builder import CHARACTER_LIMIT, build_story_context
 from app.application.contracts import DialogueLine, TurnGeneration
 from app.application.event_service import ReviewedEvent, select_events, write_events
 from app.application.fact_proposals import ProposalReview, review_fact_proposals
+from app.application.llm_metrics import (
+    GenerationPurpose,
+    TurnPerformanceMetrics,
+    failed_generation_metrics,
+)
 from app.application.location_proposals import review_location_proposals
+from app.application.observability import record_generation_safely, record_turn_safely
 from app.application.persistence import (
     NewMemory,
     NewMessage,
@@ -55,11 +62,11 @@ from app.application.persistence import (
     TurnGatewayPort,
     WorldSnapshot,
 )
-from app.application.ports import StoryGeneratorPort
+from app.application.ports import LlmMetricsRecorderPort, StoryGeneratorPort
 from app.application.situation_proposals import review_situation_proposals
 from app.application.state_service import ChangeCause, stage_state_change
 from app.domain.enums import MessageRole
-from app.domain.errors import NotFoundError, ValidationError
+from app.domain.errors import NotFoundError, StoryGenerationError, ValidationError
 from app.domain.relationships import RelationshipVector, clamp_delta
 from app.domain.resolution import (
     MAX_IDEMPOTENCY_KEY_LENGTH,
@@ -160,6 +167,7 @@ async def execute_turn(
     action: str,
     generator: StoryGeneratorPort,
     client_action_id: str | None = None,
+    recorder: LlmMetricsRecorderPort | None = None,
 ) -> TurnResult:
     """Play one turn, or return the one this submission already played.
 
@@ -169,7 +177,12 @@ async def execute_turn(
     not guess. Omitting it is allowed and means the turn is not replayable: the record
     is still written, under a key derived from the turn index, but a retry with no id
     plays a second turn.
+
+    `recorder` is optional and observational. Nothing below branches on it, nothing it
+    returns reaches the result, and a turn played without one is identical in every
+    respect except that nobody wrote down how long it took.
     """
+    turn_started = time.perf_counter()
     cleaned = action.strip()
     if not cleaned:
         raise ValidationError("Action must not be empty.")
@@ -221,7 +234,45 @@ async def execute_turn(
     )
 
     # Raises StoryGenerationError on provider failure -> caller rolls back the turn.
-    generation = await generator.generate_turn(context)
+    # Measured from here rather than inside the adapter, because this is the span the
+    # player waits through: the request, the queue, the model, and the decode.
+    generation_started = time.perf_counter()
+    try:
+        result = await generator.generate_turn(context)
+    except StoryGenerationError as exc:
+        # A failure is a measurement too, and the one most worth having: a provider that
+        # times out after ninety seconds and one that refuses in twelve milliseconds are
+        # the same exception and completely different problems. Recorded, then re-raised
+        # unchanged -- the turn still fails and still rolls back.
+        record_generation_safely(
+            recorder,
+            failed_generation_metrics(
+                exc,
+                purpose=GenerationPurpose.STORY_TURN,
+                session_id=session.id,
+                fallback_elapsed_ms=_elapsed_ms(generation_started),
+            ),
+        )
+        record_turn_safely(
+            recorder,
+            TurnPerformanceMetrics(
+                session_id=session.id,
+                turn_index=turn_index,
+                total_turn_ms=_elapsed_ms(turn_started),
+                story_generation_ms=_elapsed_ms(generation_started),
+                llm_call_count=1,
+            ),
+        )
+        raise
+    story_generation_ms = _elapsed_ms(generation_started)
+    generation = result.generation
+    # The session is attached here, not in the adapter: `narrate_outcome` has no session
+    # to attach, and a provider should not have to know which of its callers happens to
+    # know one.
+    record_generation_safely(
+        recorder,
+        result.metrics.for_session(session.id) if result.metrics is not None else None,
+    )
 
     known_character_ids = await gateway.known_character_ids(world.id)
 
@@ -383,6 +434,21 @@ async def execute_turn(
     # that refetches the transcript on success always sees this turn.
     await gateway.commit()
 
+    # After the commit, so the number includes the write the player is actually waiting
+    # for. This is the record that answers the only question worth asking about a slow
+    # turn: was it the model, or was it us? One LLM call per turn today -- see
+    # `docs/llm-performance-baseline.md`.
+    record_turn_safely(
+        recorder,
+        TurnPerformanceMetrics(
+            session_id=session.id,
+            turn_index=turn_index,
+            total_turn_ms=_elapsed_ms(turn_started),
+            story_generation_ms=story_generation_ms,
+            llm_call_count=1,
+        ),
+    )
+
     return TurnResult(
         session_id=session.id,
         turn_index=turn_index,
@@ -400,6 +466,10 @@ async def execute_turn(
         visual_cue_generated=generation.visual_cue.generate,
         resolution_id=resolution_id,
     )
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 3)
 
 
 def _turn_key(client_action_id: str) -> str:

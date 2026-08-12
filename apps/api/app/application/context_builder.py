@@ -141,13 +141,19 @@ async def build_story_context(
         relationships=[
             RelationshipContext(
                 character_id=relationship.character_id,
-                character_name=names.get(relationship.character_id, "Unknown"),
+                character_name=names[relationship.character_id],
                 trust=relationship.trust,
                 affection=relationship.affection,
                 respect=relationship.respect,
                 fear=relationship.fear,
             )
+            # Only for characters the context actually describes. This was the one read
+            # here whose size followed the campaign rather than a limit: a session
+            # accumulates a relationship row per character it ever met, and a long one in
+            # a large world would have sent hundreds of vectors attached to names the
+            # prompt never introduced. `CHARACTER_LIMIT` now bounds this too.
             for relationship in relationships
+            if relationship.character_id in names
         ],
         player_action=player_action,
     )

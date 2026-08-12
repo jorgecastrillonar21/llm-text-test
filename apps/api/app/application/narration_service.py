@@ -42,15 +42,17 @@ import uuid
 from pydantic import BaseModel, ConfigDict
 
 from app.application.context_builder import build_outcome_context
+from app.application.llm_metrics import GenerationPurpose, failed_generation_metrics
+from app.application.observability import record_generation_safely
 from app.application.persistence import (
     NarrationStorePort,
     NewMessage,
     SessionSnapshot,
     WorldSnapshot,
 )
-from app.application.ports import StoryGeneratorPort
+from app.application.ports import LlmMetricsRecorderPort, StoryGeneratorPort
 from app.domain.enums import MessageRole
-from app.domain.errors import NotFoundError
+from app.domain.errors import NotFoundError, StoryGenerationError
 from app.domain.resolution import ResolutionOutcome
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,7 @@ async def narrate_resolution(
     resolution_id: uuid.UUID,
     outcome: ResolutionOutcome | None = None,
     regenerate: bool = False,
+    recorder: LlmMetricsRecorderPort | None = None,
 ) -> NarrationResult:
     """Describe a committed resolution, storing the prose against it.
 
@@ -114,7 +117,28 @@ async def narrate_resolution(
         events=await store.load_events_for_resolution(resolution_id),
         outcome=outcome,
     )
-    generation = await generator.narrate_outcome(context)
+    try:
+        result = await generator.narrate_outcome(context)
+    except StoryGenerationError as exc:
+        # Recorded before re-raising, for the reason the turn path does it: a narration
+        # that reliably fails is a performance fact, and the record that says so is the
+        # one nobody writes if the exception simply propagates.
+        record_generation_safely(
+            recorder,
+            failed_generation_metrics(
+                exc,
+                purpose=GenerationPurpose.OUTCOME_NARRATION,
+                session_id=session_id,
+            ),
+        )
+        raise
+    generation = result.narration
+    # `OutcomeContext` carries no session id -- the provider had no way to know one -- so
+    # it is attached here, where one is in scope.
+    record_generation_safely(
+        recorder,
+        result.metrics.for_session(session_id) if result.metrics is not None else None,
+    )
 
     if existing is not None:
         await store.replace_message_content(existing.id, generation.narration)
